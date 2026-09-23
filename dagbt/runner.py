@@ -1,0 +1,951 @@
+"""Crash-isolated paired inference experiments; generation never opens labels.
+
+The coordinator uses only the standard library. Native model imports and global
+configuration live in persistent spawned workers, one per dataset and arm.
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import csv
+import fcntl
+import hashlib
+import importlib
+import importlib.util
+import importlib.metadata
+import json
+import multiprocessing as mp
+import os
+import random
+import signal
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+from collections import Counter
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+DATASETS = ("hotpotqa", "2wikimultihopqa", "musique")
+METRICS = ("f1", "em", "r@5", "r@10", "r@20", "all@5", "all@10", "all@20")
+
+
+def load(path):
+    return json.loads(Path(path).read_text())
+
+
+def save(path, value):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(path.name + f".{os.getpid()}.tmp")
+    temp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+    temp.replace(path)
+
+
+def digest(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+def file_hash(path):
+    h = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def append_jsonl(path, value):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as handle:
+        handle.write(json.dumps(value, ensure_ascii=False) + "\n")
+        handle.flush()
+
+
+def redacted_error(exc):
+    value = str(exc)
+    for key, secret in os.environ.items():
+        if secret and any(word in key.upper() for word in ("API_KEY", "TOKEN", "PASSWORD", "SECRET")):
+            value = value.replace(secret, "[REDACTED]")
+    return {"error_type": type(exc).__name__, "error": value[:2000]}
+
+
+def validate_config(config):
+    if "_test_transport" in config:
+        raise ValueError("_test_transport is forbidden in production runner configuration")
+    # Native caches store URLs/payloads. Credentials must stay in environment headers.
+    for key, value in config.items():
+        if isinstance(value, dict):
+            validate_config(value)
+        if any(word in key.lower() for word in ("api_key", "password", "secret", "access_token")):
+            raise ValueError(f"{key}: put credentials in environment variables, never config")
+        if key.endswith(("base_url", "endpoint")) or key == "url":
+            if not isinstance(value, str):
+                raise ValueError(f"{key}: expected a URL string")
+            parsed = urllib.parse.urlsplit(value)
+            if parsed.scheme not in ("http", "https") or not parsed.netloc or parsed.username or parsed.password or parsed.query:
+                raise ValueError(f"{key}: use an HTTP(S) URL without credentials or query parameters")
+    experiment = config.get("experiment", {})
+    for key in ("question_timeout_seconds", "worker_startup_timeout_seconds", "max_question_attempts"):
+        if key in experiment and (not isinstance(experiment[key], (float, int)) or experiment[key] <= 0):
+            raise ValueError(f"experiment.{key} must be positive")
+    if "max_question_attempts" in experiment and not isinstance(experiment["max_question_attempts"], int):
+        raise ValueError("experiment.max_question_attempts must be an integer")
+    return config
+
+
+def frozen_sources():
+    paths = [ROOT / "original_manifest.json"]
+    for dirname in ("dagbt", "vendor"):
+        base = ROOT / dirname
+        if base.exists():
+            paths.extend(p for p in base.rglob("*") if p.is_file() and "__pycache__" not in p.parts
+                         and p.suffix not in (".pyc", ".log"))
+    paths.extend(p for p in (ROOT / "scripts").glob("*paired*") if p.is_file())
+    return {str(p.relative_to(ROOT)): file_hash(p) for p in sorted(set(paths))}
+
+
+def verify_originals(*, include_labels=False):
+    manifest = load(ROOT / "original_manifest.json")
+    errors, checked, deferred = [], 0, []
+    for entry in manifest["files"]:
+        relative = entry["path"]
+        if relative.endswith("evaluation_only.json") and not include_labels:
+            deferred.append(relative)
+            continue
+        path = ROOT / relative
+        if not path.is_file() or file_hash(path) != entry["sha256"]:
+            errors.append(relative)
+        checked += 1
+    if errors:
+        raise ValueError("Original artifact missing or modified: " + ", ".join(errors))
+    return {"checked": checked, "label_hash_checks_deferred_until_scoring": deferred}
+
+
+def probe_endpoint(base, model, key_env, timeout=10):
+    headers = {}
+    if os.environ.get(key_env):
+        headers["Authorization"] = "Bearer " + os.environ[key_env]
+    request = urllib.request.Request(base.rstrip("/") + "/models", headers=headers)
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        result = json.load(response)
+    available = [item.get("id") for item in result.get("data", [])]
+    if model not in available:
+        raise ValueError(f"Requested model {model!r} not advertised by /models")
+    selected = [item for item in result.get("data", []) if item.get("id") == model]
+    return {"base_url": base, "model": model, "models_endpoint": "ok", "advertised_model_metadata": selected,
+            "advertised_metadata_digest": digest(selected),
+            "weight_identity_limit": "/models metadata and model ID do not establish a weights checksum or immutable revision"}
+
+
+def probe_local_tokenizer():
+    from transformers import AutoTokenizer
+    directory = ROOT / "package" / "tokenizer"
+    tokenizer = AutoTokenizer.from_pretrained(str(directory), local_files_only=True)
+    messages = [{"role": "system", "content": "You are a QA reader."},
+                {"role": "user", "content": "Return one short answer from the supplied evidence."}]
+    rendered = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+    token_ids = tokenizer.encode(rendered, add_special_tokens=False)
+    if not isinstance(rendered, str) or not rendered.strip() or not token_ids:
+        raise ValueError("Bundled tokenizer chat template produced empty output")
+    return {"path": str(directory), "local_files_only": True, "chat_template_render": "ok",
+            "probe_prompt_tokens": len(token_ids), "probe_render_sha256": hashlib.sha256(rendered.encode()).hexdigest(),
+            "files_sha256": {p.name: file_hash(p) for p in sorted(directory.iterdir()) if p.is_file()}}
+
+
+def probe_reranker(config, output=None):
+    settings = config.get("reranker", {})
+    if not settings.get("url") or not settings.get("model"):
+        raise ValueError("BridgeTree requires explicit reranker.url and reranker.model")
+    if settings.get("score_contract", "pointwise") != "pointwise":
+        raise ValueError("BridgeTree requires a pointwise reranker")
+    from dagbt.bridge import probe_reranker_protocol
+    from dagbt.budget import Ledger
+    from dagbt.transport import Transport
+    base = Path(output) if output else ROOT / "outputs" / "preflight"
+    trace = base / "preflight_calls" / f"probe-{time.time_ns()}"
+    maximum = 5 * int(config.get("max_identical_attempts", 3))
+    ledger = Ledger({"rerank_http": maximum, "http_attempts": maximum},
+                    sink=lambda event: append_jsonl(trace / "ledger_events.jsonl", event))
+    transport = Transport("preflight_pointwise_protocol", trace, config, ledger, None)
+    try:
+        report = probe_reranker_protocol(transport, config, ledger)
+    except Exception as exc:
+        save(trace / "report.json", {"status": "failed", **redacted_error(exc), "ledger": ledger.public_dict(), "cost": request_cost(trace)})
+        raise
+    result = {"url": settings["url"], "model": settings["model"], "protocol": report,
+              "trace_directory": str(trace), "ledger": ledger.public_dict(), "cost": request_cost(trace),
+              "scope": "five synthetic composition/order probes; not a proof for all inputs; outside per-question budgets"}
+    save(trace / "report.json", result)
+    return result
+
+
+def preflight(config, datasets, *, endpoints=True, output=None, arms=None):
+    validate_config(config)
+    from dagbt.config import resolve
+    for arm in arms or ["fusion"]:
+        if arm != "original":
+            resolve(config, arm)
+    report = {"original_integrity": verify_originals(), "datasets": {}, "endpoints": {},
+              "config_digest": digest(config), "created_unix": time.time()}
+    dependencies = {"numpy": "numpy", "transformers": "transformers", "yaml": "PyYAML", "jinja2": "Jinja2"}
+    missing_modules = [name for name in dependencies if importlib.util.find_spec(name) is None]
+    if missing_modules:
+        raise RuntimeError("Missing dependencies: " + ", ".join(missing_modules))
+    report["dependency_versions"] = {name: importlib.metadata.version(distribution) for name, distribution in dependencies.items()}
+    report["local_tokenizer"] = probe_local_tokenizer()
+    report["source_hashes"] = frozen_sources()
+    report["original_manifest_sha256"] = file_hash(ROOT / "original_manifest.json")
+    report["model_identity"] = {"configured_llm_model": config.get("llm_model"), "configured_embedding_model": config.get("embedding_model"),
+                                "configured_reranker_model": config.get("reranker", {}).get("model"),
+                                "operator_declared_deployment_identity": config.get("deployment_identity", {}),
+                                "operator_declared_reranker_deployment_identity": config.get("reranker", {}).get("deployment_identity", {}),
+                                "limitation": "Configured IDs and operator metadata are recorded; no model weights/revision checksum is inferred."}
+    for dataset in datasets:
+        if dataset not in DATASETS:
+            raise ValueError("Unsupported dataset: " + dataset)
+        index = ROOT / "data" / dataset / "index"
+        if not (index / "passage_vectors.npy").is_file():
+            raise FileNotFoundError(str(index / "passage_vectors.npy"))
+        info = load(index / "manifest.json")
+        if info["embedding_model"] != config["embedding_model"]:
+            raise ValueError("Embedding model differs from frozen corpus index")
+        questions = load_questions(dataset)
+        directory = ROOT / "data" / dataset
+        report["datasets"][dataset] = {"questions": len(questions), "documents": info["documents"],
+            "current_data_sha256": {name: file_hash(directory / name) for name in
+                                    ("questions.jsonl", "corpus.jsonl", "index/manifest.json", "index/passage_vectors.npy")}}
+    if endpoints:
+        for kind, env in (("llm", "DAG_LLM_API_KEY"), ("embedding", "DAG_EMBED_API_KEY")):
+            report["endpoints"][kind] = probe_endpoint(config[kind + "_base_url"], config[kind + "_model"], env)
+        if config.get("reranker"):
+            report["endpoints"]["reranker"] = probe_reranker(config, output)
+    else:
+        report["endpoints"] = {"status": "not_checked_offline_preflight"}
+    report["protocol_note"] = "Bundled local chat template is rendered; /models checks advertised IDs. Actual smoke inference is still needed for guided JSON and server/model/tokenizer compatibility."
+    return report
+
+
+def load_questions(dataset, limit=None):
+    questions = [json.loads(line) for line in (ROOT / "data" / dataset / "questions.jsonl").read_text().splitlines() if line.strip()]
+    if len({q["id"] for q in questions}) != len(questions):
+        raise ValueError("Duplicate question IDs")
+    # Never expose incidental fields to generation, even if an input schema changes.
+    result = [{"id": q["id"], "question": q["question"]} for q in questions]
+    return result if limit is None else result[:limit]
+
+
+class AuditedCalls:
+    """Native transport semantics plus per-invocation accounting, including cache hits."""
+    def __init__(self, unit, output, config, experiment):
+        self.unit, self.output, self.config = unit, Path(output), config
+        self._experiment = experiment
+        self._inner = experiment.Calls(unit, output, config)
+
+    def get(self, stage, url, payload):
+        e = self._experiment
+        embedding = url.endswith("/embeddings")
+        final = dict(payload) if embedding else {**payload, **e.SAMPLING}
+        final["model"] = self.config["embedding_model" if embedding else "llm_model"]
+        key = e.native.digest({"unit_id": self.unit, "url": url, "payload": final})
+        path = self.output / "requests" / (key + ".json")
+        before = load(path) if path.exists() else {}
+        event = {"event": "call_started", "unix": time.time(), "stage": stage, "request_ref": key,
+                 "kind": "embedding" if embedding else "llm", "cache_hit": "response" in before}
+        append_jsonl(self.output / "call_events.jsonl", event)
+        try:
+            result = self._inner.get(stage, url, payload)
+        except BaseException as exc:
+            append_jsonl(self.output / "call_events.jsonl", {**event, "event": "call_failed", **redacted_error(exc)})
+            raise
+        append_jsonl(self.output / "call_events.jsonl", {**event, "event": "call_finished", "unix": time.time()})
+        return result
+
+
+def request_cost(output):
+    output = Path(output)
+    seed_path = output / "seeded_requests.json"
+    seeded = set(load(seed_path)) if seed_path.exists() else set()
+    event_path = output / "call_events.jsonl"
+    events, incomplete_event_lines = [], 0
+    for line in event_path.read_text().splitlines() if event_path.exists() else []:
+        try:
+            if line.strip():
+                events.append(json.loads(line))
+        except json.JSONDecodeError:
+            incomplete_event_lines += 1
+    logical = [e for e in events if e.get("event") == "call_started"]
+    result = {"logical_calls": len(logical), "cache_hits": sum(e["cache_hit"] for e in logical),
+              "unique_requests": 0, "http_attempts": 0, "http_retries": 0, "successful_http_requests": 0,
+              "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "requests_by_stage": {},
+              "incomplete_or_failed_http_attempts": 0,
+              "missing_usage_responses": 0, "incomplete_event_lines": incomplete_event_lines,
+              "malformed_request_records": 0,
+              "token_scope": "observed successful nonseeded API responses; failed/lost server work may be unreported"}
+    stages = Counter()
+    for path in (output / "requests").glob("*.json"):
+        try:
+            record = load(path)
+            if not isinstance(record, dict):
+                raise ValueError("request record is not an object")
+        except (json.JSONDecodeError, ValueError):
+            result["malformed_request_records"] += 1
+            continue
+        stages[json.dumps(record.get("stage"), ensure_ascii=False)] += 1
+        result["unique_requests"] += 1
+        if path.stem in seeded:
+            continue
+        attempts = record.get("attempts", [])
+        result["http_attempts"] += len(attempts)
+        result["http_retries"] += max(0, len(attempts) - 1)
+        result["incomplete_or_failed_http_attempts"] += sum(a.get("http_status") != 200 for a in attempts)
+        if "response" in record:
+            result["successful_http_requests"] += 1
+            usage = record["response"].get("usage", {})
+            if not isinstance(usage, dict) or not usage:
+                result["missing_usage_responses"] += 1
+                usage = {}
+            for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                result[key] += int(usage.get(key, 0) or 0)
+    result["requests_by_stage"] = dict(stages)
+    result["token_usage_complete"] = not any(result[k] for k in ("missing_usage_responses", "incomplete_or_failed_http_attempts", "malformed_request_records"))
+    return result
+
+
+def original_question(q, resources, calls, e):
+    """Exact e.work computation/catches, with Calls supplied for accounting.
+
+    e.work's filesystem resume wrapper is handled by our attempt coordinator.
+    All planner/archive/controller/reader algorithms remain native functions.
+    """
+    try:
+        docs, ids, vectors, index, tokenizer = resources
+        plan = e.make_plan(q["question"], calls)
+        pool, trace = e.archive(q["question"], plan, ids, vectors, calls)
+        row = dict(unit_id=q["id"], question=q["question"], plan=plan, candidate_doc_ids=pool, archive_trace=trace)
+        save(calls.output / "input.json", row)
+        result = e.native.solve(row, docs, tokenizer, index, calls)
+        # controller mutates this pool with corpus-wide node hits. Capture it only
+        # after solve, without modifying any native selection or reader behavior.
+        result["diagnostics"] = {**result.get("diagnostics", {}), "candidate_doc_ids": list(row["candidate_doc_ids"]),
+                                 "archive_doc_ids": list(dict.fromkeys(d for t in trace for d in t.get("doc_ids", []))),
+                                 "retrieval_query_count": len(trace) + result.get("ranking", {}).get("embedding_requests", 0),
+                                 "semantic_validation": "legacy nonempty answer/source heuristic, not entailment verification"}
+        return result
+    except e.PlanError as exc:
+        return e.failure(q["id"], "planner_failed", exc)
+    except AssertionError as exc:
+        if not exc.args or not isinstance(exc.args[0], tuple) or exc.args[0][0] != "context_budget":
+            raise
+        return e.failure(q["id"], "context_overflow", exc)
+
+
+def native_worker(connection, dataset, arm, config):
+    # The environment prevents inherited server configuration changing native imports.
+    os.environ.pop("DAGV2_CONFIG", None)
+    for name in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+        os.environ[name] = "1"
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    try:
+        sys.path.insert(0, str(ROOT / "dagv2"))
+        pipeline = importlib.import_module("pipeline_dagv2_musique" if dataset == "musique" else "pipeline_dagv2")
+        e = pipeline.e
+        e.CONFIG.update(config)
+        _, resources, hashes = pipeline.prepare(dataset, ROOT / "outputs")
+        connection.send({"type": "ready", "hashes": hashes})
+    except BaseException as exc:
+        connection.send({"type": "startup_error", **redacted_error(exc)})
+        return
+    while True:
+        try:
+            task = connection.recv()
+        except EOFError:
+            return
+        if task is None:
+            return
+        q, output = task["question"], Path(task["output"])
+        started = time.monotonic()
+        try:
+            calls = AuditedCalls(q["id"], output, e.CONFIG, e)
+            if arm == "original":
+                row = original_question(q, resources, calls, e)
+            else:
+                from dagbt.engine import run_question
+                row = run_question(q, resources, calls, e.CONFIG, method=arm)
+            row["seconds"] = time.monotonic() - started
+            connection.send({"type": "result", "row": row})
+        except BaseException as exc:
+            connection.send({"type": "task_error", **redacted_error(exc)})
+
+
+class Worker:
+    def __init__(self, dataset, arm, config, *, target=None, context=None):
+        self.dataset, self.arm, self.config = dataset, arm, config
+        self.target = target or native_worker
+        self.context = context or mp.get_context("spawn")
+        self.process = self.connection = None
+
+    def start(self):
+        if self.process is not None and self.process.is_alive():
+            return
+        self.close()
+        parent, child = self.context.Pipe()
+        self.connection = parent
+        self.process = self.context.Process(target=self.target, args=(child, self.dataset, self.arm, self.config), daemon=True)
+        self.process.start()
+        child.close()
+        timeout = self.config.get("experiment", {}).get("worker_startup_timeout_seconds", 300)
+        message = self._receive(timeout)
+        if message.get("type") != "ready":
+            self.close()
+            raise RuntimeError("Worker preparation failed: " + json.dumps(message))
+        self.hashes = message.get("hashes", {})
+
+    def _receive(self, timeout):
+        if not self.connection.poll(timeout):
+            raise TimeoutError(f"{self.dataset}/{self.arm}: worker exceeded {timeout}s")
+        try:
+            return self.connection.recv()
+        except EOFError as exc:
+            raise RuntimeError(f"{self.dataset}/{self.arm}: worker exited (code {self.process.exitcode})") from exc
+
+    def run(self, q, output):
+        try:
+            self.start()
+            if self.hashes:
+                resource_record = Path(output).parents[2] / "resource_hashes.json"
+                if resource_record.exists() and load(resource_record) != self.hashes:
+                    raise RuntimeError("Worker resource hashes changed during this run")
+                save(resource_record, self.hashes)
+            self.connection.send({"question": q, "output": str(output)})
+            message = self._receive(self.config.get("experiment", {}).get("question_timeout_seconds", 3600))
+            if message.get("type") != "result":
+                raise RuntimeError("Question failed: " + json.dumps(message))
+            return message["row"]
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self):
+        if self.process is not None:
+            if self.process.is_alive():
+                self.process.terminate()
+                self.process.join(3)
+                if self.process.is_alive():
+                    self.process.kill()
+                    self.process.join(3)
+            else:
+                self.process.join(0)
+        if self.connection is not None:
+            self.connection.close()
+        self.process = self.connection = None
+
+
+def validate_result(row, unit):
+    if row.get("unit_id") != unit or not isinstance(row.get("answer"), dict):
+        raise ValueError("Malformed result identity/answer")
+    if not isinstance(row["answer"].get("status"), str) or not isinstance(row["answer"].get("prediction"), str):
+        raise ValueError("Malformed answer fields")
+    for k in ("5", "10", "20"):
+        ids = row.get("budgets", {}).get(k, {}).get("selected_doc_ids")
+        if not isinstance(ids, list) or len(ids) > int(k) or len(set(ids)) != len(ids):
+            raise ValueError("Malformed retrieval selection at k=" + k)
+    return row
+
+
+def failure_row(q, exc):
+    return {"unit_id": q["id"], "answer": {"status": "timeout" if isinstance(exc, TimeoutError) else "execution_failed", "prediction": "", **redacted_error(exc)},
+            "ranking": {"status": "execution_failed"},
+            "budgets": {str(k): {"selected_doc_ids": []} for k in (5, 10, 20)}}
+
+
+def result_path(output, dataset, arm, unit):
+    return Path(output) / dataset / arm / "rows" / (digest(unit) + ".json")
+
+
+def seed_cache(previous, current):
+    import shutil
+    seeded, skipped = [], []
+    for directory in previous:
+        for path in (directory / "requests").glob("*.json"):
+            try:
+                record = load(path)
+                if not isinstance(record, dict):
+                    raise ValueError("request record is not an object")
+            except (json.JSONDecodeError, ValueError):
+                skipped.append(str(path))
+                continue
+            if "response" in record:
+                dest = current / "requests" / path.name
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                temporary = dest.with_name(dest.name + ".copy.tmp")
+                shutil.copy2(path, temporary)
+                temporary.replace(dest)
+                seeded.append(path.stem)
+    save(current / "seeded_requests.json", sorted(set(seeded)))
+    if skipped:
+        save(current / "cache_seed_skipped.json", {"invalid_records_preserved": skipped})
+
+
+def generate_dataset(output, dataset, questions, arms, config, *, retry_failed=False, worker_factory=Worker):
+    """One arm attempt per invocation; retries require explicit --retry-failed."""
+    output = Path(output)
+    workers = {arm: worker_factory(dataset, arm, config) for arm in arms}
+    maximum = config.get("experiment", {}).get("max_question_attempts", 3)
+    counts = Counter()
+    try:
+        for qi, q in enumerate(questions):
+            # Deterministic rotation avoids always giving the first arm server warm-up.
+            order = arms[qi % len(arms):] + arms[:qi % len(arms)]
+            for arm in order:
+                path = result_path(output, dataset, arm, q["id"])
+                if path.exists():
+                    prior = validate_result(load(path), q["id"])
+                    if prior["answer"]["status"] == "ok" or not retry_failed:
+                        counts["resumed_terminal"] += 1
+                        continue
+                unit_dir = output / dataset / arm / "attempts" / digest(q["id"])
+                previous = sorted(p for p in unit_dir.glob("attempt-*") if p.is_dir())
+                if len(previous) >= maximum:
+                    # A killed coordinator may leave an attempt but no terminal row.
+                    if not path.exists():
+                        row = failure_row(q, RuntimeError("Persisted question-attempt cap reached"))
+                        row["attempt_directories"] = [str(p.relative_to(output)) for p in previous]
+                        save(path, row)
+                    counts["attempt_limit_reached"] += 1
+                    continue
+                attempt = unit_dir / f"attempt-{len(previous) + 1:03d}"
+                attempt.mkdir(parents=True)
+                seed_cache(previous, attempt)
+                save(attempt / "task.json", {"dataset": dataset, "arm": arm, "question": q, "started_unix": time.time()})
+                save(output / "progress.json", {"state": "generating", "dataset": dataset, "unit_id": q["id"], "arm": arm,
+                                               "question_index": qi, "questions_in_dataset": len(questions), "updated_unix": time.time()})
+                started = time.monotonic()
+                try:
+                    row = validate_result(workers[arm].run(q, attempt), q["id"])
+                except Exception as exc:
+                    row = failure_row(q, exc)
+                row["runner"] = {"dataset": dataset, "arm": arm, "attempt": len(previous) + 1,
+                                 "wall_seconds": time.monotonic() - started, "cost": request_cost(attempt)}
+                row["attempt_directories"] = [str(p.relative_to(output)) for p in [*previous, attempt]]
+                save(attempt / "result.json", row)
+                save(path, row)
+                if row["answer"]["status"] != "ok":
+                    save(output / dataset / arm / "failures" / (digest(q["id"]) + f"-attempt-{len(previous) + 1:03d}.json"), row)
+                append_jsonl(output / "events.jsonl", {"event": "arm_terminal", "dataset": dataset, "unit_id": q["id"], "arm": arm,
+                                                        "status": row["answer"]["status"], "attempt": len(previous) + 1, "unix": time.time()})
+                counts[row["answer"]["status"]] += 1
+    finally:
+        for worker in workers.values():
+            worker.close()
+    return dict(counts)
+
+
+def all_terminal(output, scopes, arms):
+    for dataset, questions in scopes.items():
+        for q in questions:
+            for arm in arms:
+                path = result_path(output, dataset, arm, q["id"])
+                if not path.is_file():
+                    return False
+                validate_result(load(path), q["id"])
+    return True
+
+
+def total_cost(output, dataset, arm):
+    numeric = Counter()
+    for attempt in (Path(output) / dataset / arm / "attempts").glob("*/attempt-*"):
+        for key, value in request_cost(attempt).items():
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                numeric[key] += value
+    result = dict(numeric)
+    result["token_usage_complete"] = not any(result.get(k, 0) for k in ("missing_usage_responses", "incomplete_or_failed_http_attempts", "malformed_request_records"))
+    result["token_scope"] = "observed successful responses only; incomplete usage means token totals are lower bounds, not zero cost"
+    return result
+
+
+def module_metrics(row, label, dataset, output):
+    """Gold-based discovery metrics and model/structural diagnostics stay distinct."""
+    diag = row.get("diagnostics", {})
+    if not diag and row.get("attempt_directories"):
+        partial = Path(output) / row["attempt_directories"][-1] / "fusion_partial.json"
+        if partial.is_file():
+            snapshot = load(partial)
+            diag = {**snapshot, "candidate_doc_ids": snapshot.get("candidates", []), "support_graph": {"nodes": snapshot.get("nodes", [])}}
+    candidates = diag.get("candidate_doc_ids")
+    def group_recall(ids):
+        ids = set(map(str, ids))
+        if dataset == "musique":
+            ids = {d if d.startswith("musique:") else "musique:" + d for d in ids}
+        hits = [bool(ids.intersection(g)) for g in label["gold_groups"]]
+        return sum(hits) / len(hits), float(all(hits))
+    candidate_recall, candidate_all = group_recall(candidates) if candidates is not None else (None, None)
+    selected = row.get("budgets", {}).get("20", {})
+    selected_recall, _ = group_recall(selected.get("selected_doc_ids", []))
+    nodes = diag.get("support_graph", {}).get("nodes", row.get("ranking", {}).get("nodes", []))
+    events = diag.get("events", [])
+    protocol = [event for event in events if event.get("event") == "protocol_error"]
+    quote_errors = [event for event in protocol if any(word in str(event.get("error", "")).lower() for word in ("quote", "span", "offset"))]
+    feasibility = diag.get("reader_feasibility", {})
+    ledger = diag.get("ledger", {}).get("used", {})
+    metered_limits = diag.get("ledger", {}).get("limits", {})
+    statuses = Counter(node.get("status", "legacy_resolved" if node.get("resolved") else "legacy_unresolved") for node in nodes)
+    return {"candidate_count": len(candidates) if candidates is not None else None,
+            "gold_candidate_title_group_recall": candidate_recall,
+            "gold_candidate_all_support": candidate_all,
+            "gold_discovery_minus_selection_recall_at20": candidate_recall - selected_recall if candidate_recall is not None else None,
+            "selected_doc_count_at20": len(selected.get("selected_doc_ids", [])),
+            "model_structural_node_status_counts": dict(statuses),
+            "model_unknown_nodes": statuses.get("unknown", 0), "model_ambiguous_nodes": statuses.get("ambiguous", 0),
+            "structural_complete_required_at20": selected.get("complete_required"),
+            "structural_necessary_covered_at20": selected.get("necessary_covered"),
+            "protocol_error_events": len(protocol) if "events" in diag else None,
+            "quote_or_span_protocol_error_events": len(quote_errors) if "events" in diag else None,
+            "protocol_errors_by_operation": dict(Counter(str(e.get("operation")) for e in protocol)),
+            "reader_prompt_tokens_local": feasibility.get("prompt_token_count"),
+            "reader_context_tokens_with_output_reserve": feasibility.get("token_count", selected.get("token_count")),
+            "reader_prompt_tokens_api": (row.get("answer", {}).get("response_usage") or {}).get("prompt_tokens"),
+            "retrieval_query_count": ledger.get("ann", 0 if "ann" in metered_limits else diag.get("retrieval_query_count")),
+            "set_score_count": ledger.get("set_score", 0 if "set_score" in metered_limits or "retrieval_query_count" in diag else None),
+            "ledger_used": ledger,
+            "interpretation": "gold_* uses held-out title-group labels after generation; model/structural statuses and complete_required do not prove semantic entailment"}
+
+
+def summarize_modules(rows):
+    keys = ("candidate_count", "gold_candidate_title_group_recall", "gold_candidate_all_support",
+            "gold_discovery_minus_selection_recall_at20", "selected_doc_count_at20", "model_unknown_nodes",
+            "model_ambiguous_nodes", "structural_complete_required_at20", "structural_necessary_covered_at20",
+            "protocol_error_events", "quote_or_span_protocol_error_events", "reader_prompt_tokens_local",
+            "reader_context_tokens_with_output_reserve", "reader_prompt_tokens_api", "retrieval_query_count", "set_score_count")
+    summary = {}
+    for key in keys:
+        values = [row["modules"][key] for row in rows if row["modules"][key] is not None]
+        summary[key] = {"observed_tasks": len(values), "missing_tasks": len(rows) - len(values),
+                        "sum": sum(values), "mean": sum(values) / len(values) if values else None}
+    return summary
+
+
+def paired_bootstrap_interval(differences, *, replicates=1000, seed=20260918):
+    """Resample question-level four-arm contrasts, never arms independently."""
+    n = len(next(iter(differences.values()), []))
+    report = {"method": "paired_question_percentile_bootstrap", "confidence_level": .95,
+              "question_n": n, "replicates": replicates, "seed": seed,
+              "estimable": n >= 2, "intervals_percentage_points": None}
+    if n < 2:
+        return {**report, "reason": "fewer_than_two_paired_questions"}
+    if any(len(values) != n for values in differences.values()):
+        raise ValueError("Paired bootstrap metric vectors must have matching question counts")
+    rng = random.Random(seed)
+    sampled = {metric: [] for metric in differences}
+    for _ in range(replicates):
+        # Each selected index carries the same question's original four arm
+        # scores, already reduced to its exact paired interaction contrast.
+        indices = [rng.randrange(n) for _ in range(n)]
+        for metric, values in differences.items():
+            sampled[metric].append(100 * sum(values[i] for i in indices) / n)
+    def percentile(values, quantile):
+        values = sorted(values)
+        location = (len(values) - 1) * quantile
+        lower = int(location)
+        upper = min(lower + 1, len(values) - 1)
+        return values[lower] + (values[upper] - values[lower]) * (location - lower)
+    report["intervals_percentage_points"] = {metric: {"lower": percentile(values, .025), "upper": percentile(values, .975)}
+                                              for metric, values in sampled.items()}
+    return report
+
+
+def factorial_interaction(all_scores, units):
+    factors = ("fusion", "bt_flat", "dense_dependency", "dense_flat")
+    if not set(factors) <= set(all_scores):
+        return None
+    shared = [unit for unit in units if all(all_scores[arm][unit]["valid"] for arm in factors)]
+    def differences(subset):
+        return {metric: [
+            (all_scores["fusion"][unit][metric] - all_scores["bt_flat"][unit][metric])
+            - (all_scores["dense_dependency"][unit][metric] - all_scores["dense_flat"][unit][metric])
+            for unit in subset] for metric in METRICS}
+    all_differences, shared_differences = differences(units), differences(shared)
+    def point_estimates(values):
+        if not next(iter(values.values()), []):
+            return None
+        return {metric: 100 * sum(vector) / len(vector) for metric, vector in values.items()}
+    return {"formula": "(fusion - bt_flat) - (dense_dependency - dense_flat)",
+            "factors": {"retrieval": ["bridge", "dense"], "selection": ["dependency", "flat"]},
+            "all_task_n": len(units), "shared_four_success_n": len(shared),
+            "all_task_interaction_percentage_points": point_estimates(all_differences),
+            "shared_four_success_interaction_percentage_points": point_estimates(shared_differences),
+            "all_task_interaction_ci95": paired_bootstrap_interval(all_differences),
+            "shared_four_success_interaction_ci95": paired_bootstrap_interval(shared_differences),
+            "shared_four_success_unit_ids": shared,
+            "interpretation": "Descriptive paired interactions with question-level 95% percentile bootstrap intervals (1000 resamples, fixed seed). Assumes independent, exchangeable questions; shared sources can weaken independence. Intervals condition on these tasks and fixed model outputs, not model-generation randomness, and are not causal proof. Four-arm success conditioning can select a different population; original-arm failure does not exclude a four-arm success."}
+
+
+def score_all(output, scopes, arms, *, label_loader=None):
+    """The label loader is invoked only after *all datasets and arms* are terminal."""
+    output = Path(output)
+    if not all_terminal(output, scopes, arms):
+        raise ValueError("Generation incomplete; evaluation labels remain unread")
+    if label_loader is None:
+        verify_originals(include_labels=True)
+        label_loader = lambda dataset: load(ROOT / "data" / dataset / "evaluation_only.json")
+    spec = importlib.util.spec_from_file_location("_dagbt_metrics", ROOT / "package" / "metrics.py")
+    metrics = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(metrics)
+    summaries = {}
+    for dataset, questions in scopes.items():
+        labels = {r["id"]: r for r in label_loader(dataset)}
+        all_scores, comparisons = {}, []
+        for arm in arms:
+            scored, statuses = [], Counter()
+            for q in questions:
+                row = load(result_path(output, dataset, arm, q["id"]))
+                label, valid = labels[q["id"]], row["answer"]["status"] == "ok"
+                statuses[row["answer"]["status"]] += 1
+                item = {"unit_id": q["id"], "valid": valid, "answer_status": row["answer"]["status"],
+                        "prediction": row["answer"]["prediction"],
+                        "f1": metrics.token_f1(row["answer"]["prediction"], label["answers"]) if valid else 0.,
+                        "em": metrics.exact_match(row["answer"]["prediction"], label["answers"]) if valid else 0.}
+                groups = label["gold_groups"]
+                if not groups or not all(groups):
+                    raise ValueError("Empty gold title group")
+                item["modules"] = module_metrics(row, label, dataset, output)
+                item["result_path"] = str(result_path(output, dataset, arm, q["id"]).relative_to(output))
+                item["attempt_directories"] = row.get("attempt_directories", [])
+                item["selected_doc_ids"] = {k: row["budgets"][k]["selected_doc_ids"] for k in ("5", "10", "20")}
+                item["latest_attempt_cost"] = row.get("runner", {}).get("cost")
+                for k in ("5", "10", "20"):
+                    ids = set(map(str, row["budgets"][k]["selected_doc_ids"]))
+                    if dataset == "musique":
+                        ids = {d if d.startswith("musique:") else "musique:" + d for d in ids}
+                    hits = [bool(ids.intersection(g)) for g in groups]
+                    item["r@" + k], item["all@" + k] = sum(hits) / len(hits), float(all(hits))
+                scored.append(item)
+            all_scores[arm] = {s["unit_id"]: s for s in scored}
+            save(output / dataset / arm / "scores.json", scored)
+        n = len(questions)
+        common = [q["id"] for q in questions if all(all_scores[a][q["id"]]["valid"] for a in arms)]
+        summary = {"dataset": dataset, "n": n, "common_success_n": len(common), "arms": {}, "paired": {},
+                   "support_metric": "macro recall of gold title groups; any matching document satisfies a group",
+                   "failure_policy": "answer failure scores zero on all-task answer metrics; retrieval metrics use recorded selections"}
+        for arm in arms:
+            rows = list(all_scores[arm].values())
+            summary["arms"][arm] = {"answer_status_counts": dict(Counter(s["answer_status"] for s in rows)),
+                "failure_rate": sum(not s["valid"] for s in rows) / n,
+                "all_task_metrics_percent": {k: 100 * sum(s[k] for s in rows) / n for k in METRICS},
+                "common_success_metrics_percent": {k: 100 * sum(all_scores[arm][u][k] for u in common) / len(common) for k in METRICS} if common else None,
+                "module_metrics": summarize_modules(rows),
+                "cost_all_attempts": total_cost(output, dataset, arm)}
+        baseline = arms[0]
+        for arm in arms[1:]:
+            pair_ids = [q["id"] for q in questions if all_scores[baseline][q["id"]]["valid"] and all_scores[arm][q["id"]]["valid"]]
+            summary["paired"][arm] = {"baseline": baseline, "pairwise_common_success_n": len(pair_ids),
+                "all_task_delta_percentage_points": {k: 100 * sum(all_scores[arm][q["id"]][k] - all_scores[baseline][q["id"]][k] for q in questions) / n for k in METRICS},
+                "common_success_delta_percentage_points": {k: 100 * sum(all_scores[arm][u][k] - all_scores[baseline][u][k] for u in pair_ids) / len(pair_ids) for k in METRICS} if pair_ids else None,
+                "rescue_em_common_success": sum(all_scores[arm][u]["em"] == 1 and all_scores[baseline][u]["em"] == 0 for u in pair_ids),
+                "harm_em_common_success": sum(all_scores[arm][u]["em"] == 0 and all_scores[baseline][u]["em"] == 1 for u in pair_ids)}
+        interaction = factorial_interaction(all_scores, [q["id"] for q in questions])
+        if interaction is not None:
+            summary["factorial_interaction"] = interaction
+        for q in questions:
+            comparison = {"unit_id": q["id"], "question": q["question"], "arms": {a: all_scores[a][q["id"]] for a in arms}}
+            comparisons.append(comparison)
+        dest = output / dataset
+        (dest / "comparisons.jsonl").write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in comparisons))
+        with (dest / "comparisons.csv").open("w", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["unit_id", "question", *[f"{a}.{k}" for a in arms for k in ("answer_status", "prediction", *METRICS)]])
+            for r in comparisons:
+                writer.writerow([r["unit_id"], r["question"], *[r["arms"][a][k] for a in arms for k in ("answer_status", "prediction", *METRICS)]])
+        save(dest / "summary.json", summary)
+        summaries[dataset] = summary
+    save(output / "summary.json", summaries)
+    return summaries
+
+
+@contextlib.contextmanager
+def writer_lock(output):
+    output = Path(output)
+    output.mkdir(parents=True, exist_ok=True)
+    with (output / "writer.lock").open("a+") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError("This output directory already has a live writer") from exc
+        yield
+
+
+def validate_experiment_options(config, args):
+    arms = args.arms
+    if len(set(arms)) != len(arms) or len(arms) < 2 or arms[0] != "original":
+        raise ValueError("Use at least two distinct arms, with original first")
+    from dagbt.config import METHODS, resolve
+    for arm in arms[1:]:
+        if arm not in METHODS:
+            raise ValueError("Unsupported fusion arm: " + arm)
+        resolved = resolve(config, arm)
+        if resolved["retrieval"] == "bridge" and resolved["proxy_mode"] == "activation" and not config.get("reranker"):
+            raise ValueError("Activation-scored Bridge arms require a configured pointwise reranker")
+    if args.limit is not None and args.limit <= 0:
+        raise ValueError("--limit must be positive")
+
+
+def run_experiment(args):
+    config = validate_config(load(args.config))
+    validate_experiment_options(config, args)
+    output = Path(args.output).resolve()
+    datasets, arms = args.datasets, args.arms
+    with writer_lock(output):
+        process_command = subprocess.check_output(["ps", "-p", str(os.getpid()), "-o", "command="], text=True).strip()
+        save(output / "pid.json", {"pid": os.getpid(), "pgid": os.getpgrp(), "started_unix": time.time(),
+                                  "output": str(output), "process_command": process_command})
+        save(output / "progress.json", {"state": "validating", "updated_unix": time.time()})
+        scopes = {d: load_questions(d, args.limit) for d in datasets}
+        manifest = {"schema": 1, "config": config, "datasets": datasets, "arms": arms,
+                    "question_ids": {d: [q["id"] for q in qs] for d, qs in scopes.items()},
+                    "questions_digest": {d: digest(qs) for d, qs in scopes.items()}, "source_hashes": frozen_sources(),
+                    "original_hash_manifest": file_hash(ROOT / "original_manifest.json"),
+                    "scope": "full_local_1000_per_dataset" if args.limit is None else f"first_{args.limit}_per_dataset",
+                    "baseline": "untouched native make_plan/archive/native.solve, same e.work failure handling; wrapper replaces filesystem resume and call accounting only",
+                    "generation": "all configured dataset/arm tasks terminal before first label load", "kind": "inference_evaluation_not_parameter_training"}
+        path = output / "manifest.json"
+        if path.exists() and load(path) != manifest:
+            raise ValueError("Config, source, data, arms or scope changed; use a new output directory")
+        save(path, manifest)
+        # Detached launch already probes the deployment. Reuse only its fresh,
+        # identical configuration report; still recheck all original file hashes.
+        launch_report = output / "launch_preflight.json"
+        prior_probe = load(launch_report) if launch_report.is_file() else {}
+        reusable = (not args.offline_preflight and prior_probe.get("config_digest") == digest(config)
+                    and prior_probe.get("source_hashes") == manifest["source_hashes"]
+                    and set(prior_probe.get("datasets", {})) == set(datasets)
+                    and 0 <= time.time() - prior_probe.get("created_unix", 0) < 300
+                    and "llm" in prior_probe.get("endpoints", {}))
+        if reusable:
+            report = {**prior_probe, "original_integrity": verify_originals(), "reused_launch_preflight": True}
+        else:
+            report = preflight(config, datasets, endpoints=not args.offline_preflight, output=output, arms=arms)
+        save(output / "preflight.json", report)
+        # SIGTERM raises through finally blocks, closing all persistent arm workers.
+        old_term = signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
+        try:
+            for dataset, questions in scopes.items():
+                generate_dataset(output, dataset, questions, arms, config, retry_failed=args.retry_failed)
+            save(output / "progress.json", {"state": "scoring", "updated_unix": time.time()})
+            summaries = score_all(output, scopes, arms)
+            failures = sum(sum(v for k, v in a["answer_status_counts"].items() if k != "ok") for d in summaries.values() for a in d["arms"].values())
+            save(output / "progress.json", {"state": "complete" if not failures else "complete_with_failures", "failed_arm_tasks": failures, "updated_unix": time.time()})
+        except BaseException as exc:
+            save(output / "progress.json", {"state": "stopped" if isinstance(exc, KeyboardInterrupt) else "failed", **redacted_error(exc), "updated_unix": time.time()})
+            raise
+        finally:
+            signal.signal(signal.SIGTERM, old_term)
+
+
+def lock_is_held(output):
+    path = Path(output) / "writer.lock"
+    if not path.exists():
+        return False
+    with path.open("a+") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+    return False
+
+
+def status(output):
+    output = Path(output)
+    return {"live_writer": lock_is_held(output),
+            "pid": load(output / "pid.json") if (output / "pid.json").exists() else None,
+            "progress": load(output / "progress.json") if (output / "progress.json").exists() else None,
+            "log": str(output / "launcher.log")}
+
+
+def stop(output):
+    output = Path(output).resolve()
+    info = status(output)
+    if not info["live_writer"]:
+        return {"stopped": False, "reason": "no live OS-locked writer; stale PID file ignored"}
+    record = info["pid"]
+    if not record or record.get("output") != str(output):
+        raise RuntimeError("No valid PID record for live writer")
+    pid = record["pid"]
+    command = subprocess.check_output(["ps", "-p", str(pid), "-o", "command="], text=True).strip()
+    # Comparing the command recorded after taking the writer lock handles both
+    # absolute detached-launch paths and relative foreground --output paths.
+    same_command = command == record["process_command"] if record.get("process_command") else str(output) in command
+    if "dagbt.runner" not in command or not same_command:
+        raise RuntimeError("PID identity mismatch; refusing to signal unrelated process")
+    os.kill(pid, signal.SIGTERM)
+    return {"stopped": True, "signal": "SIGTERM", "pid": pid}
+
+
+def launch(args):
+    output = Path(args.output).resolve()
+    config = validate_config(load(args.config))
+    validate_experiment_options(config, args)
+    if lock_is_held(output):
+        raise RuntimeError("Output already has a live experiment")
+    report = preflight(config, args.datasets, endpoints=not args.offline_preflight, output=output, arms=args.arms)
+    output.mkdir(parents=True, exist_ok=True)
+    save(output / "launch_preflight.json", report)
+    command = [sys.executable, "-m", "dagbt.runner", "run", "--config", str(Path(args.config).resolve()), "--output", str(output), "--datasets", *args.datasets, "--arms", *args.arms]
+    if args.limit is not None:
+        command += ["--limit", str(args.limit)]
+    if args.retry_failed:
+        command += ["--retry-failed"]
+    if args.offline_preflight:
+        command += ["--offline-preflight"]
+    with (output / "launcher.log").open("a") as log:
+        process = subprocess.Popen(command, cwd=ROOT, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    save(output / "launch.json", {"pid": process.pid, "command": command, "unix": time.time()})
+    return {"launched_pid": process.pid, "output": str(output), "log": str(output / "launcher.log"), "note": "Use status to confirm the writer started; launch does not imply completion."}
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+    for name in ("run", "launch", "preflight"):
+        command = sub.add_parser(name)
+        command.add_argument("--config", required=True)
+        command.add_argument("--datasets", nargs="+", choices=DATASETS, default=list(DATASETS))
+        command.add_argument("--offline-preflight", action="store_true", help="skip /models checks, not model calls during run")
+        if name != "preflight":
+            command.add_argument("--output", required=True)
+            command.add_argument("--arms", nargs="+", default=["original", "fusion"])
+            command.add_argument("--limit", type=int)
+            command.add_argument("--retry-failed", action="store_true")
+    for name in ("status", "stop"):
+        command = sub.add_parser(name)
+        command.add_argument("--output", required=True)
+    args = parser.parse_args(argv)
+    try:
+        if args.command == "run":
+            run_experiment(args)
+            result = status(args.output)
+        elif args.command == "launch":
+            result = launch(args)
+        elif args.command == "preflight":
+            result = preflight(load(args.config), args.datasets, endpoints=not args.offline_preflight)
+        elif args.command == "stop":
+            result = stop(args.output)
+        else:
+            result = status(args.output)
+        print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
+    except KeyboardInterrupt:
+        return 130
+    except Exception as exc:
+        if args.command == "run":
+            output = Path(args.output)
+            pidfile = output / "pid.json"
+            if pidfile.is_file() and load(pidfile).get("pid") == os.getpid() and not lock_is_held(output):
+                save(output / "progress.json", {"state": "failed", **redacted_error(exc), "updated_unix": time.time()})
+        print(json.dumps(redacted_error(exc), ensure_ascii=False), file=sys.stderr, flush=True)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

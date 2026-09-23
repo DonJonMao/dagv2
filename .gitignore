@@ -6,6 +6,7 @@ outputs/
 runs/
 *.log
 *.pid
-config.json
+/config.json
+/configs/*.local.json
 .env
 data/*/index/passage_vectors.npy

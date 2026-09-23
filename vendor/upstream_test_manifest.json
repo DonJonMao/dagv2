@@ -1,0 +1,23 @@
+[
+  {
+    "original": "/Users/mao/projects/bridgetree_preference_rag/tests/test_evidence_search.py",
+    "destination": "tests/test_bridge_upstream_evidence_search.py",
+    "source_sha256": "edd2f436b41101490907e4458956b94cab6057764ec4738b4e81acd4145c755c",
+    "adapted_sha256": "e951d568a92110aaeb4e7d88337e71dde8d68680b87e5247235595bedafabde3",
+    "only_transformation": "from bridgetree. -> from vendor.bridgetree."
+  },
+  {
+    "original": "/Users/mao/projects/bridgetree_preference_rag/tests/test_dependency_scoring.py",
+    "destination": "tests/test_bridge_upstream_dependency_scoring.py",
+    "source_sha256": "295e96d47a65f549d7ae0678670d11dad6ba6a653e57818e02505085b033a950",
+    "adapted_sha256": "bf0a16af1c067d07902dcbf87e031e20daf278f9b1be6724ed10ade97768c66b",
+    "only_transformation": "from bridgetree. -> from vendor.bridgetree."
+  },
+  {
+    "original": "/Users/mao/projects/bridgetree_preference_rag/tests/test_dependency_retrieval.py",
+    "destination": "tests/test_bridge_upstream_dependency_retrieval.py",
+    "source_sha256": "570b9bf81c2955b0b6546ec358c6461a791076d68c4f37a07e546d4fb55f6e17",
+    "adapted_sha256": "10730f20042ca872138efa9f0ba6e28243daac02c6fba6dcb8a1e07fb8919fdb",
+    "only_transformation": "from bridgetree. -> from vendor.bridgetree."
+  }
+]

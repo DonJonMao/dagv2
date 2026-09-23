@@ -1,0 +1,12 @@
+[
+  {
+    "source": "/Users/mao/projects/bridgetree_preference_rag/day2/implementation_plan.md",
+    "copy": "docs/design_reference/implementation_plan.md",
+    "sha256": "04e94501decf44b039d4f1efc7a4c9b1cbff46eced2932f19cfb284913f18edb"
+  },
+  {
+    "source": "/Users/mao/projects/bridgetree_preference_rag/day2/fusion_report.md",
+    "copy": "docs/design_reference/fusion_report.md",
+    "sha256": "44029a692b163bc3fd4094a0df23c154a95ba52d0bdfa1571f7755d5df8f604e"
+  }
+]
