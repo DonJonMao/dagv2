@@ -6,7 +6,7 @@
 
 默认配置已与 BT 当前部署一致：DeepSeek-V4-Flash、Qwen3-Embedding-8B、Qwen3-Reranker-8B，具体服务和继承来源见 [模型对齐说明](MODEL_ALIGNMENT.md)。可将 `configs/paired.example.json` 复制为本地配置覆盖端点。原版和融合版共用这些模型；原版方法本身不额外调用 reranker。首次运行会在后台先重建 Qwen3 语料索引，保留旧 NV 数组；维度相同也不会混用。
 
-凭证优先从 `DAG_LLM_API_KEY`（或 `BRIDGETREE_CHAT_API_KEY`）、`DAG_EMBED_API_KEY`、`DAG_RERANK_API_KEY` 读取；也支持 Git 忽略的本地凭据文件，严格校验其绑定端点。公开实验配置里禁止写 API key，URL 禁止包含账号、密码或 query 参数。新增依赖见 `requirements-fusion.txt`；脚本优先使用仓库 `.venv/bin/python`，可通过 `DAGBT_PYTHON` 指定解释器。支持 macOS/Linux，使用 POSIX 文件锁和信号。
+凭证优先从 `DAG_LLM_API_KEY`（或 `BRIDGETREE_CHAT_API_KEY`）、`DAG_EMBED_API_KEY`、`DAG_RERANK_API_KEY` 读取。当前 BT LLM 地址已有代码内置默认 key，无需手工配置；其他端点和服务也支持 Git 忽略的本地凭据文件，严格校验其绑定端点。实验 JSON 配置不接受 API key 字段，URL 不接受账号、密码或 query 参数。新增依赖见 `requirements-fusion.txt`；脚本优先使用仓库 `.venv/bin/python`，可通过 `DAGBT_PYTHON` 指定解释器。支持 macOS/Linux，使用 POSIX 文件锁和信号。
 
 ```bash
 # 只检查文件、依赖和配置，不访问模型端点，也不进行推理。

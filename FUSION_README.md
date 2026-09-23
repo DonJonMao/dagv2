@@ -38,7 +38,7 @@ Python 3.10+；建议 3.11。模型服务使用 BT 的既有部署，融合依�
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements-fusion.txt
 cp configs/paired.example.json configs/paired.local.json
-# 默认模型和端点已与 BT 对齐；凭证使用环境变量或不进 Git 的本地文件。
+# 默认模型、端点与 LLM key 已配置；环境变量可覆盖凭证。
 
 # 配好服务后一条命令后台启动全部 3×1000 题，每题旧/新各一次：
 bash scripts/run_paired.sh --config configs/paired.local.json --output outputs/paired_full
@@ -46,7 +46,7 @@ bash scripts/run_paired.sh --config configs/paired.local.json --output outputs/p
 
 先跑 `--limit 2` 到单独目录可以检查真实模型协议；即使只测两题，也需要所选数据集的完整语料索引。后台任务不依赖终端，支持 `status`、`stop`、原命令恢复和显式 `--retry-failed`；某题超时或失败不会停止另一版本和后续题。成功结果不会重复生成，失败尝试始终保留。数据范围或代码变动须换输出目录。
 
-完整命令、日志结构、故障处理见 [成对实验运行说明](docs/PAIRED_RUNNER.md)。
+上传 tar 包后的安装和启动步骤见 [服务器运行说明](docs/SERVER_RUN.md)。完整命令、日志结构、故障处理见 [成对实验运行说明](docs/PAIRED_RUNNER.md)。
 
 ## 如何判断各模块有用
 
