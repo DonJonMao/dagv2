@@ -2,11 +2,12 @@
 from __future__ import annotations
 import hashlib
 import json
-import os
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from .model_runtime import (prepare_request, normalize_response, resolve_api_key,
+                            is_bridgetree, count_request_tokens, token_accounting)
 
 class ServiceError(RuntimeError): pass
 class ResponseError(ValueError): pass
@@ -30,10 +31,20 @@ class Transport:
         rerank=url==self.config.get('reranker',{}).get('url') or url.rstrip('/').endswith(('/rerank','/reranks'))
         reader=stage_text.startswith('reader/')
         kind='embedding_http' if embed else 'rerank_http' if rerank else 'reader' if reader else 'llm'
-        model=self.config.get('reranker',{}).get('model') if rerank else self.config['embedding_model' if embed else 'llm_model']
-        payload={**payload,'model':model}
-        if not (embed or rerank):
-            payload={**payload,'temperature':0,'top_p':1,'seed':20260918}
+        url,payload,legacy_text=prepare_request(stage,url,payload,self.config)
+        if is_bridgetree(self.config) and not (embed or rerank):
+            count=count_request_tokens(stage,url,payload,self.config,self.tokenizer)
+            context_limit=self.config.get('fusion',{}).get('context_tokens',16384)
+            total=count+payload['max_tokens']+8
+            event={'event':'model_context_budget','stage':stage_text,'input_tokens_local':count,
+                   'output_token_reserve':payload['max_tokens'],'safety_margin':8,
+                   'context_tokens':context_limit,'total_tokens_local':total,
+                   'within_estimated_budget':total<=context_limit,**token_accounting(self.config)}
+            self.ledger.record(event)
+            if total>context_limit:
+                raise ResponseError(f'BridgeTree estimated context budget at {stage_text}: '
+                                    f'{count}+{payload["max_tokens"]}+8>{context_limit}; '
+                                    'regex estimate, not the deployed model tokenizer')
         identity={'unit_id':self.unit,'url':url,'payload':payload}
         key=digest(identity);path=self.output/'requests'/(key+'.json')
         record=json.loads(path.read_text()) if path.exists() else {**identity,'stage':stage,'attempts':[]}
@@ -48,9 +59,8 @@ class Transport:
             self.ledger.reserve('cache_hits',stage_text)
             self.ledger.record({'event':'cached_attempt_charge','stage':stage_text,'kind':kind,'replayed_attempts':charges})
             self.ledger.record({'event':'request_cache_hit','stage':stage_text,'response_ref':key,'kind':kind})
-            return {'response':record['response'],'response_ref':key,'request':payload}
-        env='DAG_EMBED_API_KEY' if embed else 'DAG_RERANK_API_KEY' if rerank else 'DAG_LLM_API_KEY'
-        secret=os.environ.get(env,'')
+            return {'response':normalize_response(record['response'],legacy_text),'response_ref':key,'request':payload}
+        secret=resolve_api_key(self.config,'embedding' if embed else 'reranker' if rerank else 'llm')
         limit=int(self.config.get('max_identical_attempts',3))
         attempts_this_call=0
         # A runner explicit retry uses a new attempt dir; old failed attempts remain archived.
@@ -64,7 +74,9 @@ class Transport:
             if secret:headers['Authorization']='Bearer '+secret
             request=urllib.request.Request(url,data=json.dumps(payload).encode(),headers=headers,method='POST')
             try:
-                with urllib.request.urlopen(request,timeout=self.config.get('request_timeout_seconds',600)) as response:
+                timeout=(self.config.get('reranker',{}).get('timeout_seconds',self.config.get('request_timeout_seconds',600))
+                         if rerank else self.config.get('request_timeout_seconds',600))
+                with urllib.request.urlopen(request,timeout=timeout) as response:
                     body=json.load(response)
                 if not isinstance(body,dict):raise ResponseError('Response must be an object')
                 if embed and not body.get('data'):raise ResponseError('Embedding data missing')
@@ -83,7 +95,7 @@ class Transport:
                 event={'event':'http_response','stage':stage_text,'response_ref':key,'kind':kind,
                        'usage':body.get('usage'), 'seconds':attempt['finished_unix']-attempt['started_unix']}
                 self.ledger.record(event);self.events.append(event)
-                return {'response':body,'response_ref':key,'request':payload}
+                return {'response':normalize_response(body,legacy_text),'response_ref':key,'request':payload}
             if attempts_this_call < limit:time.sleep(min(2*attempts_this_call,5))
         raise ServiceError(f'Retry limit at {stage_text}; request {key}')
 
@@ -92,7 +104,7 @@ class Transport:
         flat_reserve=int(settings.get('selection')=='flat')
         reserved=(0 if stage.startswith('select/') else flat_reserve if stage.startswith('audit/')
                   else int(settings.get('reserved_audit_calls',1))+flat_reserve)
-        if kind=='llm' and self.ledger.remaining('llm')<=reserved:
+        if kind=='llm' and 'llm' in self.ledger.limits and self.ledger.remaining('llm')<=reserved:
             from .budget import BudgetExceeded
             raise BudgetExceeded('llm',stage,1,0)
         self.ledger.reserve(kind,stage)

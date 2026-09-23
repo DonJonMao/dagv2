@@ -19,14 +19,14 @@ case "$ACTION" in
   launch|run)
     exec "$PYTHON" -m dagbt.runner "$ACTION" --config "$ROOT/configs/paired.example.json" --output "$ROOT/outputs/paired" "$@"
     ;;
-  preflight)
-    exec "$PYTHON" -m dagbt.runner preflight --config "$ROOT/configs/paired.example.json" "$@"
+  preflight|prepare-index)
+    exec "$PYTHON" -m dagbt.runner "$ACTION" --config "$ROOT/configs/paired.example.json" "$@"
     ;;
   status|stop)
     exec "$PYTHON" -m dagbt.runner "$ACTION" --output "$ROOT/outputs/paired" "$@"
     ;;
   *)
-    echo "Usage: $0 [launch|run|preflight|status|stop] [options]" >&2
+    echo "Usage: $0 [launch|run|preflight|prepare-index|status|stop] [options]" >&2
     exit 2
     ;;
 esac

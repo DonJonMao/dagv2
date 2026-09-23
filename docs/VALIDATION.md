@@ -1,6 +1,6 @@
 # 验证记录
 
-日期：2026-09-23。本记录区分源码保留、机制测试、真实流水线协议测试与真实模型效果。
+日期：2026-09-23。本记录对应首版提交 `f78ddfa` 的 Qwen/NV 配置，区分源码保留、机制测试、真实流水线协议测试与真实模型效果。随后按用户要求切换到 BT 模型的改动与验证见 [MODEL_ALIGNMENT.md](MODEL_ALIGNMENT.md)。
 
 ## 原始材料与运行环境
 
@@ -51,4 +51,4 @@ bash scripts/run_paired.sh preflight --config configs/paired.example.json --offl
 - 原版包装器与原 `e.work` 计算路径对照；后台启动/状态/停止、超时与坏题隔离、显式重试、恢复身份、标签延后加载。
 - `fusion_no_conditions` 只关闭独立条件审计阶段，仍保留基础实体、条件、时间和引用检查。程序结构约束不是自然语言蕴涵证明。
 
-当前默认模型端口 8019/8020/8021 均未运行，见 `outputs/verification/default_services.json`。示例配置的 reranker 名是占位符；尚未运行真实模型的完整对比实验，也没有关于融合收益的结果。配置实际 Qwen、NV-Embed-v2 和 pointwise reranker 服务后，应先用独立输出目录运行 `--limit 2`，确认真实服务协议，再启动全量成对实验。
+验证首版时，本地模型端口 8019/8020/8021 均未运行，见 `outputs/verification/default_services.json`；当时的 reranker 名是占位符。该配置现保存在 `configs/paired.legacy.json`。这里没有真实模型完整对比结果，也没有关于融合收益的结论。

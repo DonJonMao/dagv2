@@ -1,0 +1,29 @@
+{
+  "llm_base_url": "http://127.0.0.1:8020/v1",
+  "embedding_base_url": "http://127.0.0.1:8019/v1",
+  "llm_model": "qwen3.8-27b",
+  "embedding_model": "nvidia/NV-Embed-v2",
+  "request_timeout_seconds": 600,
+  "max_identical_attempts": 3,
+  "reranker": {
+    "url": "http://127.0.0.1:8021/rerank",
+    "model": "your-pointwise-reranker-model",
+    "score_space": "unit_interval",
+    "score_contract": "pointwise",
+    "max_input_tokens": 8192,
+    "batch_size": 32
+  },
+  "fusion": {
+    "ann_calls": 36,
+    "set_score_calls": 512,
+    "llm_calls": 24,
+    "reader_calls": 1,
+    "context_tokens": 16384,
+    "reader_output_tokens": 1024
+  },
+  "experiment": {
+    "question_timeout_seconds": 3600,
+    "worker_startup_timeout_seconds": 300,
+    "max_question_attempts": 3
+  }
+}

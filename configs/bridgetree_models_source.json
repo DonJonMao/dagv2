@@ -1,0 +1,25 @@
+{
+  "source_profile": "/Users/mao/projects/bridgetree_preference_rag/configs/evidence_bridge.yaml",
+  "source_files_sha256": {
+    "/Users/mao/projects/bridgetree_preference_rag/configs/evidence_bridge.yaml": "261e639f58c8ce95b375fec19779ea317fe2b9d369d7469f43e81182baf9cb82",
+    "/Users/mao/projects/bridgetree_preference_rag/configs/chain_service_fixed.yaml": "c1dadba1c359cee13c490cc66bc5d126834888c0308c8d4dc34f2e17f3042c48",
+    "/Users/mao/projects/bridgetree_preference_rag/configs/chain_full.yaml": "a9378a3d36d9f234f2e8d9e4d87ea5bf6e34afed07a80a9b22274dfcecaf4291",
+    "/Users/mao/projects/bridgetree_preference_rag/configs/default.yaml": "c05519724d764b8c02b00356fb589395c1105c3871a4819ace5fdc4e6a777eee"
+  },
+  "secrets_included": false,
+  "llm": {
+    "model": "deepseek-v4-flash",
+    "endpoint": "http://111.19.156.30:8006/v1/chat/completions",
+    "provider_request_params": {}
+  },
+  "embedding": {
+    "model": "qwen3-embedding-8b",
+    "endpoint": "http://111.19.156.74:8001/v1/embeddings"
+  },
+  "reranker": {
+    "wire_model": "",
+    "endpoint": "http://111.19.156.74:8002/rerank",
+    "declared_model_id": "Qwen3-Reranker-8B",
+    "max_batch_documents": 4
+  }
+}

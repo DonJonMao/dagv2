@@ -114,7 +114,7 @@ def test_actual_packaged_hotpot_question_both_algorithms_with_scripted_http(tmp_
     assert len(vector) == 4096
     output = tmp_path/'scripted_model_free_system_test'
     with scripted_models(q['question'], vector) as (endpoint, requests, errors):
-        config = runner.load(runner.ROOT/'configs/paired.example.json')
+        config = runner.load(runner.ROOT/'configs/paired.legacy.json')
         config.update(llm_base_url=endpoint+'/v1', embedding_base_url=endpoint+'/v1',
                       request_timeout_seconds=10, max_identical_attempts=1)
         config['reranker'].update(url=endpoint+'/rerank', model='fixture-pointwise')

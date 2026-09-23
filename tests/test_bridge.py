@@ -22,7 +22,7 @@ class Calls:
         if url.endswith('/embeddings'):
             # Deterministic server substitute, with distinct bridge discoveries.
             x = len(self.requests) % 4
-            return {'response': {'data': [{'embedding': [float(i == x) for i in range(4)]}]}}
+            return {'response': {'data': [{'index': 0, 'embedding': [float(i == x) for i in range(4)]}]}}
         if self.fail_rerank:
             raise ConnectionError('test reranker unavailable')
         # Genuine source activation code receives complete indexed responses.

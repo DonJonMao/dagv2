@@ -16,7 +16,7 @@ from typing import Any
 import numpy as np
 
 from vendor.bridgetree.dependency_retrieval import DependencyRetriever
-from vendor.bridgetree.dependency_scoring import SetReranker, probe_pointwise_consistency
+from vendor.bridgetree.dependency_scoring import SetReranker, probe_pointwise_consistency, _restore_indexed_scores
 from vendor.bridgetree.diagnostic_observability import observation_scope
 from vendor.bridgetree.evidence_config import EvidenceSearchConfig
 from vendor.bridgetree.evidence_search import EvidenceBridgeSearcher
@@ -100,12 +100,16 @@ class _Embedder:
             raise ValueError("embedding response requires indexed data")
         if len(response["data"]) != 1:
             raise ValueError("single query embedding response must contain exactly one vector")
+        index = response["data"][0].get("index")
+        if isinstance(index, bool) or not isinstance(index, int) or index != 0:
+            raise ValueError("single query embedding response requires index zero")
         vector = np.asarray(response["data"][0]["embedding"], dtype=np.float32)
         if vector.shape != (self.session.vectors.shape[1],) or not np.isfinite(vector).all():
             raise ValueError("query embedding dimensions or finite values differ from corpus")
-        if not float(np.linalg.norm(vector)):
+        norm = float(np.linalg.norm(vector.astype(np.float64)))
+        if not math.isfinite(norm) or norm <= 0:
             raise ValueError("query embedding must be nonzero")
-        return vector
+        return vector / norm
 
 
 class _Reranker:
@@ -117,6 +121,8 @@ class _Reranker:
         if settings.get("score_contract", "pointwise") != "pointwise":
             raise ValueError("Evidence BridgeTree requires a pointwise reranker")
         self.calls, self.ledger, self.sequence = calls, ledger, 0
+        self.max_batch_documents = min(4, _positive_int(
+            settings.get("max_batch_documents", 4), "reranker.max_batch_documents", 1))
         self.config = SimpleNamespace(
             endpoint=url, model=settings.get("model", ""),
             score_space=settings.get("score_space", "unit_interval"),
@@ -127,17 +133,33 @@ class _Reranker:
 
     def rerank_all(self, query: str, documents: Sequence[str]) -> Any:
         self.sequence += 1
-        payload = {"model": self.config.model, "query": query, "documents": list(documents),
-                   "top_n": len(documents), "return_documents": False}
-        stage = ("dagbt", "set_reranker", str(self.sequence))
-        self.ledger.record({"event": "bridge_rerank_request", "stage": list(stage),
-                            "query": query, "documents": list(documents),
-                            "score_contract": "pointwise", "score_space": self.score_space})
+        documents = list(documents)
+        combined = []
         post = getattr(self.calls, "post_rerank", self.calls.get)
-        result = post(stage, self.config.endpoint, payload)
-        body = _response(result)
-        self.ledger.record({"event": "bridge_rerank_response", "stage": list(stage), "response": body})
-        return body
+        for offset in range(0, len(documents), self.max_batch_documents):
+            batch = documents[offset:offset + self.max_batch_documents]
+            payload = {"query": query, "documents": batch,
+                       "top_n": len(batch), "return_documents": False}
+            if self.config.model:
+                payload["model"] = self.config.model
+            stage = ("dagbt", "set_reranker", str(self.sequence), "batch", str(offset))
+            self.ledger.record({"event": "bridge_rerank_request", "stage": list(stage),
+                                "query": query, "documents": batch, "document_offset": offset,
+                                "logical_document_count": len(documents),
+                                "physical_batch_limit": self.max_batch_documents,
+                                "score_contract": "pointwise", "score_space": self.score_space})
+            result = post(stage, self.config.endpoint, payload)
+            body = _response(result)
+            self.ledger.record({"event": "bridge_rerank_response", "stage": list(stage),
+                                "response_ref": result.get("response_ref") if isinstance(result, Mapping) else None,
+                                "document_offset": offset, "response": body})
+            # Validate each raw batch before combining, retaining the source
+            # truncation/index/finite/score-space contract without reindexing
+            # malformed provider responses into an apparently valid ranking.
+            scores = _restore_indexed_scores(body, len(batch), self.score_space)
+            combined.extend({"index": offset + index, "relevance_score": score}
+                            for index, score in enumerate(scores))
+        return {"results": combined}
 
 
 class _Scorer(SetReranker):
@@ -213,7 +235,7 @@ class BridgeSession:
     def __init__(self, original_query: str, docs: Any, ids: Sequence[str], vectors: Any,
                  tokenizer: Any, calls: Any, config: Mapping[str, Any], ledger: Any):
         self.original_query, self.calls, self.config, self.ledger = original_query, calls, dict(config), ledger
-        self.tokenizer = tokenizer  # Reader uses the real tokenizer; source R budget is explicitly estimated.
+        self.tokenizer = tokenizer  # Reader accounting follows the explicitly reported model profile.
         self.ids = tuple(str(x) for x in ids)
         if len(set(self.ids)) != len(self.ids):
             raise ValueError("corpus IDs must be unique")

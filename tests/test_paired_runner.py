@@ -334,7 +334,7 @@ def test_manifest_rejects_changed_scope_before_worker_start(monkeypatch, tmp_pat
 
 
 def cli_fixture(tmp_path, *, delay=0, fail=False):
-    config = r.load(r.ROOT / "configs/paired.example.json")
+    config = r.load(r.ROOT / "configs/paired.legacy.json")
     config["experiment"].update(fixture_delay=delay, fixture_fail_original=fail)
     config_path = tmp_path / "config.json"
     r.save(config_path, config)
@@ -391,7 +391,7 @@ def test_detached_cli_stop_reaps_active_workers(tmp_path):
 @pytest.mark.parametrize("arms,limit", [(["original", "not_a_method"], 1), (["original", "fusion"], 0)])
 def test_launch_rejects_invalid_options_before_service_probe(monkeypatch, tmp_path, arms, limit):
     config = tmp_path / "config.json"
-    r.save(config, r.load(r.ROOT / "configs/paired.example.json"))
+    r.save(config, r.load(r.ROOT / "configs/paired.legacy.json"))
     def unexpected_preflight(*args, **kwargs):
         raise AssertionError("Service preflight must not run for invalid experiment options")
     monkeypatch.setattr(r, "preflight", unexpected_preflight)
@@ -403,7 +403,7 @@ def test_launch_rejects_invalid_options_before_service_probe(monkeypatch, tmp_pa
 
 
 def test_standalone_preflight_rejects_invalid_fusion_budget_before_http(monkeypatch):
-    config = r.load(r.ROOT / "configs/paired.example.json")
+    config = r.load(r.ROOT / "configs/paired.legacy.json")
     config["fusion"]["ann_calls"] = 0
     def unexpected_probe(*args, **kwargs):
         raise AssertionError("No service request is allowed for invalid budgets")
@@ -413,7 +413,7 @@ def test_standalone_preflight_rejects_invalid_fusion_budget_before_http(monkeypa
 
 
 def test_proxy_free_control_can_launch_without_reranker_but_full_bridge_cannot():
-    config = r.load(r.ROOT / "configs/paired.example.json")
+    config = r.load(r.ROOT / "configs/paired.legacy.json")
     config.pop("reranker")
     args = SimpleNamespace(arms=["original", "fusion_proxy_free"], limit=1)
     r.validate_experiment_options(config, args)
@@ -423,7 +423,7 @@ def test_proxy_free_control_can_launch_without_reranker_but_full_bridge_cannot()
 
 
 def test_stop_foreground_relative_output_path(tmp_path):
-    config = r.load(r.ROOT / "configs/paired.example.json")
+    config = r.load(r.ROOT / "configs/paired.legacy.json")
     config["experiment"]["fixture_delay"] = 30
     config_path = tmp_path / "config.json"
     r.save(config_path, config)

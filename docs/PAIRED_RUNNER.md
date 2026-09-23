@@ -4,9 +4,9 @@
 
 ## 一键后台运行
 
-先部署原仓库要求的 Qwen3.8 和 NV-Embed-v2 服务，另外准备最新版 BT 所需的 **pointwise reranker**。将 `configs/paired.example.json` 复制为自己使用的配置，填写模型名和端点；示例 reranker 名是明确的占位符。已有 NV-Embed-v2 语料向量不能搭配其他 embedding 模型使用。
+默认配置已与 BT 当前部署一致：DeepSeek-V4-Flash、Qwen3-Embedding-8B、Qwen3-Reranker-8B，具体服务和继承来源见 [模型对齐说明](MODEL_ALIGNMENT.md)。可将 `configs/paired.example.json` 复制为本地配置覆盖端点。原版和融合版共用这些模型；原版方法本身不额外调用 reranker。首次运行会在后台先重建 Qwen3 语料索引，保留旧 NV 数组；维度相同也不会混用。
 
-凭证只从 `DAG_LLM_API_KEY`、`DAG_EMBED_API_KEY`、`DAG_RERANK_API_KEY` 读取。配置里禁止写 API key，URL 禁止包含账号、密码或 query 参数。不要把凭证传入命令行。新增依赖见 `requirements-fusion.txt`；脚本优先使用仓库 `.venv/bin/python`，可通过 `DAGBT_PYTHON` 指定解释器。支持 macOS/Linux，使用 POSIX 文件锁和信号。
+凭证优先从 `DAG_LLM_API_KEY`（或 `BRIDGETREE_CHAT_API_KEY`）、`DAG_EMBED_API_KEY`、`DAG_RERANK_API_KEY` 读取；也支持 Git 忽略的本地凭据文件，严格校验其绑定端点。公开实验配置里禁止写 API key，URL 禁止包含账号、密码或 query 参数。新增依赖见 `requirements-fusion.txt`；脚本优先使用仓库 `.venv/bin/python`，可通过 `DAGBT_PYTHON` 指定解释器。支持 macOS/Linux，使用 POSIX 文件锁和信号。
 
 ```bash
 # 只检查文件、依赖和配置，不访问模型端点，也不进行推理。
@@ -15,7 +15,8 @@ bash scripts/run_paired.sh preflight --config configs/paired.local.json --offlin
 # 检查模型服务：GET /models；reranker 做 5 次无标注的单条/混合/倒序一致性探测。
 bash scripts/run_paired.sh preflight --config configs/paired.local.json
 
-# 先用每个数据集的前 2 题检查实际 structured JSON、模型和 tokenizer 兼容性。
+# 先用每个数据集的前 2 题检查实际 JSON 输出和模型接口兼容性。
+# 首次仍需为所选数据集的完整语料建索引。
 bash scripts/run_paired.sh --config configs/paired.local.json --output outputs/paired_smoke --limit 2
 
 # 完整的默认双臂实验：3 个数据集，各 1,000 题，每题原版和融合版各一次。
@@ -29,7 +30,7 @@ bash scripts/run_paired.sh stop --output outputs/paired_full
 
 reranker 预检直接调用当前 BT 源码的 pointwise consistency probe：空集合序列化、两条固定文本的单条分数，要与混合和倒序批次一致。探测报告、请求、重试、usage 保存在 `preflight_calls/`，独立于每题预算。后台进程复用 5 分钟内、完全相同配置的本次 launch 报告，避免重复探测，但重新核验原始文件。通过只证明这组探针的一致性，不证明所有输入上的契约或相关性质量。
 
-离线预检也实际加载包内 tokenizer 并渲染 chat template，检查 NumPy、Transformers、PyYAML、Jinja2，记录依赖版本、模板输出摘要、tokenizer 文件、当前源码和语料/向量 SHA256。在线 `/models` 返回的所选模型 metadata 另存；配置中的 `deployment_identity` 和 reranker 同名字段作为操作者声明记录。模型 ID、服务 metadata 不自动等于权重校验和或不可变 revision，未提供的身份不会被编造。
+离线预检检查 NumPy、Transformers、PyYAML、Jinja2，记录依赖、源码和语料身份。BT 配置检查 chat 消息适配和明确标注的 token 估算，报告派生索引 `ready/needs_build`；历史配置则加载包内 tokenizer 渲染模板。在线 `/models` 返回的所选模型 metadata 另存；配置中的 `deployment_identity` 和 reranker 同名字段作为操作者声明记录。模型 ID、服务 metadata 不自动等于权重校验和或不可变 revision。
 
 `--offline-preflight` 仅跳过服务检查，**不会**把 `run`/`launch` 变成离线实验。离线机制测试使用 pytest 的显式模拟服务，生产运行没有假结果回退。
 
@@ -51,13 +52,13 @@ bash scripts/run_paired.sh --config configs/paired.local.json --output outputs/p
 
 ## 原版保持什么
 
-`original` 调用未修改的 `e.make_plan`、`e.archive`、`e.native.solve`；`experiment_v6` 仍按原仓库方式装载 controller/reader。保留原版 `e.work` 对 `PlanError` 和 context overflow 的处理，仅将文件恢复和 `Calls` 创建移到协调器，以记录真实缓存/请求开销。原版 planner、原始 dense 查询、节点检索、闭包选择、reader chain 注入和采样参数均不调整。
+`original` 保留原 planner、dense 查询、节点检索、闭包选择和 reader chain 算法，`experiment_v6` 仍装载原 controller/reader。历史配置继续直接调用原 `e.archive`；BT 配置的等价 archive 适配仅将固定 4096 维校验改为当前索引维度。两方法共同使用新的向量、chat 协议和 BT token 估算；JSON schema 作为格式指令发送，模型参数遵循 BT 部署配置。原始文件未修改，但不能把新模型运行称为旧 Qwen/NV 实验的直接复现。
 
 融合版默认 raw-memory reader，与原版 chain reader 不完全匹配。因此 **original vs fusion 是系统级对比，不能单独证明 BT 或依赖选择的因果贡献**。原始目录 `dagv2/`、`package/`、`data/` 和原有脚本用 `original_manifest.json` 核验；标签文件哈希检查延迟到评分阶段，生成阶段不打开标签。
 
 ## 必需的机制对照
 
-相同融合 solver、reader 和预算下，建议完整 2×2：
+相同融合 solver、reader、模型和 token 计量方式下，建议完整 2×2：
 
 ```bash
 bash scripts/run_paired.sh --config configs/paired.local.json --output outputs/factorial \
@@ -84,6 +85,7 @@ bash scripts/run_paired.sh --config configs/paired.local.json --output outputs/f
 ## 日志和评测
 
 - 根目录 `manifest.json`、`preflight.json`、`pid.json`、`progress.json`、`events.jsonl`、`launcher.log`：运行身份、状态、任务终态。
+- BT 配置另有 `index_artifacts.json` 和 `index_build/<dataset>/`：共用派生向量身份、批量编码请求、恢复进度和独立索引费用。`preparing_index` 阶段还未进入问题生成。
 - `<dataset>/<arm>/rows/<question-hash>.json`：每题当前权威结果、ranking/graph、5/10/20 证据选择、答案和 runner 开销。
 - `<dataset>/<arm>/attempts/<question-hash>/attempt-NNN/`：不可覆盖的尝试；原始请求/响应、成功缓存来源、每次逻辑调用事件、方法诊断。
 - `<dataset>/<arm>/failures/`：失败历史，即使后续成功仍保留。
@@ -94,7 +96,7 @@ bash scripts/run_paired.sh --config configs/paired.local.json --output outputs/f
 
 全任务答案失败计零，同时显式报告失败率；检索指标仍按实际保存的选集计算。共同成功结果另报，避免把服务可靠性误当算法差异。多方法时既报全部方法共同成功，也报每个方法与 original 的成对共同成功。rescues/harm 是同题 EM 变化，不是经过干预证明的证据因果效应。
 
-模块诊断把两种证据分开：`gold_candidate_title_group_recall`/`gold_candidate_all_support` 衡量发现阶段是否找到了标注支持，`gold_discovery_minus_selection_recall_at20` 衡量发现后在选择阶段丢失多少标注支持。它们只在评分阶段计算。`structural_complete_required_at20`、节点 unknown/ambiguous、必要需求覆盖、quote/span protocol 错误、ANN/set-score 用量、实际 reader token 单独汇总；这些模型判断与结构校验不等于 gold 正确性。每项汇总都有 observed/missing 分母，失败或未观测不能伪装成完整闭包或零 token。
+模块诊断把两种证据分开：`gold_candidate_title_group_recall`/`gold_candidate_all_support` 衡量发现阶段是否找到了标注支持，`gold_discovery_minus_selection_recall_at20` 衡量发现后在选择阶段丢失多少标注支持。它们只在评分阶段计算。`structural_complete_required_at20`、节点 unknown/ambiguous、必要需求覆盖、quote/span protocol 错误、ANN/set-score 用量、reader token 单独汇总。BT 本地计量是估算，`local_token_accounting` 明确标记；API usage 另存，未观测不当作零。模型判断与结构校验不等于 gold 正确性。
 
 成本日志区分逻辑调用、成功缓存命中、HTTP 尝试、重试和成功响应的 token usage。不返回 usage 的服务记为未知；服务器已执行但响应丢失的成本无法完全观测，因此总 token 是下界，不能把缺失 usage 解释成零成本。服务预检的轻量探测不混入方法实验预算，其 usage 单独保存在 preflight。
 

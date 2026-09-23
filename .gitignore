@@ -10,3 +10,4 @@ runs/
 /configs/*.local.json
 .env
 data/*/index/passage_vectors.npy
+/data/derived/

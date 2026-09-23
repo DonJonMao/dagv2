@@ -75,6 +75,8 @@ def redacted_error(exc):
 def validate_config(config):
     if "_test_transport" in config:
         raise ValueError("_test_transport is forbidden in production runner configuration")
+    if config.get("model_profile", "legacy") not in ("legacy", "bridgetree"):
+        raise ValueError("model_profile must be legacy or bridgetree")
     # Native caches store URLs/payloads. Credentials must stay in environment headers.
     for key, value in config.items():
         if isinstance(value, dict):
@@ -124,10 +126,11 @@ def verify_originals(*, include_labels=False):
     return {"checked": checked, "label_hash_checks_deferred_until_scoring": deferred}
 
 
-def probe_endpoint(base, model, key_env, timeout=10):
+def probe_endpoint(base, model, key_env, timeout=10, *, api_key=None):
     headers = {}
-    if os.environ.get(key_env):
-        headers["Authorization"] = "Bearer " + os.environ[key_env]
+    credential = os.environ.get(key_env) if api_key is None else api_key
+    if credential:
+        headers["Authorization"] = "Bearer " + credential
     request = urllib.request.Request(base.rstrip("/") + "/models", headers=headers)
     with urllib.request.urlopen(request, timeout=timeout) as response:
         result = json.load(response)
@@ -157,8 +160,8 @@ def probe_local_tokenizer():
 
 def probe_reranker(config, output=None):
     settings = config.get("reranker", {})
-    if not settings.get("url") or not settings.get("model"):
-        raise ValueError("BridgeTree requires explicit reranker.url and reranker.model")
+    if not settings.get("url") or not isinstance(settings.get("model", ""), str):
+        raise ValueError("BridgeTree requires reranker.url; an empty model uses the service default")
     if settings.get("score_contract", "pointwise") != "pointwise":
         raise ValueError("BridgeTree requires a pointwise reranker")
     from dagbt.bridge import probe_reranker_protocol
@@ -195,7 +198,15 @@ def preflight(config, datasets, *, endpoints=True, output=None, arms=None):
     if missing_modules:
         raise RuntimeError("Missing dependencies: " + ", ".join(missing_modules))
     report["dependency_versions"] = {name: importlib.metadata.version(distribution) for name, distribution in dependencies.items()}
-    report["local_tokenizer"] = probe_local_tokenizer()
+    from dagbt.model_runtime import is_bridgetree, load_tokenizer, token_accounting, resolve_api_key
+    if is_bridgetree(config):
+        tokenizer = load_tokenizer(config)
+        encoded = tokenizer.apply_chat_template([{"role": "user", "content": "Protocol check."}], tokenize=False,
+                                                add_generation_prompt=True, enable_thinking=False)
+        report["local_tokenizer"] = {**token_accounting(config), "chat_message_adapter": "ok",
+                                     "probe_prompt_tokens": len(tokenizer.encode(encoded, add_special_tokens=False))}
+    else:
+        report["local_tokenizer"] = probe_local_tokenizer()
     report["source_hashes"] = frozen_sources()
     report["original_manifest_sha256"] = file_hash(ROOT / "original_manifest.json")
     report["model_identity"] = {"configured_llm_model": config.get("llm_model"), "configured_embedding_model": config.get("embedding_model"),
@@ -206,6 +217,14 @@ def preflight(config, datasets, *, endpoints=True, output=None, arms=None):
     for dataset in datasets:
         if dataset not in DATASETS:
             raise ValueError("Unsupported dataset: " + dataset)
+        if is_bridgetree(config):
+            from dagbt.resources import inspect_index
+            index_report = inspect_index(config, dataset)
+            directory = ROOT / "data" / dataset
+            report["datasets"][dataset] = {"questions": len(load_questions(dataset)),
+                "documents": index_report["documents"], "retrieval_index": index_report,
+                "current_data_sha256": {name: file_hash(directory / name) for name in ("questions.jsonl", "corpus.jsonl")}}
+            continue
         index = ROOT / "data" / dataset / "index"
         if not (index / "passage_vectors.npy").is_file():
             raise FileNotFoundError(str(index / "passage_vectors.npy"))
@@ -219,12 +238,15 @@ def preflight(config, datasets, *, endpoints=True, output=None, arms=None):
                                     ("questions.jsonl", "corpus.jsonl", "index/manifest.json", "index/passage_vectors.npy")}}
     if endpoints:
         for kind, env in (("llm", "DAG_LLM_API_KEY"), ("embedding", "DAG_EMBED_API_KEY")):
-            report["endpoints"][kind] = probe_endpoint(config[kind + "_base_url"], config[kind + "_model"], env)
+            report["endpoints"][kind] = probe_endpoint(config[kind + "_base_url"], config[kind + "_model"], env,
+                                                      api_key=resolve_api_key(config, kind))
         if config.get("reranker"):
             report["endpoints"]["reranker"] = probe_reranker(config, output)
     else:
         report["endpoints"] = {"status": "not_checked_offline_preflight"}
-    report["protocol_note"] = "Bundled local chat template is rendered; /models checks advertised IDs. Actual smoke inference is still needed for guided JSON and server/model/tokenizer compatibility."
+    report["protocol_note"] = ("BT profile uses its declared deterministic token estimator and chat adapter; missing derived indices will be built before question generation. "
+                               if is_bridgetree(config) else "Bundled local chat template is rendered. ") + \
+                              "/models checks advertised IDs, not weights. Actual smoke inference is still needed for JSON and model compatibility."
     return report
 
 
@@ -243,8 +265,15 @@ class AuditedCalls:
         self.unit, self.output, self.config = unit, Path(output), config
         self._experiment = experiment
         self._inner = experiment.Calls(unit, output, config)
+        self._adapted = None
+        if config.get("model_profile") == "bridgetree":
+            from dagbt.transport import Transport
+            from dagbt.budget import Ledger
+            self._adapted = Transport(unit, output, config, Ledger({}), None)
 
     def get(self, stage, url, payload):
+        if self._adapted is not None:
+            return self._adapted.get(stage, url, payload)
         e = self._experiment
         embedding = url.endswith("/embeddings")
         final = dict(payload) if embedding else {**payload, **e.SAMPLING}
@@ -323,7 +352,11 @@ def original_question(q, resources, calls, e):
     try:
         docs, ids, vectors, index, tokenizer = resources
         plan = e.make_plan(q["question"], calls)
-        pool, trace = e.archive(q["question"], plan, ids, vectors, calls)
+        if getattr(calls, "config", {}).get("model_profile") == "bridgetree":
+            from dagbt.resources import archive_for_resources
+            pool, trace = archive_for_resources(q["question"], plan, ids, vectors, calls, e)
+        else:
+            pool, trace = e.archive(q["question"], plan, ids, vectors, calls)
         row = dict(unit_id=q["id"], question=q["question"], plan=plan, candidate_doc_ids=pool, archive_trace=trace)
         save(calls.output / "input.json", row)
         result = e.native.solve(row, docs, tokenizer, index, calls)
@@ -353,7 +386,12 @@ def native_worker(connection, dataset, arm, config):
         pipeline = importlib.import_module("pipeline_dagv2_musique" if dataset == "musique" else "pipeline_dagv2")
         e = pipeline.e
         e.CONFIG.update(config)
-        _, resources, hashes = pipeline.prepare(dataset, ROOT / "outputs")
+        if config.get("model_profile") == "bridgetree":
+            from dagbt.resources import prepare_resources
+            from dagbt.model_runtime import load_tokenizer
+            _, resources, hashes = prepare_resources(config, dataset, pipeline, load_tokenizer(config))
+        else:
+            _, resources, hashes = pipeline.prepare(dataset, ROOT / "outputs")
         connection.send({"type": "ready", "hashes": hashes})
     except BaseException as exc:
         connection.send({"type": "startup_error", **redacted_error(exc)})
@@ -374,6 +412,8 @@ def native_worker(connection, dataset, arm, config):
             else:
                 from dagbt.engine import run_question
                 row = run_question(q, resources, calls, e.CONFIG, method=arm)
+            from dagbt.model_runtime import token_accounting
+            row.setdefault("diagnostics", {})["token_accounting"] = token_accounting(config)
             row["seconds"] = time.monotonic() - started
             connection.send({"type": "result", "row": row})
         except BaseException as exc:
@@ -606,6 +646,8 @@ def module_metrics(row, label, dataset, output):
             "protocol_errors_by_operation": dict(Counter(str(e.get("operation")) for e in protocol)),
             "reader_prompt_tokens_local": feasibility.get("prompt_token_count"),
             "reader_context_tokens_with_output_reserve": feasibility.get("token_count", selected.get("token_count")),
+            "local_token_accounting": diag.get("token_accounting", {k: feasibility[k] for k in
+                                       ("token_count_is_estimate", "token_estimator_id") if k in feasibility}),
             "reader_prompt_tokens_api": (row.get("answer", {}).get("response_usage") or {}).get("prompt_tokens"),
             "retrieval_query_count": ledger.get("ann", 0 if "ann" in metered_limits else diag.get("retrieval_query_count")),
             "set_score_count": ledger.get("set_score", 0 if "set_score" in metered_limits or "retrieval_query_count" in diag else None),
@@ -807,7 +849,9 @@ def run_experiment(args):
                     "questions_digest": {d: digest(qs) for d, qs in scopes.items()}, "source_hashes": frozen_sources(),
                     "original_hash_manifest": file_hash(ROOT / "original_manifest.json"),
                     "scope": "full_local_1000_per_dataset" if args.limit is None else f"first_{args.limit}_per_dataset",
-                    "baseline": "untouched native make_plan/archive/native.solve, same e.work failure handling; wrapper replaces filesystem resume and call accounting only",
+                    "baseline": ("native make_plan/native.solve; original archive algorithm with query-dimension guard tied to new index; shared BT model/resource adapter replaces backend protocol, token accounting and corpus vectors"
+                                 if config.get("model_profile") == "bridgetree" else
+                                 "untouched native make_plan/archive/native.solve, same e.work failure handling; wrapper replaces filesystem resume and call accounting only"),
                     "generation": "all configured dataset/arm tasks terminal before first label load", "kind": "inference_evaluation_not_parameter_training"}
         path = output / "manifest.json"
         if path.exists() and load(path) != manifest:
@@ -830,6 +874,18 @@ def run_experiment(args):
         # SIGTERM raises through finally blocks, closing all persistent arm workers.
         old_term = signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
         try:
+            if config.get("model_profile") == "bridgetree":
+                from dagbt.resources import ensure_index, inspect_index
+                index_artifacts = {}
+                for dataset in datasets:
+                    save(output / "progress.json", {"state": "preparing_index", "dataset": dataset,
+                                                    "updated_unix": time.time()})
+                    ensure_index(config, dataset, output)
+                    index_artifacts[dataset] = inspect_index(config, dataset)
+                identity_path = output / "index_artifacts.json"
+                if identity_path.exists() and load(identity_path) != index_artifacts:
+                    raise ValueError("Derived embedding index changed; use a new output directory")
+                save(identity_path, index_artifacts)
             for dataset, questions in scopes.items():
                 generate_dataset(output, dataset, questions, arms, config, retry_failed=args.retry_failed)
             save(output / "progress.json", {"state": "scoring", "updated_unix": time.time()})
@@ -920,6 +976,10 @@ def main(argv=None):
     for name in ("status", "stop"):
         command = sub.add_parser(name)
         command.add_argument("--output", required=True)
+    command = sub.add_parser("prepare-index", help="build/resume BT-profile corpus embeddings without running question generation")
+    command.add_argument("--config", required=True)
+    command.add_argument("--datasets", nargs="+", choices=DATASETS, default=list(DATASETS))
+    command.add_argument("--output", default=str(ROOT / "outputs" / "index_preparation"))
     args = parser.parse_args(argv)
     try:
         if args.command == "run":
@@ -929,6 +989,16 @@ def main(argv=None):
             result = launch(args)
         elif args.command == "preflight":
             result = preflight(load(args.config), args.datasets, endpoints=not args.offline_preflight)
+        elif args.command == "prepare-index":
+            config = validate_config(load(args.config))
+            if config.get("model_profile") != "bridgetree":
+                raise ValueError("prepare-index requires model_profile=bridgetree; legacy packaged vectors remain unchanged")
+            verify_originals()
+            from dagbt.resources import ensure_index, inspect_index
+            with writer_lock(args.output):
+                for dataset in args.datasets:
+                    ensure_index(config, dataset, Path(args.output))
+                result = {d: inspect_index(config, d) for d in args.datasets}
         elif args.command == "stop":
             result = stop(args.output)
         else:

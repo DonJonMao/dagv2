@@ -2,6 +2,8 @@
 
 日期：2026-09-23。已重新逐段核对 `docs/design_reference/implementation_plan.md` 和 `fusion_report.md`，并结合最新 BT 工作区及原 DAG 源码做实现检查。设计原文与来源哈希同目录保存。
 
+模型更新：当前成对入口已按用户要求使用 BT 的 DeepSeek/Qwen3 部署。下文的“实际 tokenizer”对应保留的历史配置；新配置改用 BT 的显式 token 估算，不能声称满足 DeepSeek 实际 token 精确上界。原模型/索引/代码快照不改，新的资源和协议适配及差分验证见 [模型对齐说明](MODEL_ALIGNMENT.md)。
+
 ## 对用户要求的映射
 
 | 要求 | 当前实现与可核验证据 |

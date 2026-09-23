@@ -14,6 +14,7 @@ from pathlib import Path
 from .budget import Ledger, BudgetExceeded
 from .config import resolve
 from .transport import Transport, StubMeter, ServiceError, ResponseError, digest, save
+from .model_runtime import token_accounting, count_request_tokens
 from . import prompts
 from .support import (SupportError, make_span, compile_graph, select_support,
                       invalidate_support, resolve_conflict, normalized_answer, text_hash,
@@ -51,8 +52,11 @@ class Reasoner:
         messages=[{'role':'system','content':system},{'role':'user','content':json.dumps(data,ensure_ascii=False)}]
         error=None
         while True:
-            _,count=rendered(messages,self.tokenizer)
             output=self.settings['reasoning_output_tokens']
+            payload={'messages':messages,'max_tokens':output,'chat_template_kwargs':{'enable_thinking':False},
+                     'structured_outputs':{'json':schema or {'type':'object'}}}
+            count=count_request_tokens((operation,str(self.sequence+1)),
+                self.config['llm_base_url'].rstrip('/')+'/chat/completions',payload,self.config,self.tokenizer)
             if count+output+8>self.settings['context_tokens']:
                 raise InputOverflow(f'{operation}: {count}+{output}+8 exceeds {self.settings["context_tokens"]}')
             # Audits (including JSON repairs) cannot consume the flat arm's
@@ -65,13 +69,12 @@ class Reasoner:
                 raise BudgetExceeded('llm',operation,1,0)
             self.sequence+=1
             stage=(operation,str(self.sequence))
-            payload={'messages':messages,'max_tokens':output,'chat_template_kwargs':{'enable_thinking':False},
-                     'structured_outputs':{'json':schema or {'type':'object'}}}
             response=self.calls.get(stage,self.config['llm_base_url'].rstrip('/')+'/chat/completions',payload)
             choice=response['response']['choices'][0]
             raw=choice.get('message',{}).get('content','')
             self.event({'event':'reasoning_response','operation':operation,'response_ref':response['response_ref'],
-                        'input_tokens_local':count,'raw_output':raw,'finish_reason':choice.get('finish_reason')})
+                        'input_tokens_local':count,'raw_output':raw,'finish_reason':choice.get('finish_reason'),
+                        **token_accounting(self.config)})
             try:
                 if choice.get('finish_reason')!='stop':raise ProtocolError('finish_reason='+str(choice.get('finish_reason')))
                 value=json.loads(raw)
@@ -426,7 +429,8 @@ class Engine:
         text,count=rendered(messages,self.tokenizer)
         total=count+self.s['reader_output_tokens']+8
         return {'feasible':len(ids)<=max_docs and total<=self.s['context_tokens'],'token_count':total,
-                'prompt_token_count':count,'budget':self.s['context_tokens'],'context_hash':digest(text)}
+                'prompt_token_count':count,'budget':self.s['context_tokens'],'context_hash':digest(text),
+                **token_accounting(self.config)}
 
     def select(self):
         graph=self.compile()
