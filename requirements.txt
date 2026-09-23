@@ -1,0 +1,5 @@
+numpy==2.2.6
+transformers==4.57.6
+tokenizers==0.22.2
+# HTTP 客户端为 Python 标准库 urllib（package/run.py），无需额外依赖。
+# 运行环境：Python 3.10+。模型服务（vLLM 等）见 serving/requirements-*.txt，需独立环境。

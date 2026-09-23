@@ -1,0 +1,32 @@
+{
+  "2wikimultihopqa": {
+    "questions": 1000,
+    "documents": 6119,
+    "support_groups_all_resolved": true,
+    "inputs": {
+      "/data1/zhengly/rag_datasets/2wikimultihopqa/questions.jsonl": "a480b140a33bd9af516287fd786c242dcca2f8bbdf776d1b963bc172580c687f",
+      "/data1/zhengly/rag_datasets/2wikimultihopqa/corpus.jsonl": "e0f95b61347511bff3b3c1149ba8252b77a3c338e37a09c42f6991459f45eb74",
+      "/data1/zhengly/rag_datasets/2wikimultihopqa/raw/2wikimultihopqa.json": "895cba294064df0c3302c76847b1fc08d99b5619f7663dfaa3b65cd780f1cac4"
+    }
+  },
+  "hotpotqa": {
+    "questions": 1000,
+    "documents": 9811,
+    "support_groups_all_resolved": true,
+    "inputs": {
+      "/data1/zhengly/rag_datasets/hotpotqa/questions.jsonl": "1f03126ae012a531f7fdfcf24092b2e1392725316f7b4625a6985ea9fd372e13",
+      "/data1/zhengly/rag_datasets/hotpotqa/corpus.jsonl": "5b3a14167e76e3fc3952ff04ccf40377332cf4156e7e8c5408677e74cd75e488",
+      "/data1/zhengly/rag_datasets/hotpotqa/raw/hotpotqa.json": "3ad9c0bcbf93f41d7004ca6007049c904d2605046b314a2f7ecfb379c64cba6d"
+    }
+  },
+  "musique": {
+    "questions": 1000,
+    "documents": 11656,
+    "support_groups_all_resolved": true,
+    "inputs": {
+      "/data1/zhengly/rag_datasets/musique/questions.jsonl": "d88be698d8b7f61dc13f2bd4076af66acf27f75a904941a59b404353dd214a79",
+      "/data1/zhengly/rag_datasets/musique/corpus.jsonl": "72693db77411951f4f460bc3aec58806344daee4a495bea4aea2f31b505b8dfe",
+      "/data1/zhengly/rag_datasets/musique/raw/musique.json": "98ed4e21d3076532f6388d42320fb809599c63a0d8dffca8ece5e41922be6b46"
+    }
+  }
+}

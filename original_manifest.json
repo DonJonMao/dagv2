@@ -1,0 +1,290 @@
+{
+  "source": "/private/tmp/dagv2_review_20260923/dagv2_package_20260921",
+  "files": [
+    {
+      "path": "README.md",
+      "bytes": 13673,
+      "sha256": "5046ddb560d44b6799f47ed973761e6e5c1f169614c5e4fc989d67ab879cfee2"
+    },
+    {
+      "path": "config.example.json",
+      "bytes": 239,
+      "sha256": "1b16faf61011bb54c077424a7e85720919f9d6b31fdaf7d03d1e10df213ed255"
+    },
+    {
+      "path": "dagv2/experiment.py",
+      "bytes": 15343,
+      "sha256": "e3af184e3baa42bc57ae549c588b5344ab4b1cfde98fef2b3a21d318b8290a25"
+    },
+    {
+      "path": "dagv2/experiment_v6.py",
+      "bytes": 939,
+      "sha256": "973bafa09ecc35aa637acd62305628ad15d234e30cc0e26c07cd7de47aee3b9e"
+    },
+    {
+      "path": "dagv2/frozen_flow_v6.py",
+      "bytes": 7040,
+      "sha256": "957a6a964218a421f032387ceefe24162e7dc85da468d9b28a15b823c5cdebb0"
+    },
+    {
+      "path": "dagv2/pipeline_dagv2.py",
+      "bytes": 10825,
+      "sha256": "22c60773543947cd484fc00cd903b3436a01468562e8a0ca9d2712303c462bc9"
+    },
+    {
+      "path": "dagv2/pipeline_dagv2_musique.py",
+      "bytes": 10957,
+      "sha256": "71f36ce6463f59f023bbc0e2316a13cd3377ed946c84814638951466163d22b2"
+    },
+    {
+      "path": "dagv2/repair_planner.py",
+      "bytes": 5378,
+      "sha256": "433fd1e5d9365ed894f00bdeb5d396559f26548b89754e59b3df1855b06a881f"
+    },
+    {
+      "path": "data/2wikimultihopqa/corpus.json",
+      "bytes": 3212378,
+      "sha256": "131f66e4ba0bf57b90a8ab628debd692edcd7af8050905fb255c1c104d642223"
+    },
+    {
+      "path": "data/2wikimultihopqa/corpus.jsonl",
+      "bytes": 3212375,
+      "sha256": "e0f95b61347511bff3b3c1149ba8252b77a3c338e37a09c42f6991459f45eb74"
+    },
+    {
+      "path": "data/2wikimultihopqa/evaluation_only.json",
+      "bytes": 343125,
+      "sha256": "9757e0c1529d776715cfedc8bda4c6caf40caa10c2175ba18e5f0532bf709375"
+    },
+    {
+      "path": "data/2wikimultihopqa/index/manifest.json",
+      "bytes": 204,
+      "sha256": "700f315cef1be0de922ee015b0c0fd6f6a02a86b5cc60af1eb21587c32415d75"
+    },
+    {
+      "path": "data/2wikimultihopqa/index/passage_vectors.npy",
+      "bytes": 100253824,
+      "sha256": "bda627bfb64e8e0c30f65352ae3b3831b13193d33c3f5a0d0bf6973776b1a24b"
+    },
+    {
+      "path": "data/2wikimultihopqa/questions.json",
+      "bytes": 166253,
+      "sha256": "18ae947c9946ecefd01e876f3884ee73825f2d46e306b2e52e31cdc05c260795"
+    },
+    {
+      "path": "data/2wikimultihopqa/questions.jsonl",
+      "bytes": 127360,
+      "sha256": "a480b140a33bd9af516287fd786c242dcca2f8bbdf776d1b963bc172580c687f"
+    },
+    {
+      "path": "data/hotpotqa/corpus.json",
+      "bytes": 6343714,
+      "sha256": "1ae241255bc3b823ed8005bef36b54bd9db0e0492e32d61e776dcf7e1c26a5b3"
+    },
+    {
+      "path": "data/hotpotqa/corpus.jsonl",
+      "bytes": 6342601,
+      "sha256": "5b3a14167e76e3fc3952ff04ccf40377332cf4156e7e8c5408677e74cd75e488"
+    },
+    {
+      "path": "data/hotpotqa/evaluation_only.json",
+      "bytes": 285660,
+      "sha256": "89eef0956aef7b8f2491066cdd1b39d8020c402c0f50decc90ec1cb959f6c617"
+    },
+    {
+      "path": "data/hotpotqa/index/manifest.json",
+      "bytes": 204,
+      "sha256": "51f5ba530c6605b3a052a3a7476c661220ba01340887d9c79496b9263405f7ad"
+    },
+    {
+      "path": "data/hotpotqa/index/passage_vectors.npy",
+      "bytes": 160743552,
+      "sha256": "f969772f7b204636b0d92743472950d1bf1efac770bf30f8db18af737a75a916"
+    },
+    {
+      "path": "data/hotpotqa/questions.json",
+      "bytes": 184091,
+      "sha256": "79080e68afdc6881ba29ba8a7b008105871b0af2bc9184b11f00e8b5a0344d7e"
+    },
+    {
+      "path": "data/hotpotqa/questions.jsonl",
+      "bytes": 145198,
+      "sha256": "1f03126ae012a531f7fdfcf24092b2e1392725316f7b4625a6985ea9fd372e13"
+    },
+    {
+      "path": "data/inputs_manifest.json",
+      "bytes": 1588,
+      "sha256": "4efd1e3a48525657906911d932e35103745b2e7ca9c9a373dbb8e20530c751ef"
+    },
+    {
+      "path": "data/musique/corpus.json",
+      "bytes": 6711769,
+      "sha256": "b2dd44f65aa93810321d04cab5857923b649a750a97a6a142b9fd1896a9e3d52"
+    },
+    {
+      "path": "data/musique/corpus.jsonl",
+      "bytes": 6711766,
+      "sha256": "72693db77411951f4f460bc3aec58806344daee4a495bea4aea2f31b505b8dfe"
+    },
+    {
+      "path": "data/musique/evaluation_only.json",
+      "bytes": 292584,
+      "sha256": "330bec41770e7fc4f45cb1cdd7458e8f6049c752e247d61374b4cded2fc21114"
+    },
+    {
+      "path": "data/musique/index/manifest.json",
+      "bytes": 206,
+      "sha256": "b278bbaed568ef21b4ef6fe17f89949fe910cff1e0e312921ffb018601945b55"
+    },
+    {
+      "path": "data/musique/index/passage_vectors.npy",
+      "bytes": 190972032,
+      "sha256": "976542eebf4917b082d23a0a12c3e19ed734245b2cb47d1c20addd26d494a6e4"
+    },
+    {
+      "path": "data/musique/questions.json",
+      "bytes": 189593,
+      "sha256": "fbdaf33c292a21b83ba4a03a29724d01998b0ea171bdbb62015c549852fce53c"
+    },
+    {
+      "path": "data/musique/questions.jsonl",
+      "bytes": 150700,
+      "sha256": "d88be698d8b7f61dc13f2bd4076af66acf27f75a904941a59b404353dd214a79"
+    },
+    {
+      "path": "package/core.py",
+      "bytes": 5567,
+      "sha256": "4cad8b1b48400806470f64dfd958fef7a39e62573cd400034ddcfe16798a98bb"
+    },
+    {
+      "path": "package/frozen_flow.py",
+      "bytes": 7599,
+      "sha256": "8f900523036a04aeac0b4583a36cbdb6162dd836bd471bf181cbe9f5a02fea54"
+    },
+    {
+      "path": "package/metrics.py",
+      "bytes": 2443,
+      "sha256": "192e4f1293f83c68d8d2e01d6b9cc4949f7a6c43a610711e50fd81e1fa70eafe"
+    },
+    {
+      "path": "package/reader.py",
+      "bytes": 3484,
+      "sha256": "ac637306b4b63e48571773f1a40a1e47ec6908e6801322031d903d20518d26cb"
+    },
+    {
+      "path": "package/run.py",
+      "bytes": 11952,
+      "sha256": "3f3087088e3882a00580ec6b6ea6cea6dbb6af63ffd364b65801fbaa1258d380"
+    },
+    {
+      "path": "package/tokenizer/config.json",
+      "bytes": 728,
+      "sha256": "f7c4eadfbbf522470667b797a3c89be2524832d2d599797248dc304fff447c30"
+    },
+    {
+      "path": "package/tokenizer/merges.txt",
+      "bytes": 1671853,
+      "sha256": "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5"
+    },
+    {
+      "path": "package/tokenizer/tokenizer.json",
+      "bytes": 11422654,
+      "sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4"
+    },
+    {
+      "path": "package/tokenizer/tokenizer_config.json",
+      "bytes": 9732,
+      "sha256": "d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101"
+    },
+    {
+      "path": "package/tokenizer/vocab.json",
+      "bytes": 2776833,
+      "sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"
+    },
+    {
+      "path": "requirements.txt",
+      "bytes": 251,
+      "sha256": "6d2dba7d207e3e6a9213399021ed67310474bd29d57cf19a91f97550c1c1b7d5"
+    },
+    {
+      "path": "results/METHOD_CARD.md",
+      "bytes": 3404,
+      "sha256": "87556e9e47fc1f0b21b984e5adc9e921652f7374aa8194cc48bdbea5fc8097c0"
+    },
+    {
+      "path": "results/RESULTS_2wikimultihopqa.md",
+      "bytes": 291,
+      "sha256": "02343a0aae3bb48a42df48864da00f221a04772e5a683ac77fba8b9322eaf0ad"
+    },
+    {
+      "path": "results/RESULTS_hotpotqa.md",
+      "bytes": 284,
+      "sha256": "1a56c0d824f1668426659592bca6598aa96d86d464e0e45b987e5946cb80d74e"
+    },
+    {
+      "path": "results/RESULTS_musique.md",
+      "bytes": 283,
+      "sha256": "d1e6d542de4f281466384715b329844a1039d8656fa611eb4a25cf4c1786acb0"
+    },
+    {
+      "path": "scripts/run_2wiki.sh",
+      "bytes": 656,
+      "sha256": "2b5c81a8eddc68a66bf44648a315f8e1d1c07305e17c7e21c0b3cbd9fa06b7b1"
+    },
+    {
+      "path": "scripts/run_hotpotqa.sh",
+      "bytes": 613,
+      "sha256": "b1de917bcc22fd37469f3c974c1de96cb73fdcb3f8d529c1313d148e8a100a0f"
+    },
+    {
+      "path": "scripts/run_musique.sh",
+      "bytes": 604,
+      "sha256": "4d870e1aae4e90784cbb34d02c2f4396f684164aff045f2fae23dc7354e5c6a6"
+    },
+    {
+      "path": "scripts/smoke.sh",
+      "bytes": 963,
+      "sha256": "d84f1b1e011269a94f637943da047c6b65b92df51452ee05925b79caefe4c65b"
+    },
+    {
+      "path": "serving/nv_model_code/README.md",
+      "bytes": 60053,
+      "sha256": "be16687bf531d9a4e51bd19f4ba6f995a746859b53bc8b5f6a597388e4fa27ec"
+    },
+    {
+      "path": "serving/nv_model_code/configuration_nvembed.py",
+      "bytes": 3196,
+      "sha256": "810edefa67379ef9ab8c74705bd69630d22f22866065312b88878440ea7162bf"
+    },
+    {
+      "path": "serving/nv_model_code/modeling_nvembed.py",
+      "bytes": 18585,
+      "sha256": "8f94efc6f9428ce2148088728685c51d120fb914616d5750208646008628155c"
+    },
+    {
+      "path": "serving/requirements-nv.txt",
+      "bytes": 94,
+      "sha256": "b9a9164468d4cd63affa76a7fbf8b0fae45fb6faa7f56bfb248c977be61f25cc"
+    },
+    {
+      "path": "serving/requirements-qwen.txt",
+      "bytes": 13,
+      "sha256": "4de5f3d767967cf28287cc1ff1f4391a3cdacbde3596146dbbdc24176944a9db"
+    },
+    {
+      "path": "serving/serve_nv_embed.py",
+      "bytes": 5435,
+      "sha256": "16b63e711b465887cde70978231292114773575b6064d575c27fca87d8330285"
+    },
+    {
+      "path": "serving/start_nv.sh",
+      "bytes": 322,
+      "sha256": "18a93d846e647452f070db54341b504a268e716323057a454792c0227597119e"
+    },
+    {
+      "path": "serving/start_qwen38.sh",
+      "bytes": 1004,
+      "sha256": "d41dec76884807ee6f0de9046fb454d0fcb00afce90cedcab63de5d9ac823691"
+    }
+  ]
+}

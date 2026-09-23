@@ -1,0 +1,8 @@
+{
+  "llm_base_url": "http://127.0.0.1:8020/v1",
+  "embedding_base_url": "http://127.0.0.1:8019/v1",
+  "llm_model": "qwen3.8-27b",
+  "embedding_model": "nvidia/NV-Embed-v2",
+  "request_timeout_seconds": 600,
+  "max_identical_attempts": 3
+}

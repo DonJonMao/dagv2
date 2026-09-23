@@ -1,0 +1,9 @@
+{
+  "documents": 9811,
+  "dimensions": 4096,
+  "triples": 110045,
+  "failed_openie": 0,
+  "final_session_seconds": 43728.43288119603,
+  "model": "qwen3.8-27b",
+  "embedding_model": "nvidia/NV-Embed-v2"
+}
