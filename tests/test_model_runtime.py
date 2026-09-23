@@ -170,6 +170,53 @@ def test_endpoint_bound_credentials_env_precedence_and_no_payload_secret(tmp_pat
     assert "secret" not in json.dumps(wire)
 
 
+@pytest.fixture
+def builtin_key_profile(monkeypatch):
+    for name in ("DAG_LLM_API_KEY", "BRIDGETREE_CHAT_API_KEY", "DAG_EMBED_API_KEY", "DAG_RERANK_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    return profile("http://111.19.156.30:8006")
+
+
+@pytest.mark.parametrize("local_credentials", ["unconfigured", "missing_file", {},
+    {"llm": {"endpoint": "http://different-service/v1/chat/completions", "api_key": "other-secret"}},
+    {"llm": {"endpoint": "http://111.19.156.30:8006/v1/chat/completions", "api_key": ""}},
+])
+def test_bt_llm_builtin_key_fallback_without_matching_local_key(builtin_key_profile, tmp_path, local_credentials):
+    config = builtin_key_profile
+    if local_credentials != "unconfigured":
+        path = tmp_path / "credentials.json"
+        config["credentials_file"] = str(path)
+        if local_credentials != "missing_file":
+            path.write_text(json.dumps(local_credentials))
+    assert resolve_api_key(config, "llm") == "Aa@11111"
+
+
+def test_bt_llm_builtin_key_overrides_stale_file_but_yields_to_environment(builtin_key_profile, tmp_path, monkeypatch):
+    config = builtin_key_profile
+    path = tmp_path / "credentials.json"
+    config["credentials_file"] = str(path)
+    path.write_text(json.dumps({"llm": {
+        "endpoint": "http://111.19.156.30:8006/v1/chat/completions", "api_key": "file-secret"}}))
+    assert resolve_api_key(config, "llm") == "Aa@11111"
+    monkeypatch.setenv("BRIDGETREE_CHAT_API_KEY", "bt-env-secret")
+    assert resolve_api_key(config, "llm") == "bt-env-secret"
+    monkeypatch.setenv("DAG_LLM_API_KEY", "dag-env-secret")
+    assert resolve_api_key(config, "llm") == "dag-env-secret"
+
+
+@pytest.mark.parametrize("kind,overrides", [
+    ("llm", {"llm_base_url": "http://different-service/v1"}),
+    ("llm", {"llm_base_url": "https://111.19.156.30:8006/v1"}),
+    ("llm", {"model_profile": "legacy"}),
+    ("llm", {"model_profile": ""}),
+    ("embedding", {}),
+    ("reranker", {}),
+])
+def test_bt_builtin_key_is_bound_to_llm_endpoint_and_profile(builtin_key_profile, kind, overrides):
+    builtin_key_profile.update(overrides)
+    assert resolve_api_key(builtin_key_profile, kind) == ""
+
+
 def test_reranker_empty_model_omission_and_physical_batches_restore_global_indices():
     class Calls:
         def __init__(self): self.requests = []

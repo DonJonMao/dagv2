@@ -29,7 +29,7 @@ reranker 的 BT 请求配置实际 `model=""`，表示请求中省略 model，�
 
 BT 本身使用 `regex_word_or_punctuation_v1` 估算，而非本地 DeepSeek tokenizer。新配置复用同一估算，并记录 `token_count_is_estimate=true`；schema 指令计入估算，服务返回的实际 usage 另存。该预算不构成真实 DeepSeek token 数的精确上界。历史配置仍使用原包 tokenizer，不把它冒充 DeepSeek tokenizer。
 
-凭据优先来自 `DAG_LLM_API_KEY`（或 BT 的 `BRIDGETREE_CHAT_API_KEY`），embedding/reranker 使用对应 DAG 环境变量。可选的 `configs/credentials.local.json` 被 Git 忽略，只在凭据绑定的完整端点与当前配置完全一致时读取；不进入配置快照或请求日志。迁移时只复制匹配 BT 生成服务的本地凭据，不修改 BT 文件。
+凭据优先来自 `DAG_LLM_API_KEY`（或 BT 的 `BRIDGETREE_CHAT_API_KEY`）。按用户要求，`dagbt/model_runtime.py` 内置 LLM 默认 key；它仅用于 `bridgetree` 配置下的 `http://111.19.156.30:8006/v1/chat/completions`，无需本地凭据文件，且优先于该文件。其他端点和服务仍回退到可选的 `configs/credentials.local.json`，仅在完整端点匹配时读取。embedding/reranker 使用对应 DAG 环境变量或匹配的本地凭据，不复用 LLM 默认 key。凭据不进入配置快照或请求日志；BT 仓库未修改。
 
 ## 启动
 

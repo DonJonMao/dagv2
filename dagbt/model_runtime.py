@@ -21,6 +21,8 @@ from vendor.bridgetree.diagnostic_identity import validate_provider_params
 ROOT = Path(__file__).resolve().parents[1]
 MESSAGE_ENVELOPE = "DAGBT_MESSAGES_JSON_V1\n"
 TOKEN_ESTIMATOR_ID = "regex_word_or_punctuation_v1"
+DEFAULT_BT_LLM_ENDPOINT = "http://111.19.156.30:8006/v1/chat/completions"
+DEFAULT_BT_LLM_API_KEY = "Aa@11111"
 
 
 def is_bridgetree(config: Mapping[str, Any]) -> bool:
@@ -172,7 +174,7 @@ def normalize_response(response: Mapping[str, Any], legacy_text_response: bool =
 
 
 def resolve_api_key(config: Mapping[str, Any], kind: str) -> str:
-    """Environment first, then an endpoint-bound ignored local credential file."""
+    """Environment, deployed BT LLM default, then endpoint-bound local credentials."""
     env_names = {"llm": ("DAG_LLM_API_KEY", "BRIDGETREE_CHAT_API_KEY"),
                  "embedding": ("DAG_EMBED_API_KEY",), "reranker": ("DAG_RERANK_API_KEY",)}
     if kind not in env_names:
@@ -180,6 +182,11 @@ def resolve_api_key(config: Mapping[str, Any], kind: str) -> str:
     for name in env_names[kind]:
         if os.environ.get(name):
             return os.environ[name]
+    endpoint = (str(config.get("llm_base_url", "")).rstrip("/") + "/chat/completions" if kind == "llm"
+                else str(config.get("embedding_base_url", "")).rstrip("/") + "/embeddings" if kind == "embedding"
+                else config.get("reranker", {}).get("url"))
+    if kind == "llm" and is_bridgetree(config) and endpoint == DEFAULT_BT_LLM_ENDPOINT:
+        return DEFAULT_BT_LLM_API_KEY
     configured = config.get("credentials_file")
     if not configured:
         return ""
@@ -197,9 +204,6 @@ def resolve_api_key(config: Mapping[str, Any], kind: str) -> str:
     item = private.get(kind, {})
     if not isinstance(item, Mapping):
         raise ValueError("Local model credential entry must be an object")
-    endpoint = (str(config.get("llm_base_url", "")).rstrip("/") + "/chat/completions" if kind == "llm"
-                else str(config.get("embedding_base_url", "")).rstrip("/") + "/embeddings" if kind == "embedding"
-                else config.get("reranker", {}).get("url"))
     if item.get("endpoint") != endpoint:
         return ""
     secret = item.get("api_key", "")
