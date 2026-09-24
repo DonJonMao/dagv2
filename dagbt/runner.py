@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
-DATASETS = ("hotpotqa", "2wikimultihopqa", "musique")
+DATASETS = ("hotpotqa", "2wikimultihopqa", "musique", "personamem")
 METRICS = ("f1", "em", "r@5", "r@10", "r@20", "all@5", "all@10", "all@20")
 
 
@@ -217,6 +217,11 @@ def preflight(config, datasets, *, endpoints=True, output=None, arms=None):
     for dataset in datasets:
         if dataset not in DATASETS:
             raise ValueError("Unsupported dataset: " + dataset)
+        if dataset == "personamem":
+            if not is_bridgetree(config):
+                raise ValueError("PersonaMem requires the bridgetree model profile and its derived index")
+            from dagbt.personamem import validate_dataset
+            validate_dataset(ROOT)
         if is_bridgetree(config):
             from dagbt.resources import inspect_index
             index_report = inspect_index(config, dataset)
@@ -224,6 +229,10 @@ def preflight(config, datasets, *, endpoints=True, output=None, arms=None):
             report["datasets"][dataset] = {"questions": len(load_questions(dataset)),
                 "documents": index_report["documents"], "retrieval_index": index_report,
                 "current_data_sha256": {name: file_hash(directory / name) for name in ("questions.jsonl", "corpus.jsonl")}}
+            if dataset == "personamem":
+                report["datasets"][dataset]["current_data_sha256"].update(
+                    {name: file_hash(directory / name) for name in ("scopes.json", "manifest.json")})
+                report["datasets"][dataset]["task"] = "multiple_choice_personal_memory; per-question context and exclusive cutoff"
             continue
         index = ROOT / "data" / dataset / "index"
         if not (index / "passage_vectors.npy").is_file():
@@ -251,6 +260,9 @@ def preflight(config, datasets, *, endpoints=True, output=None, arms=None):
 
 
 def load_questions(dataset, limit=None):
+    if dataset == "personamem":
+        from dagbt.personamem import load_questions as load_personamem_questions
+        return load_personamem_questions(ROOT, limit=limit)
     questions = [json.loads(line) for line in (ROOT / "data" / dataset / "questions.jsonl").read_text().splitlines() if line.strip()]
     if len({q["id"] for q in questions}) != len(questions):
         raise ValueError("Duplicate question IDs")
@@ -375,6 +387,39 @@ def original_question(q, resources, calls, e):
         return e.failure(q["id"], "context_overflow", exc)
 
 
+def configure_personamem_reader():
+    """Adapt the shared reader before either algorithm counts prompt tokens."""
+    reader = importlib.import_module("reader")
+    original = reader.reader_messages
+    if getattr(original, "_personamem_adapter", False):
+        return
+
+    def messages(**kwargs):
+        result = original(**kwargs)
+        marker = "Answer with the shortest exact phrase supported by the context passages."
+        if marker not in result[-1]["content"]:
+            raise ValueError("PersonaMem reader cannot locate the frozen QA output instructions")
+        result[-1]["content"] = result[-1]["content"].rsplit(marker, 1)[0] + (
+            "Choose the single best answer option for the user's question using only the supplied "
+            "personal memory. These memories belong to this question's shared conversation and "
+            "precede its cutoff. Respect speaker roles and changes in the user's preferences. "
+            "The options are candidate answers, not evidence. The source guide only locates evidence. "
+            "Return exactly one line with the selected option letter, with no explanation:\nAnswer: (a)\n"
+            "Replace a with the letter of the selected option.")
+        return result
+
+    messages._personamem_adapter = True
+    reader.reader_messages = messages
+    # The frozen QA parser truncates at the first answer line. Preserve an
+    # invalid whole response here so explanations/multiple choices cannot be
+    # silently accepted just because their first line contains a valid label.
+    def parse_answer(text):
+        from dagbt.personamem import parse_choice
+        choice = parse_choice(text, ["a", "b", "c", "d"])
+        return f"({choice})" if choice is not None else str(text).strip()
+    reader.parse_answer = parse_answer
+
+
 def native_worker(connection, dataset, arm, config):
     # The environment prevents inherited server configuration changing native imports.
     os.environ.pop("DAGV2_CONFIG", None)
@@ -392,6 +437,12 @@ def native_worker(connection, dataset, arm, config):
             _, resources, hashes = prepare_resources(config, dataset, pipeline, load_tokenizer(config))
         else:
             _, resources, hashes = pipeline.prepare(dataset, ROOT / "outputs")
+        memory_scopes, public_questions = None, None
+        if dataset == "personamem":
+            from dagbt.personamem import load_scopes
+            memory_scopes = load_scopes(ROOT)
+            public_questions = {q["id"]: q for q in load_questions(dataset)}
+            configure_personamem_reader()
         connection.send({"type": "ready", "hashes": hashes})
     except BaseException as exc:
         connection.send({"type": "startup_error", **redacted_error(exc)})
@@ -406,12 +457,27 @@ def native_worker(connection, dataset, arm, config):
         q, output = task["question"], Path(task["output"])
         started = time.monotonic()
         try:
+            question_resources = resources
+            if memory_scopes is not None:
+                from dagbt.resources import scope_resources
+                if q != public_questions.get(q["id"]):
+                    raise ValueError("PersonaMem task differs from its frozen public question/scope")
+                question_resources = scope_resources(resources, memory_scopes[q["scope_id"]])
             calls = AuditedCalls(q["id"], output, e.CONFIG, e)
+            generation_question = {"id": q["id"], "question": q["question"]}
             if arm == "original":
-                row = original_question(q, resources, calls, e)
+                row = original_question(generation_question, question_resources, calls, e)
             else:
                 from dagbt.engine import run_question
-                row = run_question(q, resources, calls, e.CONFIG, method=arm)
+                row = run_question(generation_question, question_resources, calls, e.CONFIG, method=arm)
+            if memory_scopes is not None:
+                from dagbt.personamem import parse_choice
+                row.setdefault("diagnostics", {})["memory_scope"] = {
+                    "scope_id": q["scope_id"], "shared_context_id": q["shared_context_id"],
+                    "end_index_exclusive": q["end_index"], "visible_doc_ids": question_resources[1]}
+                if row["answer"]["status"] == "ok" and parse_choice(row["answer"]["prediction"], q["options"]) is None:
+                    row["answer"]["status"] = "invalid_choice"
+                    row["answer"]["error"] = "Reader must return one unambiguous option label"
             from dagbt.model_runtime import token_accounting
             row.setdefault("diagnostics", {})["token_accounting"] = token_accounting(config)
             row["seconds"] = time.monotonic() - started
@@ -616,6 +682,8 @@ def module_metrics(row, label, dataset, output):
             diag = {**snapshot, "candidate_doc_ids": snapshot.get("candidates", []), "support_graph": {"nodes": snapshot.get("nodes", [])}}
     candidates = diag.get("candidate_doc_ids")
     def group_recall(ids):
+        if dataset == "personamem":
+            return None, None
         ids = set(map(str, ids))
         if dataset == "musique":
             ids = {d if d.startswith("musique:") else "musique:" + d for d in ids}
@@ -652,7 +720,9 @@ def module_metrics(row, label, dataset, output):
             "retrieval_query_count": ledger.get("ann", 0 if "ann" in metered_limits else diag.get("retrieval_query_count")),
             "set_score_count": ledger.get("set_score", 0 if "set_score" in metered_limits or "retrieval_query_count" in diag else None),
             "ledger_used": ledger,
-            "interpretation": "gold_* uses held-out title-group labels after generation; model/structural statuses and complete_required do not prove semantic entailment"}
+            "interpretation": ("PersonaMem has no gold document support labels; gold_* metrics are unavailable. "
+                               "Model/structural statuses do not prove semantic correctness." if dataset == "personamem" else
+                               "gold_* uses held-out title-group labels after generation; model/structural statuses and complete_required do not prove semantic entailment")}
 
 
 def summarize_modules(rows):
@@ -698,7 +768,7 @@ def paired_bootstrap_interval(differences, *, replicates=1000, seed=20260918):
     return report
 
 
-def factorial_interaction(all_scores, units):
+def factorial_interaction(all_scores, units, metric_names=METRICS):
     factors = ("fusion", "bt_flat", "dense_dependency", "dense_flat")
     if not set(factors) <= set(all_scores):
         return None
@@ -707,7 +777,7 @@ def factorial_interaction(all_scores, units):
         return {metric: [
             (all_scores["fusion"][unit][metric] - all_scores["bt_flat"][unit][metric])
             - (all_scores["dense_dependency"][unit][metric] - all_scores["dense_flat"][unit][metric])
-            for unit in subset] for metric in METRICS}
+            for unit in subset] for metric in metric_names}
     all_differences, shared_differences = differences(units), differences(shared)
     def point_estimates(values):
         if not next(iter(values.values()), []):
@@ -731,12 +801,18 @@ def score_all(output, scopes, arms, *, label_loader=None):
         raise ValueError("Generation incomplete; evaluation labels remain unread")
     if label_loader is None:
         verify_originals(include_labels=True)
+        if "personamem" in scopes:
+            from dagbt.personamem import validate_dataset
+            validate_dataset(ROOT, include_labels=True)
         label_loader = lambda dataset: load(ROOT / "data" / dataset / "evaluation_only.json")
     spec = importlib.util.spec_from_file_location("_dagbt_metrics", ROOT / "package" / "metrics.py")
     metrics = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(metrics)
     summaries = {}
     for dataset, questions in scopes.items():
+        is_personamem = dataset == "personamem"
+        metric_names = ("accuracy",) if is_personamem else METRICS
+        answer_metric = "accuracy" if is_personamem else "em"
         labels = {r["id"]: r for r in label_loader(dataset)}
         all_scores, comparisons = {}, []
         for arm in arms:
@@ -744,20 +820,37 @@ def score_all(output, scopes, arms, *, label_loader=None):
             for q in questions:
                 row = load(result_path(output, dataset, arm, q["id"]))
                 label, valid = labels[q["id"]], row["answer"]["status"] == "ok"
-                statuses[row["answer"]["status"]] += 1
-                item = {"unit_id": q["id"], "valid": valid, "answer_status": row["answer"]["status"],
-                        "prediction": row["answer"]["prediction"],
-                        "f1": metrics.token_f1(row["answer"]["prediction"], label["answers"]) if valid else 0.,
-                        "em": metrics.exact_match(row["answer"]["prediction"], label["answers"]) if valid else 0.}
-                groups = label["gold_groups"]
-                if not groups or not all(groups):
-                    raise ValueError("Empty gold title group")
+                choice = None
+                answer_status = row["answer"]["status"]
+                if is_personamem:
+                    from dagbt.personamem import parse_choice
+                    choice = parse_choice(row["answer"]["prediction"], q["options"])
+                    if valid and choice is None:
+                        valid, answer_status = False, "invalid_choice"
+                statuses[answer_status] += 1
+                item = {"unit_id": q["id"], "valid": valid, "answer_status": answer_status,
+                        "prediction": row["answer"]["prediction"]}
+                groups = None
+                if is_personamem:
+                    correct = parse_choice(label["correct_answer"], q["options"])
+                    if correct is None:
+                        raise ValueError("Invalid PersonaMem evaluation choice")
+                    item.update(accuracy=float(valid and choice == correct), predicted_choice=choice,
+                                persona_id=q["persona_id"], question_type=q.get("question_type"))
+                else:
+                    item.update(f1=metrics.token_f1(row["answer"]["prediction"], label["answers"]) if valid else 0.,
+                                em=metrics.exact_match(row["answer"]["prediction"], label["answers"]) if valid else 0.)
+                    groups = label["gold_groups"]
+                    if not groups or not all(groups):
+                        raise ValueError("Empty gold title group")
                 item["modules"] = module_metrics(row, label, dataset, output)
                 item["result_path"] = str(result_path(output, dataset, arm, q["id"]).relative_to(output))
                 item["attempt_directories"] = row.get("attempt_directories", [])
                 item["selected_doc_ids"] = {k: row["budgets"][k]["selected_doc_ids"] for k in ("5", "10", "20")}
                 item["latest_attempt_cost"] = row.get("runner", {}).get("cost")
                 for k in ("5", "10", "20"):
+                    if is_personamem:
+                        continue
                     ids = set(map(str, row["budgets"][k]["selected_doc_ids"]))
                     if dataset == "musique":
                         ids = {d if d.startswith("musique:") else "musique:" + d for d in ids}
@@ -769,25 +862,36 @@ def score_all(output, scopes, arms, *, label_loader=None):
         n = len(questions)
         common = [q["id"] for q in questions if all(all_scores[a][q["id"]]["valid"] for a in arms)]
         summary = {"dataset": dataset, "n": n, "common_success_n": len(common), "arms": {}, "paired": {},
-                   "support_metric": "macro recall of gold title groups; any matching document satisfies a group",
+                   "support_metric": (None if is_personamem else "macro recall of gold title groups; any matching document satisfies a group"),
+                   "task": "personal_memory_multiple_choice" if is_personamem else "multi_hop_question_answering",
                    "failure_policy": "answer failure scores zero on all-task answer metrics; retrieval metrics use recorded selections"}
+        if is_personamem:
+            summary["support_metric_note"] = "Not available: PersonaMem provides no gold supporting-document labels"
+            summary["choice_protocol"] = "Single option label only; ambiguous, out-of-range or explanatory responses are invalid_choice"
         for arm in arms:
             rows = list(all_scores[arm].values())
             summary["arms"][arm] = {"answer_status_counts": dict(Counter(s["answer_status"] for s in rows)),
                 "failure_rate": sum(not s["valid"] for s in rows) / n,
-                "all_task_metrics_percent": {k: 100 * sum(s[k] for s in rows) / n for k in METRICS},
-                "common_success_metrics_percent": {k: 100 * sum(all_scores[arm][u][k] for u in common) / len(common) for k in METRICS} if common else None,
+                "all_task_metrics_percent": {k: 100 * sum(s[k] for s in rows) / n for k in metric_names},
+                "common_success_metrics_percent": {k: 100 * sum(all_scores[arm][u][k] for u in common) / len(common) for k in metric_names} if common else None,
                 "module_metrics": summarize_modules(rows),
                 "cost_all_attempts": total_cost(output, dataset, arm)}
+            if is_personamem:
+                persona_scores = {}
+                for item in rows:
+                    persona_scores.setdefault(item["persona_id"], []).append(item["accuracy"])
+                macro = sum(sum(values) / len(values) for values in persona_scores.values()) / len(persona_scores)
+                summary["arms"][arm].update(persona_macro_accuracy_percent=100 * macro,
+                                            personas=len(persona_scores))
         baseline = arms[0]
         for arm in arms[1:]:
             pair_ids = [q["id"] for q in questions if all_scores[baseline][q["id"]]["valid"] and all_scores[arm][q["id"]]["valid"]]
             summary["paired"][arm] = {"baseline": baseline, "pairwise_common_success_n": len(pair_ids),
-                "all_task_delta_percentage_points": {k: 100 * sum(all_scores[arm][q["id"]][k] - all_scores[baseline][q["id"]][k] for q in questions) / n for k in METRICS},
-                "common_success_delta_percentage_points": {k: 100 * sum(all_scores[arm][u][k] - all_scores[baseline][u][k] for u in pair_ids) / len(pair_ids) for k in METRICS} if pair_ids else None,
-                "rescue_em_common_success": sum(all_scores[arm][u]["em"] == 1 and all_scores[baseline][u]["em"] == 0 for u in pair_ids),
-                "harm_em_common_success": sum(all_scores[arm][u]["em"] == 0 and all_scores[baseline][u]["em"] == 1 for u in pair_ids)}
-        interaction = factorial_interaction(all_scores, [q["id"] for q in questions])
+                "all_task_delta_percentage_points": {k: 100 * sum(all_scores[arm][q["id"]][k] - all_scores[baseline][q["id"]][k] for q in questions) / n for k in metric_names},
+                "common_success_delta_percentage_points": {k: 100 * sum(all_scores[arm][u][k] - all_scores[baseline][u][k] for u in pair_ids) / len(pair_ids) for k in metric_names} if pair_ids else None,
+                f"rescue_{answer_metric}_common_success": sum(all_scores[arm][u][answer_metric] == 1 and all_scores[baseline][u][answer_metric] == 0 for u in pair_ids),
+                f"harm_{answer_metric}_common_success": sum(all_scores[arm][u][answer_metric] == 0 and all_scores[baseline][u][answer_metric] == 1 for u in pair_ids)}
+        interaction = factorial_interaction(all_scores, [q["id"] for q in questions], metric_names)
         if interaction is not None:
             summary["factorial_interaction"] = interaction
         for q in questions:
@@ -797,9 +901,9 @@ def score_all(output, scopes, arms, *, label_loader=None):
         (dest / "comparisons.jsonl").write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in comparisons))
         with (dest / "comparisons.csv").open("w", newline="") as handle:
             writer = csv.writer(handle)
-            writer.writerow(["unit_id", "question", *[f"{a}.{k}" for a in arms for k in ("answer_status", "prediction", *METRICS)]])
+            writer.writerow(["unit_id", "question", *[f"{a}.{k}" for a in arms for k in ("answer_status", "prediction", *metric_names)]])
             for r in comparisons:
-                writer.writerow([r["unit_id"], r["question"], *[r["arms"][a][k] for a in arms for k in ("answer_status", "prediction", *METRICS)]])
+                writer.writerow([r["unit_id"], r["question"], *[r["arms"][a][k] for a in arms for k in ("answer_status", "prediction", *metric_names)]])
         save(dest / "summary.json", summary)
         summaries[dataset] = summary
     save(output / "summary.json", summaries)
@@ -848,7 +952,9 @@ def run_experiment(args):
                     "question_ids": {d: [q["id"] for q in qs] for d, qs in scopes.items()},
                     "questions_digest": {d: digest(qs) for d, qs in scopes.items()}, "source_hashes": frozen_sources(),
                     "original_hash_manifest": file_hash(ROOT / "original_manifest.json"),
-                    "scope": "full_local_1000_per_dataset" if args.limit is None else f"first_{args.limit}_per_dataset",
+                    "scope": "all_packaged_questions_per_dataset" if args.limit is None else f"first_{args.limit}_per_dataset",
+                    "dataset_manifests": {d: file_hash(ROOT / "data" / d / "manifest.json")
+                                          for d in datasets if d == "personamem"},
                     "baseline": ("native make_plan/native.solve; original archive algorithm with query-dimension guard tied to new index; shared BT model/resource adapter replaces backend protocol, token accounting and corpus vectors"
                                  if config.get("model_profile") == "bridgetree" else
                                  "untouched native make_plan/archive/native.solve, same e.work failure handling; wrapper replaces filesystem resume and call accounting only"),
@@ -867,6 +973,9 @@ def run_experiment(args):
                     and 0 <= time.time() - prior_probe.get("created_unix", 0) < 300
                     and "llm" in prior_probe.get("endpoints", {}))
         if reusable:
+            if "personamem" in datasets:
+                from dagbt.personamem import validate_dataset
+                validate_dataset(ROOT)
             report = {**prior_probe, "original_integrity": verify_originals(), "reused_launch_preflight": True}
         else:
             report = preflight(config, datasets, endpoints=not args.offline_preflight, output=output, arms=arms)

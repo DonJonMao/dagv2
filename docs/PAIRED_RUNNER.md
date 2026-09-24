@@ -1,6 +1,8 @@
 # 成对实验启动、恢复和结果解释
 
-这是 RAG **推理与评测实验**，不会更新模型参数。默认对包内 HotpotQA、2WikiMultihopQA、MuSiQue 各 1,000 个问题，分别执行原 DAG v2 和融合版；相同问题 ID、原始文本、语料和向量不变。没有把这 3,000 题称为三个数据集的完整官方规模。
+这是 RAG **推理与评测实验**，不会更新模型参数。默认对包内 HotpotQA、2WikiMultihopQA、MuSiQue 各 1,000 个问题，以及 PersonaMem-v1 官方 32k 文件全部 589 题，分别执行原 DAG v2 和融合版，共 **3,589 题、7,178 个方法任务**。同一道题的两方法共享问题、公共选项、可见语料范围和向量。原三套数据仍是包内子集；PersonaMem 的 589 题是所固定官方 32k 文件的全部题目，不代表所有上下文长度设置，也不声称复现 BT 的 train/validation/test 划分。
+
+PersonaMem 的来源、按题可见记忆和单选评测详见 [PERSONAMEM.md](PERSONAMEM.md)。默认省略 `--datasets` 即运行四套数据；仅运行新数据可指定 `--datasets personamem`。
 
 ## 一键后台运行
 
@@ -19,11 +21,11 @@ bash scripts/run_paired.sh preflight --config configs/paired.local.json
 # 首次仍需为所选数据集的完整语料建索引。
 bash scripts/run_paired.sh --config configs/paired.local.json --output outputs/paired_smoke --limit 2
 
-# 完整的默认双臂实验：3 个数据集，各 1,000 题，每题原版和融合版各一次。
-bash scripts/run_paired.sh --config configs/paired.local.json --output outputs/paired_full
+# 完整的默认双臂实验：原三套各 1,000 题，加 PersonaMem 589 题。
+bash scripts/run_paired.sh --config configs/paired.local.json --output outputs/paired_full_personamem
 
-bash scripts/run_paired.sh status --output outputs/paired_full
-bash scripts/run_paired.sh stop --output outputs/paired_full
+bash scripts/run_paired.sh status --output outputs/paired_full_personamem
+bash scripts/run_paired.sh stop --output outputs/paired_full_personamem
 ```
 
 省略动作表示 `launch`：先同步预检，再用 `start_new_session=True` 脱离终端，标准输入断开，输出写入 `launcher.log`。进程可在终端关闭后运行。不需要 `nohup`，不启动或重启模型服务。`run` 是前台版本；启动成功不等于实验完成，以 `status` 和 `progress.json` 为准。
@@ -43,18 +45,20 @@ reranker 预检直接调用当前 BT 源码的 pointwise consistency probe：空
 重新执行相同命令会跳过已有成功和已有失败的终态记录，继续尚未完成的题。只有显式指定 `--retry-failed` 才重跑失败终态；每次启动至多给每个失败任务新增一次尝试，累计次数由 `max_question_attempts`（示例为 3）限制：
 
 ```bash
-bash scripts/run_paired.sh --config configs/paired.local.json --output outputs/paired_full --retry-failed
+bash scripts/run_paired.sh --config configs/paired.local.json --output outputs/paired_full_personamem --retry-failed
 ```
 
 每次尝试有独立目录，保留旧失败、请求和重试日志。新尝试仅复用旧尝试中已经成功的完全相同请求缓存；失败 HTTP 请求进入新的、有上限的重试窗口。达到总尝试上限后保留失败并继续。协调进程中断留下的未终态尝试也计入上限，恢复不假装重建搜索中途的 Python 状态，而是从该题起点确定性重放成功缓存。
 
-`manifest.json` 固定配置、问题顺序/摘要、原始包 manifest 和新增源码/vendor 的 SHA256。更改方法、代码、配置、题目范围都必须换输出目录；不能把 smoke 目录直接变成 full 目录。OS `flock` 防止两个写进程使用同一目录；过期 PID 文件不会阻止恢复。`stop` 校验活跃文件锁和进程命令，SIGTERM 触发 finally 终止工作进程，避免只停掉外层留下任务。
+`manifest.json` 固定配置、问题顺序/摘要、原始包 manifest 和新增源码/vendor 的 SHA256，并记录 PersonaMem 的数据 manifest。更改方法、代码、配置、题目范围都必须换输出目录；不能把 smoke 目录直接变成 full 目录，也不能沿用加入 PersonaMem 前的全量输出目录。OS `flock` 防止两个写进程使用同一目录；过期 PID 文件不会阻止恢复。`stop` 校验活跃文件锁和进程命令，SIGTERM 触发 finally 终止工作进程，避免只停掉外层留下任务。
 
 ## 原版保持什么
 
 `original` 保留原 planner、dense 查询、节点检索、闭包选择和 reader chain 算法，`experiment_v6` 仍装载原 controller/reader。历史配置继续直接调用原 `e.archive`；BT 配置的等价 archive 适配仅将固定 4096 维校验改为当前索引维度。两方法共同使用新的向量、chat 协议和 BT token 估算；JSON schema 作为格式指令发送，模型参数遵循 BT 部署配置。原始文件未修改，但不能把新模型运行称为旧 Qwen/NV 实验的直接复现。
 
-融合版默认 raw-memory reader，与原版 chain reader 不完全匹配。因此 **original vs fusion 是系统级对比，不能单独证明 BT 或依赖选择的因果贡献**。原始目录 `dagv2/`、`package/`、`data/` 和原有脚本用 `original_manifest.json` 核验；标签文件哈希检查延迟到评分阶段，生成阶段不打开标签。
+PersonaMem 接入当前成对入口的 `original` 臂，保留其原求解流程，同时增加按题语料隔离和单选 reader 协议；没有修改历史 `original-dagv2` 分支、原始 57 个文件或 BT vendor 快照。两臂接收同样的公共选项，并要求最终只输出一个选项标签。`configs/paired.legacy.json` 不支持 PersonaMem，使用历史配置时须显式加 `--datasets hotpotqa 2wikimultihopqa musique`。
+
+融合版默认 raw-memory reader，与原版 chain reader 不完全匹配。因此 **original vs fusion 是系统级对比，不能单独证明 BT 或依赖选择的因果贡献**。原始目录 `dagv2/`、`package/`、`data/` 中的原文件和原有脚本用 `original_manifest.json` 核验；新增 PersonaMem 文件用 `data/personamem/manifest.json` 核验。标签文件哈希检查延迟到评分阶段，生成阶段不打开标签。
 
 ## 必需的机制对照
 
@@ -72,7 +76,7 @@ bash scripts/run_paired.sh --config configs/paired.local.json --output outputs/f
 | `bt_flat` | 最新 BT 桥接搜索 | 平面证据选择 |
 | `dense_flat` | Dense | 平面证据选择 |
 
-当四个融合家族方法齐全时，`summary.json` 额外报告 `(fusion - bt_flat) - (dense_dependency - dense_flat)` 的 F1/EM/检索指标交互项，分别使用全任务和四方法共同成功子集；original 失败不会排除四方法均成功的题。保留描述性点估计，并在评分阶段进行 1,000 次、固定 seed=20260918 的同题配对 percentile bootstrap，给出 95% 区间：每次按问题索引同步抽取四臂，不能独立抽各方法。样本数小于 2 时明确报告无法估计。区间假设问题独立、可交换；共享语料可能削弱独立性，区间也不包含模型再次生成的随机性。它不等于因果证据；共同成功筛选也可能改变被评估的题目分布。
+当四个融合家族方法齐全时，`summary.json` 额外报告 `(fusion - bt_flat) - (dense_dependency - dense_flat)` 的指标交互项：原三套数据使用 F1/EM/检索指标，PersonaMem 使用 accuracy，分别使用全任务和四方法共同成功子集；original 失败不会排除四方法均成功的题。保留描述性点估计，并在评分阶段进行 1,000 次、固定 seed=20260918 的同题配对 percentile bootstrap，给出 95% 区间：每次按问题索引同步抽取四臂，不能独立抽各方法。样本数小于 2 时明确报告无法估计。区间假设问题独立、可交换；共享语料和 PersonaMem 同 persona 的问题相关性可能削弱独立性，区间也不包含模型再次生成的随机性。这不是按 persona 聚类的 bootstrap，也不等于因果证据；共同成功筛选也可能改变被评估的题目分布。
 
 可按需加入 `fusion_no_conditions`、`fusion_single_support`、`fusion_no_invalidation`、`fusion_fixed_dag`、`fusion_chain`，分别检查条件审计、多支持方案、失效传播、细化节点和 chain reader。方法名字与最终语义以 `dagbt/config.py` 为准。融合配置预算是**每题、每方法、每次 attempt** 的共享上限，不能按节点重置；显式 `--retry-failed` 开始新 attempt，因此可能额外产生请求和 token，`cost_all_attempts` 累加全部尝试成本。相同 ANN 上限不代表相同总成本，必须报告 LLM、reranker、缓存、HTTP 重试和实际 token。
 
@@ -89,14 +93,16 @@ bash scripts/run_paired.sh --config configs/paired.local.json --output outputs/f
 - `<dataset>/<arm>/rows/<question-hash>.json`：每题当前权威结果、ranking/graph、5/10/20 证据选择、答案和 runner 开销。
 - `<dataset>/<arm>/attempts/<question-hash>/attempt-NNN/`：不可覆盖的尝试；原始请求/响应、成功缓存来源、每次逻辑调用事件、方法诊断。
 - `<dataset>/<arm>/failures/`：失败历史，即使后续成功仍保留。
-- `<dataset>/comparisons.jsonl` 和 `.csv`：相同题目的各方法预测、状态、EM/F1、title-group recall、all-support；JSONL 另外含候选/选择模块指标、具体选集、结果路径和最新尝试成本。
-- `<dataset>/summary.json` 和根 `summary.json`：全任务分数/失败率、共同成功子集、成对 delta、EM rescue/harm、所有尝试的累计请求成本。
+- `<dataset>/comparisons.jsonl` 和 `.csv`：相同题目的各方法预测、状态与逐题分数；原三套数据为 EM/F1、title-group recall、all-support，PersonaMem 为 accuracy 和选项标签；JSONL 另外含候选/选择模块指标、具体选集、结果路径和最新尝试成本。
+- `<dataset>/summary.json` 和根 `summary.json`：全任务分数/失败率、共同成功子集、成对 delta、答案正确性 rescue/harm、所有尝试的累计请求成本。PersonaMem 另有 `persona_macro_accuracy_percent`。
 
 所有配置的数据集、方法、问题必须先达到成功或记录失败的终态，才会第一次打开 `evaluation_only.json`。金答案、gold support 不进入 planner、检索器、selector 或 reader。MuSiQue 保留原协议的 `musique:` doc ID 规范化；检索指标按 **title group**，命中组内任何文档即命中该组，不替换为单一 doc ID recall。
 
-全任务答案失败计零，同时显式报告失败率；检索指标仍按实际保存的选集计算。共同成功结果另报，避免把服务可靠性误当算法差异。多方法时既报全部方法共同成功，也报每个方法与 original 的成对共同成功。rescues/harm 是同题 EM 变化，不是经过干预证明的证据因果效应。
+PersonaMem 对每道题先按 `messages[:end_index]` 截断，再采用 BT 的 `user_assistant_pair` 切分并保留 system persona。向量库存储全部去重记忆，但检索、reranker、桥接、证据校验和 reader 只能访问 `scopes.json` 为当前题列出的文档 ID；全库索引不等于全库可见。两臂都不能检索另一 persona 或该题的未来消息。
 
-模块诊断把两种证据分开：`gold_candidate_title_group_recall`/`gold_candidate_all_support` 衡量发现阶段是否找到了标注支持，`gold_discovery_minus_selection_recall_at20` 衡量发现后在选择阶段丢失多少标注支持。它们只在评分阶段计算。`structural_complete_required_at20`、节点 unknown/ambiguous、必要需求覆盖、quote/span protocol 错误、ANN/set-score 用量、reader token 单独汇总。BT 本地计量是估算，`local_token_accounting` 明确标记；API usage 另存，未观测不当作零。模型判断与结构校验不等于 gold 正确性。
+全任务答案失败计零，同时显式报告失败率；原三套数据的检索指标仍按实际保存的选集计算。PersonaMem 仅接受单个选项标签，歧义、多选、超范围标签或带解释的答案记录为 `invalid_choice`，计失败和 0 分。其主指标为 `all_task_metrics_percent.accuracy`，同时报告先在每个 persona 内平均、再对 persona 等权平均的 `persona_macro_accuracy_percent`。没有 gold support，因此不报告 recall、all-support 或文本 F1。共同成功结果另报，避免把服务可靠性误当算法差异。多方法时既报全部方法共同成功，也报每个方法与 original 的成对共同成功。rescues/harm 是同题 EM（原三套）或 accuracy（PersonaMem）变化，不是经过干预证明的证据因果效应。
+
+原三套数据的模块诊断把两种证据分开：`gold_candidate_title_group_recall`/`gold_candidate_all_support` 衡量发现阶段是否找到了标注支持，`gold_discovery_minus_selection_recall_at20` 衡量发现后在选择阶段丢失多少标注支持。它们只在评分阶段计算，不为 PersonaMem 伪造这些 gold 指标。`structural_complete_required_at20`、节点 unknown/ambiguous、必要需求覆盖、quote/span protocol 错误、ANN/set-score 用量、reader token 单独汇总。BT 本地计量是估算，`local_token_accounting` 明确标记；API usage 另存，未观测不当作零。模型判断与结构校验不等于 gold 正确性。
 
 成本日志区分逻辑调用、成功缓存命中、HTTP 尝试、重试和成功响应的 token usage。不返回 usage 的服务记为未知；服务器已执行但响应丢失的成本无法完全观测，因此总 token 是下界，不能把缺失 usage 解释成零成本。服务预检的轻量探测不混入方法实验预算，其 usage 单独保存在 preflight。
 

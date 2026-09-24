@@ -1,0 +1,36 @@
+{
+  "schema": "dagbt_personamem_scoped_v1",
+  "dataset": "bowen-upenn/PersonaMem-v1",
+  "revision": "fd7c30f071d5c2ee2a211506783be222d7b6002e",
+  "split": "32k",
+  "questions": 589,
+  "personas": 20,
+  "shared_contexts": 37,
+  "scopes": 222,
+  "documents": 3187,
+  "source_sha256": {
+    "questions_32k.csv": "cccd34cf53e0bc4d9536c04cff5ca045156d9a4e227e83327112482840bbc93c",
+    "shared_contexts_32k.jsonl": "217247ebfec9e8442fc53570c795ab69f21aad08745f7de78d9beab51b122d4a"
+  },
+  "source_urls": {
+    "questions_32k.csv": "https://huggingface.co/datasets/bowen-upenn/PersonaMem-v1/resolve/fd7c30f071d5c2ee2a211506783be222d7b6002e/questions_32k.csv",
+    "shared_contexts_32k.jsonl": "https://huggingface.co/datasets/bowen-upenn/PersonaMem-v1/resolve/fd7c30f071d5c2ee2a211506783be222d7b6002e/shared_contexts_32k.jsonl"
+  },
+  "public_sha256": {
+    "questions.jsonl": "0a8aa0191561528dec8216f03e9f9522d4ead1b6290303a3ea50c5a60af2462f",
+    "questions.json": "3c576e12147816ef32335d3f3f3836ba91047ac6a2c790329fb67b5d178c7109",
+    "corpus.jsonl": "12d418c27ff7e8c67c9424b6ed622baf7b148f6d179287ee9d4661f095db2b60",
+    "corpus.json": "a3980269f5bc5fdd543e31d5e2016f7528148e23cb2695516b47fade064a52a1",
+    "scopes.json": "3331ffaac3bb867d2249b757fad33ca7e4c579a25cb5949680017db0b18e6158"
+  },
+  "evaluation_sha256": "d79a6174758d1b4dcea492fa1df82274137f3b30cb2cb39c79778408d24a05c5",
+  "protocol": {
+    "row_selection": "all official 32k rows; no additional sample or train/test claim",
+    "memory_granularity": "user_assistant_pair",
+    "include_system_persona": true,
+    "memory_title": "zero_based_message_index_range_v1;observation_order_not_calendar_time",
+    "cutoff": "messages[:end_index] before memory segmentation",
+    "retrieval_scope": "only docids listed in the current question scope_id",
+    "metric": "strict single-choice accuracy; invalid choices count as incorrect"
+  }
+}

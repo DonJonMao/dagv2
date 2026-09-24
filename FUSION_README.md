@@ -1,6 +1,6 @@
 # DAG v2 + 最新 Evidence BridgeTree
 
-本目录由 `dagv2_package_20260921` 完整复制而来。原始 57 个文件保留不改；原版 Git 分支是 `original-dagv2`，融合支线是 `fusion/latest-bt`。三套数据、索引、原脚本、原方法代码都可继续使用。`original_manifest.json` 提供字节校验。
+本目录由 `dagv2_package_20260921` 完整复制而来。原始 57 个文件保留不改；原版 Git 分支是 `original-dagv2`，融合支线是 `fusion/latest-bt`。原三套数据、索引、原脚本、原方法代码都可继续使用。当前成对入口另接入 PersonaMem，`original` 和 `fusion` 两臂都能运行；历史原版分支不改。`original_manifest.json` 提供字节校验。
 
 三个大型 `passage_vectors.npy` 原样保存在本地，并纳入校验，但不提交到 Git；复制或部署此目录时需一并携带 `data/`。
 
@@ -28,7 +28,9 @@ BT 从当前工作区冻结为 `vendor/bridgetree/`，不是旧 Git HEAD。原�
 
 当前默认模型已与 `bridgetree_preference_rag/configs/evidence_bridge.yaml` 的配置继承链同步：**DeepSeek-V4-Flash + Qwen3-Embedding-8B + Qwen3-Reranker-8B**，使用同一组服务地址。成对入口的 `original` 和 `fusion` 共享这些模型。原版方法不调用 reranker，融合版用于 BT 集合评分。
 
-首次启动会为三套语料重建独立 Qwen3 向量索引，旧 NV-Embed-v2 数组原样保留。DeepSeek 使用 chat 接口；本地预算改用 BT 的明确标注的 token 估算，实际服务 usage 另外记录。适配细节、来源与限制见 [模型对齐说明](docs/MODEL_ALIGNMENT.md)。`configs/paired.legacy.json` 可复现上一版 Qwen/NV 配置；原始分支及 `config.example.json` 仍保留历史快照。
+首次启动会为所选数据集建立独立 Qwen3 向量索引，旧 NV-Embed-v2 数组原样保留。PersonaMem 物理共享记忆向量库，但每道题仅可检索其用户在该时刻已经可见的记忆，不能检索其他用户或未来消息。DeepSeek 使用 chat 接口；本地预算改用 BT 的明确标注的 token 估算，实际服务 usage 另外记录。适配细节、来源与限制见 [模型对齐说明](docs/MODEL_ALIGNMENT.md)。`configs/paired.legacy.json` 保留上一版 Qwen/NV 配置，仅支持原三套数据，运行时须显式指定 `--datasets hotpotqa 2wikimultihopqa musique`；原始分支及 `config.example.json` 仍保留历史快照。
+
+默认数据范围为 HotpotQA、2WikiMultihopQA、MuSiQue 各 1,000 题，以及 PersonaMem-v1 官方 32k 文件全部 589 题，共 **3,589 题、7,178 个双臂方法任务**。PersonaMem 覆盖 20 个 persona、37 个 shared context、222 个可见记忆范围和 3,187 条去重记忆，使用与 BT 相同的固定数据源版本。其任务为四选一，报告严格单选 accuracy 和 persona 宏平均 accuracy，不生成不存在的 gold-support recall 或文本 F1。数据与评测协议见 [PersonaMem 说明](docs/PERSONAMEM.md)。
 
 ## 启动
 
@@ -40,8 +42,8 @@ python3 -m venv .venv
 cp configs/paired.example.json configs/paired.local.json
 # 默认模型、端点与 LLM key 已配置；环境变量可覆盖凭证。
 
-# 配好服务后一条命令后台启动全部 3×1000 题，每题旧/新各一次：
-bash scripts/run_paired.sh --config configs/paired.local.json --output outputs/paired_full
+# 配好服务后一条命令后台启动全部四套数据，每题旧/新各一次：
+bash scripts/run_paired.sh --config configs/paired.local.json --output outputs/paired_full_personamem
 ```
 
 先跑 `--limit 2` 到单独目录可以检查真实模型协议；即使只测两题，也需要所选数据集的完整语料索引。后台任务不依赖终端，支持 `status`、`stop`、原命令恢复和显式 `--retry-failed`；某题超时或失败不会停止另一版本和后续题。成功结果不会重复生成，失败尝试始终保留。数据范围或代码变动须换输出目录。
@@ -61,6 +63,6 @@ bash scripts/run_paired.sh --config configs/paired.local.json --output outputs/f
 
 四个新臂共享融合求解器、同一 token 计量方式和 raw-only reader。另有条件审计、OR 支持、失效传播、细化、chain reader，以及强制保留导航来源、取消评分代理调度的消融。`fixed_candidate_pools` 可为指定问题提供冻结候选 ID 列表，用于同候选池选择对照；它不能来自 gold，也不能作为在线召回成绩。
 
-日志包括每次查询与命中、完整 BT 搜索事件、实际支持父项与原文引用、节点状态/版本、冲突与明确解决、闭包选取、reader 确切输入、所有调用/缓存/重试成本。评分阶段再加载标签，报告全任务、共同成功子集、救回/损害题、发现召回和选集召回。语义依赖正确性仍需独立人工检查，程序证书不证明自然语言蕴涵。
+日志包括每次查询与命中、完整 BT 搜索事件、实际支持父项与原文引用、节点状态/版本、冲突与明确解决、闭包选取、reader 确切输入、所有调用/缓存/重试成本。评分阶段再加载标签，报告全任务、共同成功子集和救回/损害题；原三套问答数据另报发现召回和选集召回，PersonaMem 只报告有定义的单选准确率。语义依赖正确性仍需独立人工检查，程序证书不证明自然语言蕴涵。
 
 研究设计逐项对应与适配依据见 [实现核对](docs/FIDELITY_AUDIT.md)。首版离线验证记录见 `docs/VALIDATION.md`，本次模型切换验证见 `docs/MODEL_ALIGNMENT.md`。这里没有将模拟接口输出当作真实模型实验收益。

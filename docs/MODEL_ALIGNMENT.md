@@ -2,6 +2,8 @@
 
 2026-09-23，按用户要求修改成对实验入口的共同模型配置。BT 原仓库及本仓库原始 57 个文件均不修改。`original-dagv2` 是历史源码快照；通过当前 `scripts/run_paired.sh` 运行的 `original` 与 `fusion` 使用相同的新模型。
 
+2026-09-24 新增 PersonaMem 时沿用这组模型，并加入按题记忆范围与单选任务适配，见 [PERSONAMEM.md](PERSONAMEM.md)。下文的 27,586 篇语料和 244 项测试均是 2026-09-23 模型切换的历史记录，不包含此次新增 PersonaMem。旧 `paired.legacy.json` 仅支持原三套数据，运行时须显式加 `--datasets hotpotqa 2wikimultihopqa musique`。
+
 ## 模型与来源
 
 配置来自 BT 的 `evidence_bridge.yaml → chain_service_fixed.yaml → chain_full.yaml → default.yaml`，非旧的基础模型猜测。来源文件 SHA256 和非敏感模型字段见 `configs/bridgetree_models_source.json`。

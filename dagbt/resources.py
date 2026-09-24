@@ -24,7 +24,7 @@ from .transport import Transport, digest, save
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DATASETS = {"hotpotqa", "2wikimultihopqa", "musique"}
+DATASETS = {"hotpotqa", "2wikimultihopqa", "musique", "personamem"}
 SERIALIZATION = "reader.Document.passage:title_newline_text_nonempty_v1;no_document_instruction"
 SCHEMA = "dagbt_derived_embeddings_v1"
 BATCH_SIZE = 32
@@ -276,8 +276,31 @@ def prepare_resources(config, dataset, pipeline, tokenizer, root=ROOT):
     assets = [corpus_path, question_path, Path(report["manifest_path"]), Path(report["vectors_path"]), Path(__file__)]
     if canonical_path.exists():
         assets.append(canonical_path)
+    if dataset == "personamem":
+        from .personamem import validate_dataset
+        validate_dataset(root)
+        assets.extend(Path(root) / "data" / dataset / name for name in ("scopes.json", "manifest.json"))
     hashes = {str(path): _file_hash(path) for path in assets}
     return questions, (docs, ids, vectors, index, tokenizer), hashes
+
+
+def scope_resources(resources, doc_ids):
+    """Give both algorithms only this question's visible memory and index.
+
+    A fresh index is essential: the native controller caches its full search
+    matrix on the index object. Reusing it would expose a previous scope.
+    """
+    docs, ids, vectors, index, tokenizer = resources
+    scoped_ids = list(doc_ids)
+    if not scoped_ids or len(scoped_ids) != len(set(scoped_ids)):
+        raise ValueError("Memory scope must contain nonempty unique document IDs")
+    positions = {doc_id: pos for pos, doc_id in enumerate(ids)}
+    if any(doc_id not in positions or doc_id not in docs for doc_id in scoped_ids):
+        raise ValueError("Memory scope references unknown documents")
+    scoped_vectors = vectors[[positions[doc_id] for doc_id in scoped_ids]]
+    scoped_docs = {doc_id: docs[doc_id] for doc_id in scoped_ids}
+    scoped_index = SimpleNamespace(vectors=dict(zip(scoped_ids, scoped_vectors)), lock=index.lock)
+    return scoped_docs, scoped_ids, scoped_vectors, scoped_index, tokenizer
 
 
 def archive_for_resources(question, plan, ids, vectors, calls, e):
