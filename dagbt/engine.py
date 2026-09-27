@@ -20,8 +20,12 @@ from .support import (SupportError, make_span, compile_graph, select_support,
                       invalidate_support, resolve_conflict, normalized_answer, text_hash,
                       with_navigation_closure)
 
-class InputOverflow(ValueError): pass
-class ProtocolError(ValueError): pass
+from .reasoning import Reasoner, InputOverflow, ProtocolError
+from .evidence_mapping import EvidenceMapper
+from .evidence_views import build_view
+from .row_recovery import recover_rows
+
+RELIABILITY_VERSION = "dagbt_fusion_reliability_v2"
 
 
 def legacy_modules():
@@ -44,50 +48,6 @@ def _strings(value, name):
         raise ProtocolError(name+' must contain unique nonempty string IDs')
     return value
 
-class Reasoner:
-    def __init__(self,calls,tokenizer,config,settings,ledger,event):
-        self.calls,self.tokenizer,self.config,self.settings,self.ledger,self.event=calls,tokenizer,config,settings,ledger,event
-        self.sequence=0
-    def json(self,operation,system,data,validate,schema=None):
-        messages=[{'role':'system','content':system},{'role':'user','content':json.dumps(data,ensure_ascii=False)}]
-        error=None
-        while True:
-            output=self.settings['reasoning_output_tokens']
-            payload={'messages':messages,'max_tokens':output,'chat_template_kwargs':{'enable_thinking':False},
-                     'structured_outputs':{'json':schema or {'type':'object'}}}
-            count=count_request_tokens((operation,str(self.sequence+1)),
-                self.config['llm_base_url'].rstrip('/')+'/chat/completions',payload,self.config,self.tokenizer)
-            if count+output+8>self.settings['context_tokens']:
-                raise InputOverflow(f'{operation}: {count}+{output}+8 exceeds {self.settings["context_tokens"]}')
-            # Audits (including JSON repairs) cannot consume the flat arm's
-            # final selection call. Otherwise only that control arm may fail
-            # after an otherwise recoverable audit-budget exhaustion.
-            flat_reserve=int(self.settings['selection']=='flat')
-            reserved=(0 if operation.startswith('select') else flat_reserve
-                      if operation.startswith('audit') else self.settings['reserved_audit_calls']+flat_reserve)
-            if self.ledger.remaining('llm')<=reserved:
-                raise BudgetExceeded('llm',operation,1,0)
-            self.sequence+=1
-            stage=(operation,str(self.sequence))
-            response=self.calls.get(stage,self.config['llm_base_url'].rstrip('/')+'/chat/completions',payload)
-            choice=response['response']['choices'][0]
-            raw=choice.get('message',{}).get('content','')
-            self.event({'event':'reasoning_response','operation':operation,'response_ref':response['response_ref'],
-                        'input_tokens_local':count,'raw_output':raw,'finish_reason':choice.get('finish_reason'),
-                        **token_accounting(self.config)})
-            try:
-                if choice.get('finish_reason')!='stop':raise ProtocolError('finish_reason='+str(choice.get('finish_reason')))
-                value=json.loads(raw)
-                if not isinstance(value,dict):raise ProtocolError('Expected object')
-                return validate(value)
-            except (ValueError,KeyError,TypeError) as exc:
-                error=f'{type(exc).__name__}: {exc}'
-                self.event({'event':'protocol_error','operation':operation,'error':error})
-                if self.ledger.remaining('json_repairs')<1:raise ProtocolError(error) from exc
-                self.ledger.reserve('json_repairs',operation)
-                messages += [{'role':'assistant','content':raw}, {'role':'user','content':
-                    'Repair the JSON using only the original evidence. Validation error: '+error}]
-
 class Engine:
     def __init__(self,q,resources,calls,config,method):
         if set(q)-{'id','question'}:raise ProtocolError('Generation question must contain only id/question')
@@ -103,6 +63,7 @@ class Engine:
         self.spans={};self.nodes=[];self.steps=[];self.candidates=[];self.chunks=[];self.mapped_chunks=set()
         self.requirements=[];self.refinements=0;self.discoveries=[];self.errors=[];self.conflicts=[];self.graph=None
         self.navigation_provenance={}
+        self.mapper=EvidenceMapper(self);self.input_views=[];self.row_recoveries=[]
         self.e,self.repair,self.reader=legacy_modules()
 
     def event(self,value):
@@ -161,24 +122,35 @@ class Engine:
         return query,[]
 
     def add_candidates(self,ids):
-        for doc_id in ids:
-            if doc_id not in self.docs:raise ProtocolError('Discovery returned invisible document '+str(doc_id))
-            if doc_id in self.candidates:continue
-            self.candidates.append(doc_id)
-            raw=self.docs[doc_id].passage
-            start=0
-            # Partition every source character; no head-only truncation.
-            while start<len(raw):
-                lo,hi=1,len(raw)-start
-                cap=max(64,self.s['map_batch_tokens']//2)
-                while lo<hi:
-                    mid=(lo+hi+1)//2
-                    if len(self.tokenizer.encode(raw[start:start+mid],add_special_tokens=False))<=cap:lo=mid
-                    else:hi=mid-1
-                self.chunks.append({'doc_id':doc_id,'start':start,'text':raw[start:start+lo]})
-                if start+lo>=len(raw):break
-                overlap=min(self.s['max_quote_chars']-1,lo-1)
-                start+=max(1,lo-overlap)
+        self.mapper.add_candidates(ids)
+
+    def evidence_view(self,operation,system,fixed,**kwargs):
+        view=build_view(self.reasoner,operation,system,fixed,list(self.spans.values()),
+                        self.s,self.event,node_order=[n['id'] for n in self.nodes],**kwargs)
+        self.input_views.append(deepcopy(view.audit))
+        return view
+
+    def recover(self,operation,system,view,validate,fields):
+        result,diagnostic=recover_rows(self.reasoner,operation,system,view.data,validate,
+                                      fields,decode=view.decode)
+        self.row_recoveries.append({'operation':operation,**diagnostic})
+        if not diagnostic['complete']:
+            error={'stage':operation,'type':diagnostic.get('error_type') or 'ProtocolError',
+                   'error':'Local response rows remain unavailable','details':diagnostic}
+            self.errors.append(error);self.event({'event':'reasoning_rows_incomplete',**error})
+        return result
+
+    def reliability(self):
+        mapping=self.mapper.diagnostics()
+        truncated=any(view.get('input_truncated',False) or view.get('omitted_span_ids')
+                      or view.get('omitted_ids') or view.get('omitted_alternative_ids')
+                      for view in self.input_views)
+        incomplete=bool(mapping['mapping_incomplete'])
+        cohort=('truncated_and_partially_mapped' if truncated and incomplete else
+                'truncated' if truncated else 'partially_mapped' if incomplete else 'normal')
+        return {**mapping,'version':RELIABILITY_VERSION,'cohort':cohort,
+                'input_truncated':bool(truncated),'mapping_incomplete':incomplete,'mapping_complete':not incomplete,
+                'input_views':deepcopy(self.input_views),'row_recoveries':deepcopy(self.row_recoveries)}
 
     def record_navigation(self, found):
         """Freeze actual first exposure; later revisits never add cycles/paths."""
@@ -202,48 +174,7 @@ class Engine:
                 'first_exposure_index':len(self.navigation_provenance),'dependency_claim':False}
 
     def map_pending(self,remaining_nodes=1):
-        pending=[i for i in range(len(self.chunks)) if i not in self.mapped_chunks]
-        available=max(0,self.ledger.remaining('llm')-self.s['reserved_audit_calls']-max(1,remaining_nodes))
-        quota=max(1,available//max(1,remaining_nodes)) if available else 0
-        while pending and quota>0:
-            batch=[];indices=[]
-            while pending:
-                idx=pending[0];proposed=batch+[self.chunks[idx]]
-                data={'original_question':self.q['question'],'nodes':self.steps,'chunks':proposed}
-                _,count=rendered([{'role':'system','content':prompts.MAP},{'role':'user','content':json.dumps(data,ensure_ascii=False)}],self.tokenizer)
-                if count>self.s['map_batch_tokens']:
-                    if not batch:raise InputOverflow('One full map chunk and plan cannot fit map budget')
-                    break
-                batch=proposed;indices.append(pending.pop(0))
-            visible={c['doc_id'] for c in batch};node_ids=set(self.node_map())
-            def validate(value):
-                if not isinstance(value.get('spans'),list):raise ProtocolError('spans must be a list')
-                result=[]
-                for x in value['spans']:
-                    if x.get('doc_id') not in visible:raise ProtocolError('Map quote outside supplied documents')
-                    quote=x.get('quote');start=x.get('start')
-                    if not isinstance(quote,str) or not 0<len(quote)<=self.s['max_quote_chars']:raise ProtocolError('Invalid quote length')
-                    if type(start) is not int:raise ProtocolError('Absolute quote start must be integer')
-                    if not any(c['doc_id']==x['doc_id'] and c['start']<=start and start+len(quote)<=c['start']+len(c['text']) for c in batch):
-                        raise ProtocolError('Quote outside supplied chunk')
-                    rel=_strings(x.get('node_ids'),'node_ids')
-                    if not set(rel)<=node_ids:raise ProtocolError('Unknown relevance node')
-                    if x.get('stance') not in ('support','partial','contradiction'):raise ProtocolError('Invalid evidence stance')
-                    et=x.get('event_time');tq=x.get('time_quote')
-                    if et is not None and (not isinstance(et,str) or not isinstance(tq,str) or not tq or not any(c['doc_id']==x['doc_id'] and tq in c['text'] for c in batch)):
-                        raise ProtocolError('Event time lacks exact source time quote')
-                    sid='s_'+digest([x['doc_id'],start,quote])[:20]
-                    result.append(make_span(sid,x['doc_id'],quote,self.docs,start=start,event_time=et,
-                          node_ids=rel,stance=x['stance'],entity_scope=x.get('entity_scope',''),
-                          time_quote=tq,reason=x.get('reason',''),source_role='document'))
-                return result
-            mapped=self.reasoner.json('map',prompts.MAP,{'original_question':self.q['question'],'nodes':self.steps,'chunks':batch},validate)
-            for sp in mapped:
-                if sp['id'] in self.spans:sp['node_ids']=sorted(set(sp['node_ids'])|set(self.spans[sp['id']]['node_ids']))
-                self.spans[sp['id']]=sp
-            self.mapped_chunks.update(indices);quota-=1
-            self.event({'event':'evidence_mapped','chunk_indices':indices,'spans':mapped,'unmapped_chunks':len(pending)})
-        if pending:self.event({'event':'mapping_deferred','unmapped_chunks':len(pending),'reason':'shared_budget_fairness'})
+        self.mapper.map_pending(remaining_nodes)
 
     def resolve_node(self,step,query):
         nodes=self.node_map();node_id=step['output_slot'];old=deepcopy(nodes[node_id])
@@ -251,13 +182,15 @@ class Engine:
         for node in self.nodes:
             if node['id']==node_id:break
             if node['status']=='supported':predecessors.append(node)
-        allowed_parents={n['id']:n for n in predecessors}
-        # All mapped evidence is visible, not just hits on the winning BT path.
-        data={'original_question':self.q['question'],'subquestion':query,'node_id':node_id,
+        # Views crop whole records; aliases resolve only against supplied evidence.
+        fixed={'original_question':self.q['question'],'subquestion':query,'node_id':node_id,
               'planned_parent_ids':step['inputs'],'supported_parents':predecessors,
-              'evidence':list(self.spans.values()),'prior_state':old,'known_conflicts':self.conflicts,
+              'prior_state':old,'known_conflicts':self.conflicts,
               'refinement_available':self.s['refinement'] and self.refinements<self.s['max_refinement_nodes'],
               'condition_audit_enabled':self.s['condition_audit']}
+        view=self.evidence_view('resolve',prompts.RESOLVE,fixed)
+        allowed_parents={n['id']:n for n in view.data['supported_parents'] if n['status']=='supported'}
+        allowed_spans={sid for sid in view.visible_span_ids if node_id in self.spans[sid].get('node_ids',[])}
         def validate(value):
             status=value.get('status');answer=value.get('answer')
             if status not in ('unknown','partial','supported','ambiguous'):raise ProtocolError('Invalid resolver status')
@@ -272,11 +205,11 @@ class Engine:
             version=old['version']+int(normalized_answer(old['answer'] or '')!=normalized_answer(answer or '') or old_scope!=new_scope)
             result={**old,'answer':answer,'status':status,'version':version,'applicable_scope':new_scope,'declared_status':status,'alternatives':[],
                     'unresolved_inputs':missing,'unresolved_guards':guards,
-                    'partial_span_ids':[s['id'] for s in self.spans.values() if node_id in s.get('node_ids',[])]}
+                    'partial_span_ids':sorted(allowed_spans)}
             cap=self.s['max_alternatives'] if self.s['allow_alternatives'] else 1
             for i,a in enumerate(alternatives):
                 for f in ('source_span_ids','guard_span_ids','used_parent_ids'):_strings(a.get(f,[]),f)
-                if not set(a.get('source_span_ids',[])+a.get('guard_span_ids',[]))<=set(self.spans):raise ProtocolError('Unknown evidence span')
+                if not set(a.get('source_span_ids',[])+a.get('guard_span_ids',[]))<=allowed_spans:raise ProtocolError('Evidence not visible or mapped to this node')
                 if not set(a.get('used_parent_ids',[]))<=set(allowed_parents):raise ProtocolError('Unknown/unavailable/nonpreceding parent')
                 if a.get('semantic_status') not in ('supported','partial'):raise ProtocolError('Invalid alternative semantic status')
                 if not isinstance(a.get('applicable_scope'),str):raise ProtocolError('Scope must be explicit string')
@@ -294,12 +227,19 @@ class Engine:
                     alt['disputed_by']=[c['id'] for c in self.conflicts
                         if c.get('resolution_status')=='unresolved' and node_id in c.get('target_node_ids',[])]
                 result['alternatives'].append(alt)
+            for refinement in refinements:
+                refs=_strings(refinement.get('source_span_ids'),'refinement_source_span_ids')
+                parents=_strings(refinement.get('inputs'),'refinement_inputs')
+                if not refs or not set(refs)<=allowed_spans:raise ProtocolError('Refinement requires current-node visible evidence')
+                if not set(parents)<=set(allowed_parents):raise ProtocolError('Refinement requires supplied supported parents')
+                if not isinstance(refinement.get('question'),str) or not refinement['question'].strip() or not isinstance(refinement.get('answer_type'),str):
+                    raise ProtocolError('Invalid refinement task')
             candidate=[result if n['id']==node_id else n for n in self.nodes]
             compiled=compile_graph(candidate,list(self.spans.values()),self.requirements,self.docs,
                 max_nodes=self.s['max_initial_nodes']+self.s['max_refinement_nodes'],max_alternatives=cap)
             normalized=next(n for n in compiled['nodes'] if n['id']==node_id)
             return normalized,refinements,len(alternatives)-cap if len(alternatives)>cap else 0
-        resolved,refinements,dropped=self.reasoner.json('resolve',prompts.RESOLVE,data,validate)
+        resolved,refinements,dropped=self.recover('resolve',prompts.RESOLVE,view,validate,('alternatives','refinements'))
         self.nodes=[resolved if n['id']==node_id else n for n in self.nodes]
         self.compile()
         self.event({'event':'node_resolved','node':resolved,'grounded_query':query,'prior_state':old,
@@ -367,25 +307,36 @@ class Engine:
 
     def audit(self):
         if not self.s['condition_audit']:self.event({'event':'condition_audit_disabled'});return []
-        graph=self.compile();alt_ids={a['id'] for n in graph['nodes'] for a in n['alternatives']}
+        graph=self.compile()
+        view=self.evidence_view('audit',prompts.AUDIT,
+             {'original_question':self.q['question'],'mapping_complete':not self.mapper.diagnostics()['mapping_incomplete'],
+              'previous_conflicts':self.conflicts},audit_nodes=graph['nodes'])
+        alt_ids=set(view.visible_alternative_ids);visible_spans=set(view.visible_span_ids)
+        auditable_nodes={n['id'] for n in view.data['nodes'] if n['alternatives']}
+        empty_nodes={n['id'] for n in graph['nodes'] if not n['alternatives']}
+        visible_conflicts={c['id'] for c in view.data.get('previous_conflicts',[])}
         def validate(value):
             conflicts=value.get('conflicts');guards=value.get('unresolved_guards',[])
             if not isinstance(conflicts,list) or not isinstance(guards,list):raise ProtocolError('Invalid audit lists')
             for x in conflicts:
                 aids=_strings(x.get('alternative_ids'),'alternative_ids');spans=_strings(x.get('span_ids'),'span_ids')
-                if not aids or not spans or not set(aids)<=alt_ids or not set(spans)<=set(self.spans):raise ProtocolError('Audit conflict must identify alternatives and supplied quotes')
+                if not aids or not spans or not set(aids)<=alt_ids or not set(spans)<=visible_spans:raise ProtocolError('Audit conflict must identify alternatives and supplied quotes')
                 if not isinstance(x.get('reason'),str) or not x['reason']:raise ProtocolError('Conflict reason missing')
             for x in guards:
                 if x.get('node_id') not in self.node_map() or not isinstance(x.get('description'),str):raise ProtocolError('Audit unresolved guard malformed')
+                if x['node_id'] not in auditable_nodes|empty_nodes:
+                    raise ProtocolError('Audit guard targets a node whose alternatives were omitted')
             resolutions=value.get('resolutions',[])
             if not isinstance(resolutions,list):raise ProtocolError('Audit resolutions must be a list')
             checked=deepcopy(graph)
             for r in resolutions:
+                if r.get('conflict_id') not in visible_conflicts:
+                    raise ProtocolError('Resolution targets an undisplayed conflict')
+                if not set(_strings(r.get('resolution_span_ids'),'resolution_span_ids')+_strings(r.get('addressed_conflict_span_ids'),'addressed_conflict_span_ids'))<=visible_spans:
+                    raise ProtocolError('Conflict resolution cites omitted evidence')
                 checked=resolve_conflict(checked,r['conflict_id'],r['resolution_span_ids'],r['addressed_conflict_span_ids'],r['reason'],resolution_kind=r['resolution_kind'])
             return conflicts,guards,resolutions
-        conflicts,guards,resolutions=self.reasoner.json('audit',prompts.AUDIT,
-             {'original_question':self.q['question'],'nodes':graph['nodes'],'evidence':list(self.spans.values()),
-              'mapping_complete':len(self.mapped_chunks)==len(self.chunks),'previous_conflicts':self.conflicts},validate)
+        conflicts,guards,resolutions=self.recover('audit',prompts.AUDIT,view,validate,('conflicts','unresolved_guards','resolutions'))
         affected=[]
         if self.s['invalidation']:
             for r in resolutions:
@@ -449,16 +400,17 @@ class Engine:
                         max_states=self.s['max_enumeration_states'],partial_groups=partial,fill_partial=True)
                 selections[str(k)]=choice
         else:
+            view=self.evidence_view('select',prompts.FLAT_SELECT,{'original_question':self.q['question'],
+                'requirements':self.requirements,'max_documents':20,'context_budget':self.s['context_tokens'],
+                'output_reserve':self.s['reader_output_tokens']},
+                document_costs={d:len(self.tokenizer.encode(self.docs[d].passage,add_special_tokens=False)) for d in self.candidates})
             def validate(v):
                 ids=_strings(v.get('selected_doc_ids'),'selected_doc_ids')
-                if not set(ids)<=set(self.candidates):raise ProtocolError('Flat selector chose undiscovered document')
+                if not set(ids)<=set(view.visible_doc_ids):raise ProtocolError('Flat selector chose document absent from supplied evidence view')
                 if not self.feasible(ids)['feasible']:raise ProtocolError('Flat selection exceeds actual context budget')
                 _strings(v.get('covered_requirement_ids',[]),'covered_requirement_ids')
                 return v
-            value=self.reasoner.json('select',prompts.FLAT_SELECT,{'original_question':self.q['question'],
-                'requirements':self.requirements,'evidence':list(self.spans.values()),'candidate_doc_ids':self.candidates,
-                'document_token_counts':{d:len(self.tokenizer.encode(self.docs[d].passage,add_special_tokens=False)) for d in self.candidates},
-                'max_documents':20,'context_budget':self.s['context_tokens'],'output_reserve':self.s['reader_output_tokens']},validate)
+            value=self.reasoner.json('select',prompts.FLAT_SELECT,view.data,lambda value:validate(view.decode(value)))
             selections={}
             for k in (5,10,20):
                 ids=value['selected_doc_ids'][:k]
@@ -531,9 +483,9 @@ class Engine:
                 'response_usage':r['response'].get('usage'),'finish_reason':choice.get('finish_reason')}
         graph=self.compile()
         result={'unit_id':self.q['id'],'method':self.method,
-                'ranking':{'status':'partial' if self.errors or len(self.mapped_chunks)<len(self.chunks) else 'ok',
+                'ranking':{'status':'partial' if self.errors or self.reliability()['cohort']!='normal' else 'ok',
                            'nodes':graph['nodes'],'trace':self.discoveries},'budgets':selections,'answer':answer,
-                'seconds':time.time()-self.started,'diagnostics':{'settings':self.s,'requirements':self.requirements,
+                'seconds':time.time()-self.started,'diagnostics':{'settings':self.s,'requirements':self.requirements,'reliability':self.reliability(),
                     'support_graph':graph,'candidate_doc_ids':self.candidates,'spans':list(self.spans.values()),
                     'navigation_provenance':list(self.navigation_provenance.values()),
                     'unmapped_chunks':[c for i,c in enumerate(self.chunks) if i not in self.mapped_chunks],
@@ -551,5 +503,6 @@ def run_question(q,resources,calls,config,method='fusion'):
         engine.event({'event':'task_failed','error_type':type(exc).__name__,'error':str(exc)})
         if engine.output:save(engine.output/'fusion_partial.json',{'question':q,'nodes':engine.nodes,
              'spans':list(engine.spans.values()),'candidates':engine.candidates,'events':engine.events,
-             'ledger':engine.ledger.public_dict(),'error_type':type(exc).__name__,'error':str(exc)})
+             'ledger':engine.ledger.public_dict(),'diagnostics':{'reliability':engine.reliability()},
+             'error_type':type(exc).__name__,'error':str(exc)})
         raise

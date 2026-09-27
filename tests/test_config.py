@@ -9,6 +9,7 @@ from dagbt.config import DEFAULTS, resolve
     ('max_refinement_nodes', -1), ('max_feedback_rounds', -1),
     ('max_feedback_rounds', 1.5), ('max_feedback_rounds', '2'),
     ('json_repairs', -1), ('json_repairs', True),
+    ('input_margin', -1), ('input_margin', True), ('max_repairs_per_request', -1),
     ('max_quote_chars', -10), ('max_quote_chars', 0), ('max_quote_chars', True),
     ('initial_width', 0), ('proposal_width', False), ('pair_rescue_width', -1),
 ])
@@ -22,6 +23,7 @@ def test_invalid_loop_chunk_and_reservation_settings_rejected_before_execution(n
     {'selection': 'dependncy'}, {'retrieval': 'bt'}, {'ann_call': 12},
     {'search': []}, {'search': {'coverage_roots': 0}},
     {'search': {'quantum_new_sets': 3}}, {'search': {'nonexistent_switch': True}},
+    {'response_format': 'auto'},
 ])
 def test_module_settings_do_not_silently_select_another_method(settings):
     with pytest.raises(ValueError):
@@ -58,9 +60,12 @@ def test_named_ablation_overrides_valid_user_defaults():
     assert result['retrieval'] == 'dense' and result['selection'] == 'flat'
 
 
-def test_map_context_boundary_can_fit_exactly():
-    result = resolve({'fusion': {'map_batch_tokens': 12280}})
-    assert result['map_batch_tokens'] + result['reasoning_output_tokens'] + 8 == result['context_tokens']
+@pytest.mark.parametrize('margin', [0, 256])
+def test_map_context_boundary_includes_configured_safety_margin(margin):
+    result = resolve({'fusion': {'map_batch_tokens': 12280 - margin, 'input_margin': margin}})
+    assert result['map_batch_tokens'] + result['reasoning_output_tokens'] + 8 + margin == result['context_tokens']
+    with pytest.raises(ValueError, match='Map batch'):
+        resolve({'fusion': {'map_batch_tokens': 12281 - margin, 'input_margin': margin}})
 
 
 @pytest.mark.parametrize('value', ['true', 'false', 1, None])

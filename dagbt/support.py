@@ -71,6 +71,34 @@ def make_span(span_id, doc_id, quote, documents, start=None, event_time=None, **
 def validate_span(span, documents):
     """Return a normalized copy, preserving unknown event time as null."""
     span = deepcopy(span)
+    if 'fragments' in span:
+        for field in ('id', 'doc_id'):
+            if not isinstance(span.get(field), str) or not span[field]:
+                raise SupportError('invalid_span_' + field)
+        fragments = span['fragments']
+        if not isinstance(fragments, list) or not fragments:
+            raise SupportError('empty_evidence_fragments')
+        if any(not isinstance(f, dict) or 'fragments' in f or f.get('doc_id') != span['doc_id'] for f in fragments):
+            raise SupportError('fragment_source_mismatch')
+        normalized = [validate_span(fragment, documents) for fragment in fragments]
+        if len({(f['start'], f['end']) for f in normalized}) != len(normalized):
+            raise SupportError('duplicate_evidence_fragment')
+        span['fragments'] = normalized
+        raw_hash = text_hash(_passage(documents[span['doc_id']]))
+        if span.get('raw_text_hash', raw_hash) != raw_hash:
+            raise SupportError('quote_source_hash_changed: ' + span['id'])
+        span['raw_text_hash'] = raw_hash
+        span.setdefault('event_time', None)
+        # Each fragment remains an exact contiguous quotation. Never pretend
+        # separated excerpts form one continuous span or independent premises.
+        if len(normalized) == 1:
+            for field in ('start', 'end', 'exact_quote'):
+                if field in span and span[field] != normalized[0][field]:
+                    raise SupportError('fragment_summary_mismatch')
+                span[field] = normalized[0][field]
+        elif any(field in span for field in ('start', 'end', 'exact_quote')):
+            raise SupportError('noncontiguous_evidence_has_no_single_quote')
+        return span
     for field in ("id", "doc_id", "exact_quote"):
         if not isinstance(span.get(field), str) or not span[field]:
             raise SupportError("invalid_span_" + field)

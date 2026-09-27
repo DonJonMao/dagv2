@@ -19,7 +19,7 @@ import numpy as np
 
 from dagbt import runner
 from dagbt.resources import inspect_index
-from test_system_http import FIXTURE_ANSWER
+from test_system_http import FIXTURE_ANSWER, scripted_source_mapping
 
 
 @contextmanager
@@ -75,7 +75,12 @@ def scripted_bt_models(question):
                 messages = payload["messages"]
                 system = messages[0]["content"]
                 if system.startswith("Decompose a multi-hop question"):
-                    value = {"steps": [{"question": question, "output_slot": "answer", "answer_type": "answer", "inputs": []}]}
+                    try:
+                        planner_question = json.loads(messages[1]["content"])
+                    except json.JSONDecodeError:
+                        planner_question = messages[1]["content"]
+                    assert isinstance(planner_question, str)
+                    value = {"steps": [{"question": planner_question, "output_slot": "answer", "answer_type": "answer", "inputs": []}]}
                 elif system.startswith("Solve the current evidence-grounded task"):
                     # Native node semantics/schema are unchanged, only adapted
                     # into chat messages instead of a Qwen completion prompt.
@@ -86,12 +91,7 @@ def scripted_bt_models(question):
                     value = {"answer": FIXTURE_ANSWER, "sources": [True] + [False] * (count - 1)}
                 elif system.startswith("Map raw corpus passages"):
                     data = json.loads(messages[1]["content"])
-                    value = {"spans": [
-                        {"doc_id": chunk["doc_id"], "start": chunk["start"], "quote": chunk["text"][:160],
-                         "node_ids": [node["output_slot"] for node in data["nodes"]], "stance": "support",
-                         "entity_scope": "scripted profile fixture only", "event_time": None, "time_quote": None,
-                         "reason": "Exact-quote transport fixture; no semantic quality claim"}
-                        for chunk in data["chunks"] if chunk["text"]]}
+                    value = scripted_source_mapping(data)
                 elif system.startswith("Resolve ONE executable subquestion"):
                     data = json.loads(messages[1]["content"])
                     assert data["evidence"]
@@ -207,8 +207,11 @@ def test_bt_profile_chat_only_and_model_specific_full_corpus_index(tmp_path, mon
         assert rows["original"]["ranking"]["nodes"][0]["resolved"]
         chat_requests = [r for r in requests if r["path"] == "/v1/chat/completions"]
         planners = [r for r in chat_requests if r["payload"]["messages"][0]["content"].startswith("Decompose a multi-hop question")]
-        assert len(planners) == 2
-        assert all(q["question"] in r["payload"]["messages"][1]["content"] for r in planners)
+        assert len(planners) == 3  # Independent protocol gate, original question, fusion question.
+        assert sum(q["question"] in r["payload"]["messages"][1]["content"] for r in planners) == 2
+        probe = runner.load(output / "preflight.json")["endpoints"]["fusion_planner_protocol"]
+        assert probe["status"] == "passed" and probe["logical_calls"] == 1
+        assert probe["experiment_task"] is False
         assert not any(r["path"] == "/v1/completions" for r in requests)
         assert all(r["payload"]["model"] == "deepseek-v4-flash" for r in chat_requests)
         wire = json.dumps(requests)

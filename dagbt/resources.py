@@ -8,6 +8,8 @@ the same vector space. This module never opens evaluation labels.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from copy import deepcopy
+from dataclasses import dataclass, field
 import fcntl
 import hashlib
 import importlib
@@ -21,6 +23,7 @@ import numpy as np
 
 from .budget import Ledger
 from .transport import Transport, digest, save
+from .evidence_spans import SourceSpanError, document_source_metadata, normalize_source_segments
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -28,6 +31,60 @@ DATASETS = {"hotpotqa", "2wikimultihopqa", "musique", "personamem"}
 SERIALIZATION = "reader.Document.passage:title_newline_text_nonempty_v1;no_document_instruction"
 SCHEMA = "dagbt_derived_embeddings_v1"
 BATCH_SIZE = 32
+
+
+@dataclass(frozen=True)
+class ProvenanceDocument:
+    """Reader-compatible document whose provenance indexes the complete passage."""
+    doc_id: str
+    title: str
+    text: str
+    metadata: dict = field(default_factory=dict)
+
+    def __post_init__(self):
+        if (not isinstance(self.doc_id, str) or not self.doc_id
+                or not isinstance(self.title, str) or not isinstance(self.text, str)):
+            raise SourceSpanError("Invalid provenance document fields")
+        object.__setattr__(self, "metadata", document_source_metadata(self))
+
+    @property
+    def passage(self):
+        return self.title + "\n" + self.text if self.title and self.text else self.title or self.text
+
+
+def personamem_document(record):
+    """Shift authoritative body offsets past the non-speaker title/header."""
+    if not isinstance(record, Mapping):
+        raise SourceSpanError("PersonaMem document must be an object")
+    doc_id, title, text = record.get("docid"), record.get("title"), record.get("text")
+    if (not isinstance(doc_id, str) or not doc_id or not isinstance(title, str)
+            or not isinstance(text, str) or not text):
+        raise SourceSpanError("Invalid PersonaMem source document fields")
+    if "source_segments" not in record:
+        raise SourceSpanError("PersonaMem requires authoritative source_segments")
+    segments = normalize_source_segments(text, record["source_segments"])
+    context, indices, roles, time_metadata = (record.get(key) for key in
+        ("shared_context_id", "source_message_indices", "roles", "time"))
+    if (not isinstance(context, str) or not context or not isinstance(indices, list) or not indices
+            or any(type(index) is not int or index < 0 for index in indices)
+            or indices != sorted(set(indices))):
+        raise SourceSpanError("Invalid PersonaMem context or source message indices")
+    if (not isinstance(roles, list) or not roles
+            or any(not isinstance(role, str) or role not in {"system", "user", "assistant", "unknown"} for role in roles)
+            or not isinstance(time_metadata, Mapping)):
+        raise SourceSpanError("Invalid PersonaMem roles or time metadata")
+    raw_segments = record["source_segments"]
+    if ([segment["role"] for segment in raw_segments] != roles
+            or sorted({index for segment in raw_segments for index in segment["source_message_indices"]}) != indices):
+        raise SourceSpanError("PersonaMem segment roles/indices disagree with source metadata")
+    offset = len(title) + 1 if title else 0
+    metadata = {key: deepcopy(record[key]) for key in
+                ("shared_context_id", "source_message_indices", "roles", "time") if key in record}
+    metadata["source_segments"] = ([{"role": "unknown", "start": 0, "end": offset,
+        "source_message_indices": [], "provenance": "title_metadata"}] if offset else []) + [
+        {**segment, "start": segment["start"] + offset, "end": segment["end"] + offset}
+        for segment in segments]
+    return ProvenanceDocument(doc_id, title, text, metadata)
 
 
 def _file_hash(path):
@@ -59,6 +116,8 @@ def _corpus(root, dataset):
         passage = title + "\n" + text if title and text else title or text
         if not passage:
             raise ValueError("Empty corpus passages cannot be silently skipped")
+        if dataset == "personamem":
+            personamem_document(record)  # Validate provenance before any model request.
         ids.append(doc_id)
         passages.append(passage)
     if not records or len(ids) != len(set(ids)):
@@ -264,7 +323,8 @@ def prepare_resources(config, dataset, pipeline, tokenizer, root=ROOT):
         canonical = [{"doc_id": d["docid"], "title": d["title"], "text": d["text"]} for d in records]
         if _load(canonical_path) != canonical:
             raise ValueError("Original corpus canonical copies disagree")
-    docs = {d["docid"]: e.Document(d["docid"], d["title"], d["text"]) for d in records}
+    docs = {d["docid"]: (personamem_document(d) if dataset == "personamem"
+                        else e.Document(d["docid"], d["title"], d["text"])) for d in records}
     vectors = _validate_matrix(report["vectors_path"], len(ids), report["dimensions"])
     index = SimpleNamespace(vectors=dict(zip(ids, vectors)), lock=e.EMBED_LOCK)
     e.CONFIG = {**e.CONFIG, **config, "dataset": dataset,

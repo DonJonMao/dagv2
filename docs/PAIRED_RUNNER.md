@@ -4,6 +4,8 @@
 
 PersonaMem 的来源、按题可见记忆和单选评测详见 [PERSONAMEM.md](PERSONAMEM.md)。默认省略 `--datasets` 即运行四套数据；仅运行新数据可指定 `--datasets personamem`。
 
+当前融合可靠性版本为 `dagbt_fusion_reliability_v2`，对应 BridgeTree `16809bd` 的协议修订适配。实现变化、来源 ID、局部恢复和输入预算窗口见 [FUSION_RELIABILITY_V2.md](FUSION_RELIABILITY_V2.md)。旧结果没有该诊断时记为 unknown。
+
 ## 一键后台运行
 
 默认配置已与 BT 当前部署一致：DeepSeek-V4-Flash、Qwen3-Embedding-8B、Qwen3-Reranker-8B，具体服务和继承来源见 [模型对齐说明](MODEL_ALIGNMENT.md)。可将 `configs/paired.example.json` 复制为本地配置覆盖端点。原版和融合版共用这些模型；原版方法本身不额外调用 reranker。首次运行会在后台先重建 Qwen3 语料索引，保留旧 NV 数组；维度相同也不会混用。
@@ -14,27 +16,27 @@ PersonaMem 的来源、按题可见记忆和单选评测详见 [PERSONAMEM.md](P
 # 只检查文件、依赖和配置，不访问模型端点，也不进行推理。
 bash scripts/run_paired.sh preflight --config configs/paired.local.json --offline-preflight
 
-# 检查模型服务：GET /models；reranker 做 5 次无标注的单条/混合/倒序一致性探测。
+# 线上检查：GET /models、reranker 五次一致性探测，以及一次真实融合 planner 协议检查。
 bash scripts/run_paired.sh preflight --config configs/paired.local.json
 
 # 先用每个数据集的前 2 题检查实际 JSON 输出和模型接口兼容性。
 # 首次仍需为所选数据集的完整语料建索引。
-bash scripts/run_paired.sh --config configs/paired.local.json --output outputs/paired_smoke --limit 2
+bash scripts/run_paired.sh --config configs/paired.local.json --output outputs/paired_smoke_v2 --limit 2
 
 # 完整的默认双臂实验：原三套各 1,000 题，加 PersonaMem 589 题。
-bash scripts/run_paired.sh --config configs/paired.local.json --output outputs/paired_full_personamem
+bash scripts/run_paired.sh --config configs/paired.local.json --output outputs/paired_full_reliability_v2
 
-bash scripts/run_paired.sh status --output outputs/paired_full_personamem
-bash scripts/run_paired.sh stop --output outputs/paired_full_personamem
+bash scripts/run_paired.sh status --output outputs/paired_full_reliability_v2
+bash scripts/run_paired.sh stop --output outputs/paired_full_reliability_v2
 ```
 
 省略动作表示 `launch`：先同步预检，再用 `start_new_session=True` 脱离终端，标准输入断开，输出写入 `launcher.log`。进程可在终端关闭后运行。不需要 `nohup`，不启动或重启模型服务。`run` 是前台版本；启动成功不等于实验完成，以 `status` 和 `progress.json` 为准。
 
-reranker 预检直接调用当前 BT 源码的 pointwise consistency probe：空集合序列化、两条固定文本的单条分数，要与混合和倒序批次一致。探测报告、请求、重试、usage 保存在 `preflight_calls/`，独立于每题预算。后台进程复用 5 分钟内、完全相同配置的本次 launch 报告，避免重复探测，但重新核验原始文件。通过只证明这组探针的一致性，不证明所有输入上的契约或相关性质量。
+reranker 预检直接调用当前 BT 源码的 pointwise consistency probe：空集合序列化、两条固定文本的单条分数，要与混合和倒序批次一致。探测报告、请求、重试、usage 保存在 `preflight_calls/`，独立于每题预算。默认 BT profile 的融合臂另执行一次固定虚构问题的真实 planner 请求：正式 Reasoner/schema/validator，无标签、无格式修复、无协议切换；失败阻止后台启动。其原始请求响应、metadata、校验和费用在 `preflight_calls/planner-*/`，不进入题预算。后台进程只复用 5 分钟内配置、源码、数据范围和 arms 一致、且 planner 探测通过的本次 launch 报告，但重新核验原始文件。通过只证明这组探针的一致性，不证明所有输入上的契约或相关性质量。
 
 离线预检检查 NumPy、Transformers、PyYAML、Jinja2，记录依赖、源码和语料身份。BT 配置检查 chat 消息适配和明确标注的 token 估算，报告派生索引 `ready/needs_build`；历史配置则加载包内 tokenizer 渲染模板。在线 `/models` 返回的所选模型 metadata 另存；配置中的 `deployment_identity` 和 reranker 同名字段作为操作者声明记录。模型 ID、服务 metadata 不自动等于权重校验和或不可变 revision。
 
-`--offline-preflight` 仅跳过服务检查，**不会**把 `run`/`launch` 变成离线实验。离线机制测试使用 pytest 的显式模拟服务，生产运行没有假结果回退。
+`--offline-preflight` 显式跳过全部端点和 planner 协议检查，**不会**把 `run`/`launch` 变成离线实验。离线机制测试使用 pytest 的显式模拟服务，生产运行没有假结果回退。
 
 ## 固定实验与显式恢复
 
@@ -45,16 +47,16 @@ reranker 预检直接调用当前 BT 源码的 pointwise consistency probe：空
 重新执行相同命令会跳过已有成功和已有失败的终态记录，继续尚未完成的题。只有显式指定 `--retry-failed` 才重跑失败终态；每次启动至多给每个失败任务新增一次尝试，累计次数由 `max_question_attempts`（示例为 3）限制：
 
 ```bash
-bash scripts/run_paired.sh --config configs/paired.local.json --output outputs/paired_full_personamem --retry-failed
+bash scripts/run_paired.sh --config configs/paired.local.json --output outputs/paired_full_reliability_v2 --retry-failed
 ```
 
 每次尝试有独立目录，保留旧失败、请求和重试日志。新尝试仅复用旧尝试中已经成功的完全相同请求缓存；失败 HTTP 请求进入新的、有上限的重试窗口。达到总尝试上限后保留失败并继续。协调进程中断留下的未终态尝试也计入上限，恢复不假装重建搜索中途的 Python 状态，而是从该题起点确定性重放成功缓存。
 
-`manifest.json` 固定配置、问题顺序/摘要、原始包 manifest 和新增源码/vendor 的 SHA256，并记录 PersonaMem 的数据 manifest。更改方法、代码、配置、题目范围都必须换输出目录；不能把 smoke 目录直接变成 full 目录，也不能沿用加入 PersonaMem 前的全量输出目录。OS `flock` 防止两个写进程使用同一目录；过期 PID 文件不会阻止恢复。`stop` 校验活跃文件锁和进程命令，SIGTERM 触发 finally 终止工作进程，避免只停掉外层留下任务。
+`manifest.json` 固定配置、问题顺序/摘要、原始包 manifest 和新增源码/vendor 的 SHA256，并记录 PersonaMem 的数据 manifest。更改方法、代码、配置、题目范围都必须换输出目录；不能把 smoke 目录直接变成 full 目录，也不能沿用加入 PersonaMem 前的全量输出目录，也不能用可靠性 v2 续跑旧 PersonaMem 包的 `outputs/paired_full_personamem`。OS `flock` 防止两个写进程使用同一目录；过期 PID 文件不会阻止恢复。`stop` 校验活跃文件锁和进程命令，SIGTERM 触发 finally 终止工作进程，避免只停掉外层留下任务。
 
 ## 原版保持什么
 
-`original` 保留原 planner、dense 查询、节点检索、闭包选择和 reader chain 算法，`experiment_v6` 仍装载原 controller/reader。历史配置继续直接调用原 `e.archive`；BT 配置的等价 archive 适配仅将固定 4096 维校验改为当前索引维度。两方法共同使用新的向量、chat 协议和 BT token 估算；JSON schema 作为格式指令发送，模型参数遵循 BT 部署配置。原始文件未修改，但不能把新模型运行称为旧 Qwen/NV 实验的直接复现。
+`original` 保留原 planner、dense 查询、节点检索、闭包选择和 reader chain 算法，`experiment_v6` 仍装载原 controller/reader。历史配置继续直接调用原 `e.archive`；BT 配置的等价 archive 适配仅将固定 4096 维校验改为当前索引维度。两方法共同使用新的向量、chat 适配和 BT 模型部署；原版继续使用此前 token 估算与 JSON schema 格式指令。融合 v2 的证据请求使用独立的保守估算和固定 `response_format`，默认 plain，亦可显式 json_object/json_schema；最终 reader 不继承该证据格式约束。原始文件未修改，但不能把新模型运行称为旧 Qwen/NV 实验的直接复现。
 
 PersonaMem 接入当前成对入口的 `original` 臂，保留其原求解流程，同时增加按题语料隔离和单选 reader 协议；没有修改历史 `original-dagv2` 分支、原始 57 个文件或 BT vendor 快照。两臂接收同样的公共选项，并要求最终只输出一个选项标签。`configs/paired.legacy.json` 不支持 PersonaMem，使用历史配置时须显式加 `--datasets hotpotqa 2wikimultihopqa musique`。
 
@@ -88,6 +90,7 @@ bash scripts/run_paired.sh --config configs/paired.local.json --output outputs/f
 
 ## 日志和评测
 
+- `preflight_calls/planner-*/`：独立部署协议探测，含真实原始请求响应、验证、metadata 和成本；不与题目混合。
 - 根目录 `manifest.json`、`preflight.json`、`pid.json`、`progress.json`、`events.jsonl`、`launcher.log`：运行身份、状态、任务终态。
 - BT 配置另有 `index_artifacts.json` 和 `index_build/<dataset>/`：共用派生向量身份、批量编码请求、恢复进度和独立索引费用。`preparing_index` 阶段还未进入问题生成。
 - `<dataset>/<arm>/rows/<question-hash>.json`：每题当前权威结果、ranking/graph、5/10/20 证据选择、答案和 runner 开销。
@@ -104,6 +107,10 @@ PersonaMem 对每道题先按 `messages[:end_index]` 截断，再采用 BT 的 `
 
 原三套数据的模块诊断把两种证据分开：`gold_candidate_title_group_recall`/`gold_candidate_all_support` 衡量发现阶段是否找到了标注支持，`gold_discovery_minus_selection_recall_at20` 衡量发现后在选择阶段丢失多少标注支持。它们只在评分阶段计算，不为 PersonaMem 伪造这些 gold 指标。`structural_complete_required_at20`、节点 unknown/ambiguous、必要需求覆盖、quote/span protocol 错误、ANN/set-score 用量、reader token 单独汇总。BT 本地计量是估算，`local_token_accounting` 明确标记；API usage 另存，未观测不当作零。模型判断与结构校验不等于 gold 正确性。
 
-成本日志区分逻辑调用、成功缓存命中、HTTP 尝试、重试和成功响应的 token usage。不返回 usage 的服务记为未知；服务器已执行但响应丢失的成本无法完全观测，因此总 token 是下界，不能把缺失 usage 解释成零成本。服务预检的轻量探测不混入方法实验预算，其 usage 单独保存在 preflight。
+成本日志区分逻辑调用、成功缓存命中、HTTP 尝试、重试和成功响应的 token usage。不返回 usage 的服务记为未知；服务器已执行但响应丢失的成本无法完全观测，因此总 token 是下界，不能把缺失 usage 解释成零成本。服务预检不混入方法实验预算，其 usage 单独保存在 preflight。
+
+融合 v2 的每题 `diagnostics.reliability` 记录 `version=dagbt_fusion_reliability_v2`、`cohort`、`mapping_complete`、`input_truncated` 等；失败时保留已落盘 `fusion_partial.json`。每方法摘要新增 `reliability.completion_cohorts`，仅按当前权威成功 rows 统计 normal、truncated、partially_mapped、truncated_and_partially_mapped、unknown 的题数、答对数、accuracy（PersonaMem）或 EM（其他数据集）及 `cost_latest_attempt`；`failed_tasks` 和 `failure_cost_latest_attempt` 单列失败。旧诊断缺失不填 normal，成本缺失不填零，失败历史与 retry 日志不重复算题；`cost_all_attempts` 继续保留所有尝试费用。各组问题不同，这些分组是描述性结果，不能直接归因截断或部分映射的效果。
+
+证据推理默认每请求至多 2 次局部修复、每题至多 6 次，所有 planner/map/resolve/audit/select/repair/rebatch 共用每题每方法每 attempt 的 24 次 LLM attempt 额度，reader 单列。沿用 DAG 的保守计费，每次物理 HTTP 重试也扣 LLM 余额，成功缓存重放按历史已记尝试数扣额度；实际可用逻辑调用可能更少，request 日志中的逻辑调用数另计。预算窗口保留完整记录并限定实际可引用 ID；被省略或未完成的证据不当作未检索到或无关。证据输入估算为 `regex_or_utf8_bytes_div3_v2`，包含 schema、输出预留及 margin，但不是实际服务 tokenizer 上界；原始 reader 的可行性检查仍独立执行。
 
 当前交付验证应以离线测试报告为准；没有启动远程完整实验，也没有据此声称融合性能提升。

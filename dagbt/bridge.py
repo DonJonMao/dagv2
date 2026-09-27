@@ -22,6 +22,7 @@ from vendor.bridgetree.evidence_config import EvidenceSearchConfig
 from vendor.bridgetree.evidence_search import EvidenceBridgeSearcher
 from vendor.bridgetree.index import ExactInnerProductIndex
 from vendor.bridgetree.types import Memory
+from .evidence_spans import document_source_metadata
 
 
 QUERY_INSTRUCTION = "Instruct: Retrieve passages that answer the factual question.\nQuery: "
@@ -246,13 +247,13 @@ class BridgeSession:
         if self.vectors.ndim != 2 or self.vectors.shape[0] != len(self.ids) or not np.isfinite(self.vectors).all():
             raise ValueError("invalid complete corpus vector matrix")
         self.index = ExactInnerProductIndex(self.ids, self.vectors)
-        self.records = {
-            identifier: Memory(identifier, _text(self.docs[identifier]), float(position), identifier,
-                               {"source_segments": [{"role": "document", "start": 0,
-                                 "end": len(_text(self.docs[identifier])), "source_message_indices": []}],
-                                "observation_order_is_event_time": False})
-            for position, identifier in enumerate(self.ids)
-        }
+        self.records = {}
+        for position, identifier in enumerate(self.ids):
+            metadata = document_source_metadata(self.docs[identifier])
+            indices = metadata.get("source_message_indices", [])
+            observation = max(indices) if indices else position
+            self.records[identifier] = Memory(identifier, _text(self.docs[identifier]), float(observation),
+                                               identifier, metadata)
         if any(not m.text for m in self.records.values()):
             raise ValueError("empty corpus passage cannot be silently omitted")
         self.memories = tuple(self.records.values())

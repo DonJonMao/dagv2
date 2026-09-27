@@ -21,6 +21,8 @@ from vendor.bridgetree.diagnostic_identity import validate_provider_params
 ROOT = Path(__file__).resolve().parents[1]
 MESSAGE_ENVELOPE = "DAGBT_MESSAGES_JSON_V1\n"
 TOKEN_ESTIMATOR_ID = "regex_word_or_punctuation_v1"
+EVIDENCE_TOKEN_ESTIMATOR_ID = "regex_or_utf8_bytes_div3_v2"
+REASONING_MARKER = "_dagbt_evidence_reasoning"
 DEFAULT_BT_LLM_ENDPOINT = "http://111.19.156.30:8006/v1/chat/completions"
 DEFAULT_BT_LLM_API_KEY = "Aa@11111"
 
@@ -94,6 +96,7 @@ def token_accounting(config: Mapping[str, Any]) -> dict[str, Any]:
 def prepare_request(stage, url: str, payload: Mapping[str, Any], config: Mapping[str, Any]):
     """Return exact wire URL/payload and whether legacy choices.text is needed."""
     wire = deepcopy(dict(payload))
+    evidence_reasoning = wire.pop(REASONING_MARKER, False)
     embed = url.rstrip("/").endswith("/embeddings")
     rerank = (url == config.get("reranker", {}).get("url")
               or url.rstrip("/").endswith(("/rerank", "/reranks")))
@@ -137,12 +140,42 @@ def prepare_request(stage, url: str, payload: Mapping[str, Any], config: Mapping
     if isinstance(output_tokens, bool) or not isinstance(output_tokens, int) or output_tokens < 1:
         raise ValueError("BridgeTree generator request requires positive max_tokens")
     provider = validate_provider_params(config.get("llm_provider_request_params", {}))
+    response_format = wire.get("response_format")
     # Only the actual BT provider configuration may add generation options;
     # Qwen stops, local templates, sampling and guided-output fields are not
     # propagated from the original algorithm's payload.
     wire = {"model": config["llm_model"], "messages": messages,
             "temperature": 0.0, "max_tokens": output_tokens, **provider}
+    if evidence_reasoning:
+        # The evidence protocol is chosen once by configuration; provider
+        # defaults cannot silently replace it. Native DAG and reader retain
+        # their old request adaptation, including schema-as-instruction.
+        wire.pop("response_format", None)
+        if response_format is not None:
+            wire["response_format"] = deepcopy(response_format)
     return url, wire, legacy_text
+
+
+def estimate_evidence_tokens(text: str) -> int:
+    """BridgeTree 16809bd evidence heuristic, not a tokenizer upper bound."""
+    return max(estimate_tokens(text), (len(text.encode("utf-8")) + 2) // 3)
+
+
+def evidence_token_accounting() -> dict[str, Any]:
+    return {"token_count_is_estimate": True,
+            "token_estimator_id": EVIDENCE_TOKEN_ESTIMATOR_ID,
+            "tokenizer_id": None,
+            "token_accounting_note": "Evidence wire JSON estimate; not the deployed model tokenizer"}
+
+
+def evidence_wire_tokens(wire: Mapping[str, Any]) -> int:
+    """Estimate the entire final wire object, including protocol/schema fields."""
+    return estimate_evidence_tokens(json.dumps(dict(wire), ensure_ascii=False, allow_nan=False))
+
+
+def count_evidence_request_tokens(stage, url, payload, config) -> int:
+    _, wire, _ = prepare_request(stage, url, payload, config)
+    return evidence_wire_tokens(wire)
 
 
 def count_request_tokens(stage, url, payload, config, tokenizer=None) -> int:

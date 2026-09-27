@@ -31,7 +31,11 @@
     "llm_calls": 24,
     "reader_calls": 1,
     "context_tokens": 16384,
-    "reader_output_tokens": 1024
+    "reader_output_tokens": 1024,
+    "json_repairs": 6,
+    "max_repairs_per_request": 2,
+    "response_format": "plain",
+    "input_margin": 256
   },
   "experiment": {
     "question_timeout_seconds": 3600,

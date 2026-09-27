@@ -20,6 +20,25 @@ from dagbt import runner
 FIXTURE_ANSWER = "SCRIPTED_HTTP_PROTOCOL_FIXTURE_NOT_A_MODEL_PREDICTION"
 
 
+def scripted_source_mapping(data):
+    """Exercise the actual visible span-ID protocol, with scripted semantics."""
+    sources = {source['id']: source for source in data['source_spans']}
+    units = []
+    for unit in data['units']:
+        source = sources[unit['source_span_id']]
+        assert source['doc_id'] == unit['doc_id']
+        assessments = [{
+            'span_ids': [source['id']], 'node_id': node['output_slot'],
+            'kind': 'explicit', 'stance': 'support',
+            'claim': 'Scripted source-ID fixture: ' + source['text'][:80],
+            'entity_scope': 'scripted protocol fixture only', 'event_time': None,
+            'time_span_ids': [], 'reason': 'Fixture protocol; no semantic accuracy claim',
+        } for node in data['nodes'] if node['output_slot'] in unit['node_ids']] if source['text'].strip() else []
+        units.append({'unit_id': unit['unit_id'], 'assessments': assessments,
+                      'irrelevance_reason': '' if assessments else 'Empty fixture source'})
+    return {'units': units}
+
+
 @contextmanager
 def scripted_models(question, vector):
     requests, errors = [], []
@@ -67,12 +86,7 @@ def scripted_models(question, vector):
                                         'answer_type': 'answer', 'inputs': []}]}
                 elif system.startswith('Map raw corpus passages'):
                     data = json.loads(messages[1]['content'])
-                    value = {'spans': [
-                        {'doc_id': chunk['doc_id'], 'start': chunk['start'], 'quote': chunk['text'][:160],
-                         'node_ids': [n['output_slot'] for n in data['nodes']], 'stance': 'support',
-                         'entity_scope': 'scripted protocol fixture only', 'event_time': None,
-                         'time_quote': None, 'reason': 'Fixture exact-quote protocol; no semantic claim'}
-                        for chunk in data['chunks'] if chunk['text']]}
+                    value = scripted_source_mapping(data)
                 elif system.startswith('Resolve ONE executable subquestion'):
                     data = json.loads(messages[1]['content'])
                     assert data['evidence'], 'Production mapper supplied no exact evidence to resolver'

@@ -185,13 +185,67 @@ def probe_reranker(config, output=None):
     return result
 
 
+def probe_fusion_planner(config, output=None):
+    """One real, label-free planner request; never repair or change protocols."""
+    from copy import deepcopy
+    from dagbt.budget import Ledger
+    from dagbt.config import resolve
+    from dagbt.engine import legacy_modules
+    from dagbt.model_runtime import load_tokenizer
+    from dagbt.reasoning import Reasoner
+    from dagbt.transport import Transport
+
+    base = Path(output) if output else ROOT / "outputs" / "preflight"
+    trace = base / "preflight_calls" / f"planner-{time.time_ns()}"
+    settings = resolve(config, "fusion")
+    effective = deepcopy(config)
+    effective["fusion"] = settings
+    ledger = Ledger({}, sink=lambda event: append_jsonl(trace / "ledger_events.jsonl", event))
+    tokenizer = load_tokenizer(effective)
+    transport = Transport("preflight_fusion_planner_protocol", trace, effective, ledger, tokenizer)
+    events = []
+    def observe(event):
+        events.append(event)
+        append_jsonl(trace / "protocol_events.jsonl", event)
+    reasoner = Reasoner(transport, tokenizer, effective, settings, ledger, observe)
+    e, repair, _ = legacy_modules()
+    query = "Which city hosts the science museum visited by the fictional traveler Mira?"
+    report = {"check": "fusion_planner_protocol", "version": "dagbt_fusion_reliability_v2", "status": "running",
+              "trace_directory": str(trace), "configured_protocol": settings.get("response_format", "plain"),
+              "schema_sha256": digest(e.PLAN_SCHEMA), "synthetic_query": query,
+              "logical_call_limit": 1, "repair_calls": 0, "protocol_fallback": False,
+              "experiment_task": False,
+              "scope": "one synthetic planner request using the actual fusion schema/validator; no labels or question budget; does not establish map/select/reader compatibility or answer quality"}
+    save(trace / "report.json", report)
+    started = time.monotonic()
+    try:
+        def validate_plan(value):
+            plan = repair.validate_plan(value)
+            if len(plan["steps"]) > settings["max_initial_nodes"]:
+                raise ValueError("Initial node cap exceeded")
+            return plan
+        plan = reasoner.request("planner", e.PLAN_SYSTEM, query, validate_plan, e.PLAN_SCHEMA, reserve=0)
+    except Exception as exc:
+        report.update(status="failed", **redacted_error(exc))
+        raise
+    else:
+        report.update(status="passed", validated_plan=plan)
+        return report
+    finally:
+        report.update(elapsed_seconds=time.monotonic() - started, ledger=ledger.public_dict(),
+                      cost=request_cost(trace), logical_calls=reasoner.sequence,
+                      reasoning_requests=reasoner.requests, response_events=events)
+        save(trace / "report.json", report)
+
+
 def preflight(config, datasets, *, endpoints=True, output=None, arms=None):
     validate_config(config)
+    arms = list(arms or ["fusion"])
     from dagbt.config import resolve
     for arm in arms or ["fusion"]:
         if arm != "original":
             resolve(config, arm)
-    report = {"original_integrity": verify_originals(), "datasets": {}, "endpoints": {},
+    report = {"original_integrity": verify_originals(), "datasets": {}, "endpoints": {}, "arms": arms,
               "config_digest": digest(config), "created_unix": time.time()}
     dependencies = {"numpy": "numpy", "transformers": "transformers", "yaml": "PyYAML", "jinja2": "Jinja2"}
     missing_modules = [name for name in dependencies if importlib.util.find_spec(name) is None]
@@ -251,11 +305,13 @@ def preflight(config, datasets, *, endpoints=True, output=None, arms=None):
                                                       api_key=resolve_api_key(config, kind))
         if config.get("reranker"):
             report["endpoints"]["reranker"] = probe_reranker(config, output)
+        if is_bridgetree(config) and any(arm != "original" for arm in arms):
+            report["endpoints"]["fusion_planner_protocol"] = probe_fusion_planner(config, output)
     else:
         report["endpoints"] = {"status": "not_checked_offline_preflight"}
     report["protocol_note"] = ("BT profile uses its declared deterministic token estimator and chat adapter; missing derived indices will be built before question generation. "
                                if is_bridgetree(config) else "Bundled local chat template is rendered. ") + \
-                              "/models checks advertised IDs, not weights. Actual smoke inference is still needed for JSON and model compatibility."
+                              "/models checks advertised IDs, not weights. Online BT fusion preflight also requires one real planner request; it does not verify map/select/reader compatibility or accuracy."
     return report
 
 
@@ -675,11 +731,25 @@ def total_cost(output, dataset, arm):
 def module_metrics(row, label, dataset, output):
     """Gold-based discovery metrics and model/structural diagnostics stay distinct."""
     diag = row.get("diagnostics", {})
-    if not diag and row.get("attempt_directories"):
+    if row.get("attempt_directories") and (not diag or
+            (row.get("answer", {}).get("status") != "ok" and "reliability" not in diag)):
         partial = Path(output) / row["attempt_directories"][-1] / "fusion_partial.json"
         if partial.is_file():
             snapshot = load(partial)
-            diag = {**snapshot, "candidate_doc_ids": snapshot.get("candidates", []), "support_graph": {"nodes": snapshot.get("nodes", [])}}
+            snapshot_diag = snapshot.get("diagnostics", {})
+            snapshot_diag = snapshot_diag if isinstance(snapshot_diag, dict) else {}
+            snapshot_reliability = snapshot_diag.get("reliability", snapshot.get("reliability"))
+            if not diag:
+                diag = {**snapshot, **snapshot_diag, "candidate_doc_ids": snapshot.get("candidates", []),
+                        "support_graph": {"nodes": snapshot.get("nodes", [])}}
+                if row.get("answer", {}).get("status") == "ok":
+                    diag.pop("reliability", None)
+            if row.get("answer", {}).get("status") != "ok" and isinstance(snapshot_reliability, dict):
+                diag = {**diag, "reliability": snapshot_reliability}
+    reliability = diag.get("reliability")
+    reliability = dict(reliability) if isinstance(reliability, dict) else {}
+    if reliability.get("cohort") not in RELIABILITY_COHORTS:
+        reliability["cohort"] = "unknown"
     candidates = diag.get("candidate_doc_ids")
     def group_recall(ids):
         if dataset == "personamem":
@@ -720,6 +790,7 @@ def module_metrics(row, label, dataset, output):
             "retrieval_query_count": ledger.get("ann", 0 if "ann" in metered_limits else diag.get("retrieval_query_count")),
             "set_score_count": ledger.get("set_score", 0 if "set_score" in metered_limits or "retrieval_query_count" in diag else None),
             "ledger_used": ledger,
+            "reliability": reliability,
             "interpretation": ("PersonaMem has no gold document support labels; gold_* metrics are unavailable. "
                                "Model/structural statuses do not prove semantic correctness." if dataset == "personamem" else
                                "gold_* uses held-out title-group labels after generation; model/structural statuses and complete_required do not prove semantic entailment")}
@@ -737,6 +808,44 @@ def summarize_modules(rows):
         summary[key] = {"observed_tasks": len(values), "missing_tasks": len(rows) - len(values),
                         "sum": sum(values), "mean": sum(values) / len(values) if values else None}
     return summary
+
+
+RELIABILITY_COHORTS = ("normal", "truncated", "partially_mapped", "truncated_and_partially_mapped", "unknown")
+
+
+def summarize_reliability(rows, answer_metric):
+    """Only the currently authoritative rows enter success/failure cohorts.
+
+    Costs here describe each row's latest attempt. Historical failed attempts
+    remain in cost_all_attempts, never in a success cohort after a retry.
+    """
+    def costs(subset):
+        observed = [r.get("latest_attempt_cost") for r in subset]
+        keys = sorted({key for cost in observed if isinstance(cost, dict)
+                       for key, value in cost.items()
+                       if isinstance(value, (int, float)) and not isinstance(value, bool)})
+        result = {}
+        for key in keys:
+            values = [cost[key] for cost in observed if isinstance(cost, dict)
+                      and isinstance(cost.get(key), (int, float)) and not isinstance(cost[key], bool)]
+            result[key] = {"observed_tasks": len(values), "missing_tasks": len(subset) - len(values),
+                           "sum": sum(values), "mean": sum(values) / len(values) if values else None}
+        return {"observed_tasks": sum(isinstance(cost, dict) for cost in observed),
+                "missing_tasks": sum(not isinstance(cost, dict) for cost in observed), "metrics": result}
+
+    groups = {}
+    for cohort in RELIABILITY_COHORTS:
+        subset = [r for r in rows if r["valid"] and
+                  r.get("modules", {}).get("reliability", {}).get("cohort", "unknown") == cohort]
+        correct = sum(r[answer_metric] == 1 for r in subset)
+        groups[cohort] = {"tasks": len(subset), "correct": correct,
+                          answer_metric: correct / len(subset) if subset else None,
+                          "cost_latest_attempt": costs(subset)}
+    failed = [r for r in rows if not r["valid"]]
+    return {"answer_metric": answer_metric, "completion_cohorts": groups,
+            "failed_tasks": len(failed), "failure_cost_latest_attempt": costs(failed),
+            "scope": "current authoritative task rows; cohorts contain successful answers only; costs use latest attempts; all retry costs remain in cost_all_attempts",
+            "interpretation": "Cohorts contain different questions; their accuracies and costs are descriptive, not evidence of a causal benefit from truncation or partial mapping."}
 
 
 def paired_bootstrap_interval(differences, *, replicates=1000, seed=20260918):
@@ -875,6 +984,7 @@ def score_all(output, scopes, arms, *, label_loader=None):
                 "all_task_metrics_percent": {k: 100 * sum(s[k] for s in rows) / n for k in metric_names},
                 "common_success_metrics_percent": {k: 100 * sum(all_scores[arm][u][k] for u in common) / len(common) for k in metric_names} if common else None,
                 "module_metrics": summarize_modules(rows),
+                "reliability": summarize_reliability(rows, answer_metric),
                 "cost_all_attempts": total_cost(output, dataset, arm)}
             if is_personamem:
                 persona_scores = {}
@@ -970,8 +1080,11 @@ def run_experiment(args):
         reusable = (not args.offline_preflight and prior_probe.get("config_digest") == digest(config)
                     and prior_probe.get("source_hashes") == manifest["source_hashes"]
                     and set(prior_probe.get("datasets", {})) == set(datasets)
+                    and prior_probe.get("arms") == arms
                     and 0 <= time.time() - prior_probe.get("created_unix", 0) < 300
-                    and "llm" in prior_probe.get("endpoints", {}))
+                    and "llm" in prior_probe.get("endpoints", {})
+                    and (config.get("model_profile") != "bridgetree" or
+                         prior_probe.get("endpoints", {}).get("fusion_planner_protocol", {}).get("status") == "passed"))
         if reusable:
             if "personamem" in datasets:
                 from dagbt.personamem import validate_dataset
@@ -1076,7 +1189,7 @@ def main(argv=None):
         command = sub.add_parser(name)
         command.add_argument("--config", required=True)
         command.add_argument("--datasets", nargs="+", choices=DATASETS, default=list(DATASETS))
-        command.add_argument("--offline-preflight", action="store_true", help="skip /models checks, not model calls during run")
+        command.add_argument("--offline-preflight", action="store_true", help="explicitly skip all endpoint/protocol preflight calls; model calls during run still occur")
         if name != "preflight":
             command.add_argument("--output", required=True)
             command.add_argument("--arms", nargs="+", default=["original", "fusion"])

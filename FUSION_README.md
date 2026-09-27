@@ -6,6 +6,8 @@
 
 **这是冻结模型的检索、推理与评测实验，不更新模型参数。** 新方案的准确率是否提高，必须由真实模型实验判断。
 
+当前融合求解器已适配 BT `16809bd` 的可靠性修复：稳定原文片段 ID、严格响应协议、局部保留与修复、按完整记录裁剪输入，以及可靠性分组统计。搜索 vendor 保持冻结；修复接入 DAG 自己的证据处理层。具体协议和验证边界见 [可靠性 v2 说明](docs/FUSION_RELIABILITY_V2.md)。
+
 ## 融合做什么
 
 ```text
@@ -43,7 +45,7 @@ cp configs/paired.example.json configs/paired.local.json
 # 默认模型、端点与 LLM key 已配置；环境变量可覆盖凭证。
 
 # 配好服务后一条命令后台启动全部四套数据，每题旧/新各一次：
-bash scripts/run_paired.sh --config configs/paired.local.json --output outputs/paired_full_personamem
+bash scripts/run_paired.sh --config configs/paired.local.json --output outputs/paired_full_reliability_v2
 ```
 
 先跑 `--limit 2` 到单独目录可以检查真实模型协议；即使只测两题，也需要所选数据集的完整语料索引。后台任务不依赖终端，支持 `status`、`stop`、原命令恢复和显式 `--retry-failed`；某题超时或失败不会停止另一版本和后续题。成功结果不会重复生成，失败尝试始终保留。数据范围或代码变动须换输出目录。

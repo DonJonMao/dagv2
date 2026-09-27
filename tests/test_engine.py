@@ -48,15 +48,17 @@ class FakeCalls:
             data = json.loads(payload["messages"][1]["content"])
             if operation == "planner":
                 value = {"steps": self.steps}
-            elif operation == "map":
+            elif operation in ("map", "map_repair"):
                 if self.mapper:
                     value = self.mapper(data)
                 else:
-                    value = {"spans": [{"doc_id": c["doc_id"], "start": c["start"], "quote": c["text"],
-                               "node_ids": [n["output_slot"] for n in data["nodes"]],
-                               "stance": "contradiction" if c["doc_id"] == "x" else "support",
-                               "entity_scope": "fixture", "event_time": None, "time_quote": None,
-                               "reason": "fixture quotation"} for c in data["chunks"]]}
+                    value = {"units": [{"unit_id": unit["unit_id"], "irrelevance_reason": "",
+                        "assessments": [{"span_ids": [unit["source_span_id"]], "node_id": n["output_slot"],
+                            "kind": "explicit", "claim": "fixture evidence",
+                            "stance": "contradiction" if unit["doc_id"] == "x" else "support",
+                            "entity_scope": "fixture", "event_time": None, "time_span_ids": [],
+                            "reason": "fixture source reference"} for n in data["nodes"] if n["output_slot"] in unit["node_ids"]]}
+                        for unit in data["units"]]}
             elif operation == "resolve":
                 value = self.resolver(data)
             elif operation == "audit":
@@ -77,7 +79,7 @@ def step(nid, question="Resolve requested relation?", inputs=()):
 
 
 def answer(data, value, sources, parents=(), alternatives=None, **extra):
-    mapped = {s["doc_id"]: s["id"] for s in data["evidence"]}
+    mapped = {s["doc_id"]: s["id"] for s in data["evidence"] if data["node_id"] in s["node_ids"]}
     alternatives = alternatives or [(sources, parents)]
     return {"status": "supported", "answer": value,
             "alternatives": [{"source_span_ids": [mapped[d] for d in docs], "guard_span_ids": [],
@@ -244,18 +246,20 @@ def test_gold_fields_are_rejected_before_any_model_request(setup):
     assert calls.requests == []
 
 
-def test_bad_quote_is_logged_and_never_compiled_as_valid_evidence(setup):
+def test_fabricated_source_id_is_logged_and_never_compiled_as_valid_evidence(setup):
     bridge, resources, config = setup
     bridge.routes = {"answer": ["a"]}
     def mapper(data):
-        c = data["chunks"][0]
-        return {"spans": [{"doc_id": c["doc_id"], "start": c["start"], "quote": "FABRICATED QUOTE",
-                 "node_ids": ["answer"], "stance": "support", "event_time": None, "time_quote": None}]}
+        return {"units": [{"unit_id": u["unit_id"], "irrelevance_reason": "", "assessments": [
+            {"span_ids": ["FABRICATED_SOURCE"], "node_id": "answer", "kind": "explicit",
+             "claim": "bad", "stance": "support", "event_time": None, "time_span_ids": [],
+             "entity_scope": "fixture", "reason": "fixture"}]} for u in data["units"]]}
     calls = FakeCalls([step("answer")], lambda data: unknown(), mapper=mapper)
     result = run_question({"id": "q", "question": "Requested relation?"}, resources, calls, config)
     assert result["diagnostics"]["spans"] == []
     assert result["diagnostics"]["errors"]
     assert result["diagnostics"]["ledger"]["used"]["json_repairs"] == 2
+    assert result["diagnostics"]["reliability"]["mapping_incomplete"]
     assert not result["budgets"]["20"]["complete_required"]
 
 
@@ -367,34 +371,35 @@ def test_explicit_audit_resolution_retains_its_proof_as_raw_guard(setup):
     assert {s["doc_id"] for s in graph["spans"] if s["id"] in guard_ids} == {"c"}
 
 
-def test_chunk_overlap_preserves_quote_crossing_old_boundary_with_absolute_offsets(setup):
+def test_adjacent_source_fragments_remain_one_assessment_with_exact_offsets(setup):
     bridge, resources, config = setup
     docs, ids, vectors, index, tokenizer = resources
-    docs = {"long": Document("long", " ".join("word%04d" % i for i in range(3000)))}
+    docs = {"long": Document("long", " ".join("word%04d" % i for i in range(85)))}
     resources = (docs, list(docs), np.ones((1, 4), dtype=np.float32), index, tokenizer)
-    config["fusion"]["map_batch_tokens"] = 1500
-    target = {}
     def mapper(data):
-        matching = [c for c in data["chunks"] if c["start"] <= target["start"]
-                    and target["end"] <= c["start"] + len(c["text"])]
-        return {"spans": [] if not matching else [{"doc_id": "long", "start": target["start"],
-                    "quote": target["quote"], "node_ids": ["answer"], "stance": "support",
-                    "event_time": None, "time_quote": None, "entity_scope": "fixture"}]}
+        sources = {s["id"]: s for s in data["source_spans"]}
+        rows = []
+        for u in data["units"]:
+            first = sources[u["source_span_id"]]
+            following = next((s for s in sources.values() if s["start"] == first["end"]), None)
+            assessments = []
+            if first["start"] == 0 and following:
+                assessments = [{"span_ids": [first["id"], following["id"]], "node_id": "answer",
+                    "kind": "explicit", "claim": "One combined fact", "stance": "support",
+                    "event_time": None, "time_span_ids": [], "entity_scope": "fixture", "reason": "combined"}]
+            rows.append({"unit_id": u["unit_id"], "assessments": assessments,
+                         "irrelevance_reason": "" if assessments else "No other relevant fact"})
+        return {"units": rows}
     calls = FakeCalls([step("answer")], lambda data: unknown(), mapper=mapper)
     engine = Engine({"id": "q", "question": "Requested relation?"}, resources, calls, config, "fusion")
-    engine.plan(); engine.add_candidates(["long"])
-    assert len(engine.chunks) > 1
-    boundary = len(engine.chunks[0]["text"])
-    raw = docs["long"].passage
-    target.update(start=boundary - 40, end=boundary + 40, quote=raw[boundary - 40:boundary + 40])
-    assert any(c["start"] <= target["start"] and target["end"] <= c["start"] + len(c["text"])
-               for c in engine.chunks[1:])
-    engine.map_pending()
+    engine.plan(); engine.add_candidates(["long"]); engine.map_pending()
     assert len(engine.mapped_chunks) == len(engine.chunks)
     assert len(engine.spans) == 1
     span = next(iter(engine.spans.values()))
-    assert span["start"] == target["start"] and span["end"] == target["end"]
-    assert span["exact_quote"] == target["quote"]
+    assert len(span["fragments"]) == 2
+    assert "exact_quote" not in span
+    for fragment in span["fragments"]:
+        assert docs["long"].passage[fragment["start"]:fragment["end"]] == fragment["exact_quote"]
 
 
 def test_post_audit_missing_guard_triggers_budgeted_bridge_feedback_and_reaudit(setup):

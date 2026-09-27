@@ -6,7 +6,9 @@ from copy import deepcopy
 DEFAULTS = {
     'ann_calls': 36, 'set_score_calls': 512, 'llm_calls': 24, 'reader_calls': 1,
     'reserved_gap_ann_calls': 2, 'reserved_audit_calls': 1,
-    'json_repairs': 2, 'max_initial_nodes': 6, 'max_refinement_nodes': 2,
+    'json_repairs': 6, 'max_repairs_per_request': 2,
+    'response_format': 'plain', 'input_margin': 256,
+    'max_initial_nodes': 6, 'max_refinement_nodes': 2,
     'max_alternatives': 2, 'max_enumeration_states': 10000,
     'initial_width': 12, 'proposal_width': 4, 'pair_rescue_width': 4,
     'context_tokens': 16384, 'map_batch_tokens': 6144,
@@ -51,7 +53,7 @@ def resolve(config, method='fusion'):
         if not isinstance(result[name], int) or isinstance(result[name], bool) or result[name] < 1:
             raise ValueError(f'{name} must be positive integer')
     for name in ('reserved_gap_ann_calls','reserved_audit_calls','max_refinement_nodes',
-                 'max_feedback_rounds','json_repairs','pair_rescue_width'):
+                 'max_feedback_rounds','json_repairs','max_repairs_per_request','input_margin','pair_rescue_width'):
         if not isinstance(result[name], int) or isinstance(result[name], bool) or result[name] < 0:
             raise ValueError(f'{name} must be nonnegative integer')
     for name in ('condition_audit','allow_alternatives','invalidation','refinement','reader_chain','navigation_closure'):
@@ -59,6 +61,8 @@ def resolve(config, method='fusion'):
             raise ValueError(f'{name} must be boolean')
     if result['selection'] not in ('dependency','flat') or result['retrieval'] not in ('bridge','dense'):
         raise ValueError('selection must be dependency/flat and retrieval must be bridge/dense')
+    if result['response_format'] not in ('plain', 'json_object', 'json_schema'):
+        raise ValueError('response_format must be plain/json_object/json_schema')
     if result['navigation_closure'] and result['selection'] != 'dependency':
         raise ValueError('navigation_closure requires dependency selection; flat-navigation combination is undefined')
     if result['proxy_mode'] not in ('activation','none'):
@@ -83,10 +87,10 @@ def resolve(config, method='fusion'):
     final_calls = result['reserved_audit_calls'] + int(result['selection'] == 'flat')
     if final_calls >= result['llm_calls']:
         raise ValueError('LLM audit/selection reservation leaves no reasoning budget')
-    if result['reasoning_output_tokens'] + 8 >= result['context_tokens']:
+    if result['reasoning_output_tokens'] + result['input_margin'] + 8 >= result['context_tokens']:
         raise ValueError('Reasoning output reserve leaves no input context')
     if result['reader_output_tokens'] + 8 >= result['context_tokens']:
         raise ValueError('Reader output reserve leaves no input context')
-    if result['map_batch_tokens'] + result['reasoning_output_tokens'] + 8 > result['context_tokens']:
+    if result['map_batch_tokens'] + result['reasoning_output_tokens'] + result['input_margin'] + 8 > result['context_tokens']:
         raise ValueError('Map batch plus reasoning output reserve exceeds context_tokens')
     return result
