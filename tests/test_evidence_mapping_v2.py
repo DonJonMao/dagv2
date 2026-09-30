@@ -8,7 +8,7 @@ import pytest
 from dagbt.budget import Ledger
 from dagbt.config import DEFAULTS
 from dagbt.evidence_mapping import EvidenceMapper
-from dagbt.reasoning import InputOverflow, Reasoner
+from dagbt.reasoning import InputOverflow, Reasoner, RefusalError
 
 
 def assessment(unit, *, node=None, spans=None, claim="The source supplies this fact", **changes):
@@ -116,7 +116,7 @@ def test_persistent_semantic_errors_stop_at_per_unit_limit_across_future_calls()
 
 
 def test_global_repair_limit_prevents_new_round_reset():
-    e = engine(lambda data, _: {"units": []}, json_repairs=1)
+    e = engine(lambda data, _: {"units": []}, json_repairs=1, reserved_selection_repairs=0)
     e.mapper.add_candidates(list(e.docs))
     e.mapper.map_pending()
     e.mapper.map_pending()
@@ -294,7 +294,7 @@ def test_mapping_request_preserves_future_resolve_audit_and_flat_selection_calls
     e = engine(selection="flat")
     e.mapper.add_candidates(list(e.docs))
     e.mapper.map_pending(remaining_nodes=2)
-    assert e.calls.requests[0]["options"] == {"reserve": 0, "extra_reserve": 4}
+    assert e.calls.requests[0]["options"] == {"reserve": 0, "extra_reserve": 6}
     exhausted = engine(llm_calls=4, selection="flat")
     exhausted.mapper.add_candidates(list(exhausted.docs))
     exhausted.mapper.map_pending(remaining_nodes=2)
@@ -307,7 +307,8 @@ def test_refusal_stops_without_retry_and_preplan_diagnostics_are_available():
     assert e.mapper.diagnostics()["mapping_incomplete"] is False
     e.steps = [{"output_slot": "n1", "question": "What?", "inputs": []}]
     e.mapper.add_candidates(list(e.docs))
-    e.mapper.map_pending()
+    with pytest.raises(RefusalError):
+        e.mapper.map_pending()
     e.mapper.map_pending()
     assert len(e.calls.requests) == 1 and e.ledger.used["json_repairs"] == 0
     assert e.mapper.diagnostics()["unavailable_unit_ids"] == ["u1", "u2"]

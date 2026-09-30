@@ -34,6 +34,11 @@
     "reader_output_tokens": 1024,
     "json_repairs": 6,
     "max_repairs_per_request": 2,
+    "selection_review": true,
+    "raw_memory_review": true,
+    "allow_unassessed_coverage": true,
+    "final_selection_calls": 3,
+    "reserved_selection_repairs": 2,
     "response_format": "plain",
     "input_margin": 256
   },

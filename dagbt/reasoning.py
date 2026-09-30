@@ -164,11 +164,22 @@ class Reasoner:
         record["validation_status"] = "valid"
         return result
 
-    def json(self, operation, system, data, validate, schema=None, *, reserve=None, extra_reserve=0):
+    def repair_reservation(self, operation, reserve_repairs=None):
+        """Reserve global repairs for the final legal selection and coverage."""
+        if reserve_repairs is None:
+            reserve_repairs = (0 if operation.startswith(("select", "reader")) else
+                               self.settings.get("reserved_selection_repairs", 0))
+        if isinstance(reserve_repairs, bool) or not isinstance(reserve_repairs, int) or reserve_repairs < 0:
+            raise ValueError("reserve_repairs must be a nonnegative integer")
+        return reserve_repairs
+
+    def json(self, operation, system, data, validate, schema=None, *, reserve=None, extra_reserve=0,
+             repair_builder=None, reserve_repairs=None):
         """Bounded local repair, preserving original evidence and allowed IDs."""
         original = deepcopy(data)
         current = deepcopy(data)
         local_repairs = 0
+        repair_reserve = self.repair_reservation(operation, reserve_repairs)
         while True:
             try:
                 return self.request(operation, system, current, validate, schema,
@@ -179,22 +190,43 @@ class Reasoner:
                 raise
             except ProtocolError as exc:
                 if (local_repairs >= self.settings.get("max_repairs_per_request", 2)
-                        or self.ledger.remaining("json_repairs") < 1):
+                        or self.ledger.remaining("json_repairs") <= repair_reserve):
+                    self.event({"event": "reasoning_repair_exhausted", "operation": operation,
+                                "error_type": type(exc).__name__, "error": str(exc),
+                                "failure_category": exc.category, "local_repairs": local_repairs,
+                                "reserved_repairs": repair_reserve,
+                                "remaining_repairs": self.ledger.remaining("json_repairs")})
                     raise
                 feedback = ("Use only original source evidence and allowed IDs. "
                             "Correct this validation error: " + str(exc))[:1200]
-                current = deepcopy(original) if isinstance(original, dict) else {"original_input": deepcopy(original)}
+                state = {"original_data": deepcopy(original), "error": str(exc),
+                         "error_type": type(exc).__name__, "failure_category": exc.category,
+                         "repair_index": local_repairs + 1}
+                current = (repair_builder(state) if repair_builder is not None else
+                           deepcopy(original) if isinstance(original, dict) else {"original_input": deepcopy(original)})
+                if not isinstance(current, dict):
+                    raise TypeError("repair_builder must return a payload object")
+                current = deepcopy(current)
                 while True:
                     current["validation_feedback"] = feedback
                     count = self.estimate(operation, system, current, schema)
                     try:
                         self._preflight(operation, count, reserve=reserve, extra_reserve=extra_reserve)
-                    except InputOverflow:
+                    except InputOverflow as overflow:
                         if len(feedback) <= 80:
-                            raise exc
+                            self.event({"event": "reasoning_repair_preflight_failed", "operation": operation,
+                                        "error_type": type(overflow).__name__, "error": str(overflow),
+                                        "failure_category": "repair_input_budget",
+                                        "input_tokens_local": count, "original_error": str(exc),
+                                        "local_repairs": local_repairs})
+                            raise overflow from exc
                         feedback = feedback[:max(80, len(feedback) // 2)]
                         continue
                     break
+                self.event({"event": "reasoning_repair_prepared", "operation": operation,
+                            "repair_index": local_repairs + 1, "input_tokens_local": count,
+                            "scoped_builder": repair_builder is not None,
+                            "reserved_repairs": repair_reserve})
                 # Count only repairs that have passed local budget checks.
                 self.ledger.reserve("json_repairs", operation)
                 local_repairs += 1

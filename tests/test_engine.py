@@ -63,9 +63,18 @@ class FakeCalls:
                 value = self.resolver(data)
             elif operation == "audit":
                 value = self.auditor(data) if self.auditor else {"conflicts": [], "unresolved_guards": []}
-            elif operation == "select":
-                value = self.selector(data) if self.selector else {"selected_doc_ids": data["candidate_doc_ids"],
-                          "reason": "fixture whole-set judgment", "covered_requirement_ids": ["answer"]}
+            elif operation in ("select", "select_repair"):
+                if payload['messages'][0]['content'].startswith('Review source documents'):
+                    header = data.get('repair_scope', {}).get('fixed_header') or {
+                        'selected_doc_ids': data.get('proposed_doc_ids') or data['candidate_doc_ids'],
+                        'reason': 'fixture review', 'conflicts': []}
+                    value = {**header, 'coverage': [{'requirement_id': r['id'], 'status': 'missing',
+                        'source_span_ids': [], 'kind': 'explicit', 'reason': 'Scripted unresolved coverage'} for r in data['requirements']]}
+                    if self.selector:
+                        value = self.selector(data)
+                else:
+                    value = self.selector(data) if self.selector else {"selected_doc_ids": data["candidate_doc_ids"],
+                              "reason": "fixture whole-set judgment", "covered_requirement_ids": ["answer"]}
             else:
                 raise AssertionError("Unexpected fixture operation: " + operation)
             result = json.dumps(value)
@@ -119,7 +128,8 @@ def setup(monkeypatch):
     resources = (docs, ids, np.eye(len(ids), dtype=np.float32), SimpleNamespace(), Tokenizer())
     config = {"_test_transport": True, "llm_base_url": "https://invalid.example/v1",
               "llm_model": "fixture", "embedding_model": "fixture", "fusion": {
-                  "max_feedback_rounds": 0, "max_quote_chars": 400, "refinement": False}}
+                  "max_feedback_rounds": 0, "max_quote_chars": 400, "refinement": False,
+                  "selection_review": False}}  # Separate regression of the original DAG closure selector.
     return Bridge, resources, config
 
 

@@ -133,7 +133,7 @@ class EvidenceView:
 
 def build_view(reasoner, operation, system, fixed, records, settings, event=None, schema=None, *,
                audit_nodes=None, node_order=None, evidence_key="evidence", document_costs=None,
-               input_limit=None):
+               input_limit=None, raw_doc_ids=()):
     """Return a payload/registry whose exact estimated wire fits its allowance.
 
     ``fixed`` excludes evidence. ``audit_nodes`` moves audit alternatives out
@@ -191,7 +191,8 @@ def build_view(reasoner, operation, system, fixed, records, settings, event=None
     alt_aliases = {identifier: f"a{index + 1}" for index, identifier in enumerate(all_alternatives)}
     order = list(node_order or [node["id"] for node in all_nodes])
     ordered_ids = _round_robin(records, list(dict.fromkeys(order)))
-    documents = list(dict.fromkeys(record["doc_id"] for record in records))
+    raw_doc_ids = _ids(list(raw_doc_ids), "raw_doc_ids")
+    documents = list(dict.fromkeys([*raw_doc_ids, *(record["doc_id"] for record in records)]))
     if document_costs is not None:
         if not isinstance(document_costs, Mapping):
             raise ValueError("document_costs must be a mapping")
@@ -225,7 +226,7 @@ def build_view(reasoner, operation, system, fixed, records, settings, event=None
         data = deepcopy(fixed)
         shown_ids = [identifier for identifier in ordered_ids if identifier in visible]
         data[evidence_key] = [deepcopy(by_id[identifier]) for identifier in shown_ids]
-        shown_docs = list(dict.fromkeys(by_id[identifier]["doc_id"] for identifier in shown_ids))
+        shown_docs = list(dict.fromkeys([*raw_doc_ids, *(by_id[identifier]["doc_id"] for identifier in shown_ids)]))
         if document_costs is not None:
             data["candidate_doc_ids"] = shown_docs
             data["document_token_counts"] = {doc: document_costs[doc] for doc in shown_docs}
@@ -364,7 +365,7 @@ def build_view(reasoner, operation, system, fixed, records, settings, event=None
         data, included = payload_for(kept, selected_alts)
     after = reasoner.estimate(operation, system, data, schema)
     visible_ids = [identifier for identifier in ordered_ids if identifier in kept]
-    shown_docs = list(dict.fromkeys(by_id[identifier]["doc_id"] for identifier in visible_ids))
+    shown_docs = list(dict.fromkeys([*raw_doc_ids, *(by_id[identifier]["doc_id"] for identifier in visible_ids)]))
     audit = {
         "event": "evidence_view_prepared", "operation": operation, "policy_version": POLICY_VERSION,
         "input_tokens_before": before, "input_tokens_after": after, "input_token_limit": limit,

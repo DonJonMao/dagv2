@@ -1,17 +1,21 @@
-# DAG v2 + 最新 Evidence BridgeTree
+# DAG v2 + Evidence BridgeTree：融合可靠性 v3
 
-本目录由 `dagv2_package_20260921` 完整复制而来。原始 57 个文件保留不改；原版 Git 分支是 `original-dagv2`，融合支线是 `fusion/latest-bt`。原三套数据、索引、原脚本、原方法代码都可继续使用。当前成对入口另接入 PersonaMem，`original` 和 `fusion` 两臂都能运行；历史原版分支不改。`original_manifest.json` 提供字节校验。
+当前融合版本为 `dagbt_fusion_reliability_v3`，将 BT `c4b04c9` 的个人历史提示、原文独立复核、有界覆盖修复和诊断适配到 DAG。DAG 先提出来源闭包，再由模型结合原问题 dense 基线原文复核整个选集；实际选定后重新计算支持证书，未映射原文不会自动变成已覆盖证据。方法、验证范围和限制见 [v3 说明](docs/FUSION_RELIABILITY_V3.md)。
+
+本目录由 `dagv2_package_20260921` 完整复制而来。原始 57 个文件保留不改；原版 Git 分支是 `original-dagv2`，融合支线是 `fusion/latest-bt`。当前成对入口运行 HotpotQA、2WikiMultihopQA、MuSiQue 和 PersonaMem，`original`、`fusion` 两臂共享模型部署；`original_manifest.json` 提供原始文件字节校验。
 
 三个大型 `passage_vectors.npy` 原样保存在本地，并纳入校验，但不提交到 Git；复制或部署此目录时需一并携带 `data/`。
 
 **这是冻结模型的检索、推理与评测实验，不更新模型参数。** 新方案的准确率是否提高，必须由真实模型实验判断。
 
-当前融合求解器已适配 BT `16809bd` 的可靠性修复：稳定原文片段 ID、严格响应协议、局部保留与修复、按完整记录裁剪输入，以及可靠性分组统计。搜索 vendor 保持冻结；修复接入 DAG 自己的证据处理层。具体协议和验证边界见 [可靠性 v2 说明](docs/FUSION_RELIABILITY_V2.md)。
+v3 保留 [v2](docs/FUSION_RELIABILITY_V2.md) 的稳定来源 ID、严格响应协议、局部保留与修复，以及完整记录预算窗口；搜索 vendor 保持冻结。v3 是方法行为变更，使用新的运行身份，不能恢复到旧版输出目录。新增 raw review、未评估覆盖及其消融均单独记录。
 
 ## 融合做什么
 
 ```text
-原问题 → 原 DAG 规划器（只看问题）→ 固定终端需求
+原问题 → DAG 规划器 + 任务理解提示 → 固定终端需求
+                  ↓
+       原问题 dense 基线（共享 ANN 预算，完整 reader 可行）
                   ↓
        就绪子问题：用已支持父结论填入实体/条件
                   ↓
@@ -23,7 +27,9 @@
                   ↓
        条件与反证审计 → 局部支持失效 → 受影响结论重评
                   ↓
-       token 预算内完整来源闭包 → 原文 reader → 答案
+       DAG 来源闭包提案 + dense 基线原文独立复核
+                  ↓
+       整组选集可保留/替换 → 重算支持证书 → 原文 reader → 答案
 ```
 
 BT 从当前工作区冻结为 `vendor/bridgetree/`，不是旧 Git HEAD。原目录 `/Users/mao/projects/bridgetree_preference_rag` 不作为运行依赖，也没有被改动。默认融合路径使用实际 `EvidenceBridgeSearcher` 和 `SetReranker`，包含多根调度、pair tests、pivot、受限 speculation；没有用简单 BFS 或 cosine 分数替代 BT。来源见 `vendor/bridgetree_manifest.json`。
@@ -33,6 +39,8 @@ BT 从当前工作区冻结为 `vendor/bridgetree/`，不是旧 Git HEAD。原�
 首次启动会为所选数据集建立独立 Qwen3 向量索引，旧 NV-Embed-v2 数组原样保留。PersonaMem 物理共享记忆向量库，但每道题仅可检索其用户在该时刻已经可见的记忆，不能检索其他用户或未来消息。DeepSeek 使用 chat 接口；本地预算改用 BT 的明确标注的 token 估算，实际服务 usage 另外记录。适配细节、来源与限制见 [模型对齐说明](docs/MODEL_ALIGNMENT.md)。`configs/paired.legacy.json` 保留上一版 Qwen/NV 配置，仅支持原三套数据，运行时须显式指定 `--datasets hotpotqa 2wikimultihopqa musique`；原始分支及 `config.example.json` 仍保留历史快照。
 
 默认数据范围为 HotpotQA、2WikiMultihopQA、MuSiQue 各 1,000 题，以及 PersonaMem-v1 官方 32k 文件全部 589 题，共 **3,589 题、7,178 个双臂方法任务**。PersonaMem 覆盖 20 个 persona、37 个 shared context、222 个可见记忆范围和 3,187 条去重记忆，使用与 BT 相同的固定数据源版本。其任务为四选一，报告严格单选 accuracy 和 persona 宏平均 accuracy，不生成不存在的 gold-support recall 或文本 F1。数据与评测协议见 [PersonaMem 说明](docs/PERSONAMEM.md)。
+
+PersonaMem 的融合臂规划、检索和证据判断只接收当前用户问题，公开选项单独交给最终 reader；`original` 臂保留既有“问题加公开选项”协议。这也是双臂的差异之一，不能将总分差完全归因于 BT。DAG 上下文维持 16,384，并包含 reader 输出预留；没有改成独立 BT 的 8,192。
 
 ## 启动
 
@@ -45,10 +53,11 @@ cp configs/paired.example.json configs/paired.local.json
 # 默认模型、端点与 LLM key 已配置；环境变量可覆盖凭证。
 
 # 配好服务后一条命令后台启动全部四套数据，每题旧/新各一次：
-bash scripts/run_paired.sh --config configs/paired.local.json --output outputs/paired_full_reliability_v2
+bash scripts/run_v3.sh start --config configs/paired.local.json
+bash scripts/run_v3.sh status
 ```
 
-先跑 `--limit 2` 到单独目录可以检查真实模型协议；即使只测两题，也需要所选数据集的完整语料索引。后台任务不依赖终端，支持 `status`、`stop`、原命令恢复和显式 `--retry-failed`；某题超时或失败不会停止另一版本和后续题。成功结果不会重复生成，失败尝试始终保留。数据范围或代码变动须换输出目录。
+默认输出为 `outputs/paired_full_reliability_v3`。先用 `--datasets personamem --limit 2 --output outputs/smoke_personamem_v3` 到单独目录检查真实模型协议；即使只测两题，也需要所选数据集的完整语料索引。后台任务不依赖终端，支持 `status`、`stop`、`resume`、`diagnostics` 和显式 `--retry-failed`；恢复时须带回原配置和题目范围。某题超时或失败不会停止另一版本和后续题，成功结果不会重复生成。
 
 上传 tar 包后的安装和启动步骤见 [服务器运行说明](docs/SERVER_RUN.md)。完整命令、日志结构、故障处理见 [成对实验运行说明](docs/PAIRED_RUNNER.md)。
 
@@ -63,7 +72,7 @@ bash scripts/run_paired.sh --config configs/paired.local.json --output outputs/f
   --arms original fusion dense_dependency bt_flat dense_flat
 ```
 
-四个新臂共享融合求解器、同一 token 计量方式和 raw-only reader。另有条件审计、OR 支持、失效传播、细化、chain reader，以及强制保留导航来源、取消评分代理调度的消融。`fixed_candidate_pools` 可为指定问题提供冻结候选 ID 列表，用于同候选池选择对照；它不能来自 gold，也不能作为在线召回成绩。
+四个新臂共享融合求解器、同一 token 计量方式、v3 原文复核和 raw-only reader；dependency/flat 区别包括是否使用 DAG 闭包提案及相应覆盖约束。`fusion_no_raw_review` 保持同样的 dense 基线候选和复核流程，仅关闭独立原文输入；`fusion_strict_coverage` 禁止未评估覆盖继续执行。另有条件审计、OR 支持、失效传播、细化、chain reader，以及强制保留导航来源、取消评分代理调度的消融。`fixed_candidate_pools` 可为指定问题提供冻结候选 ID 列表，用于同候选池选择对照；它不能来自 gold，也不能作为在线召回成绩。
 
 日志包括每次查询与命中、完整 BT 搜索事件、实际支持父项与原文引用、节点状态/版本、冲突与明确解决、闭包选取、reader 确切输入、所有调用/缓存/重试成本。评分阶段再加载标签，报告全任务、共同成功子集和救回/损害题；原三套问答数据另报发现召回和选集召回，PersonaMem 只报告有定义的单选准确率。语义依赖正确性仍需独立人工检查，程序证书不证明自然语言蕴涵。
 

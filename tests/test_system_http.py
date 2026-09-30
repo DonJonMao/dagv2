@@ -39,6 +39,20 @@ def scripted_source_mapping(data):
     return {'units': units}
 
 
+def scripted_final_selection(data):
+    """V3 wire fixture: review real IDs without asserting semantic coverage."""
+    fixed = data.get('repair_scope', {}).get('fixed_header')
+    selected = (data.get('proposed_doc_ids') or
+                [row['doc_id'] for row in data.get('raw_memory_candidates', [])][:1] or
+                data.get('candidate_doc_ids', [])[:1])
+    return {**(fixed or {'selected_doc_ids': selected,
+                         'reason': 'Scripted protocol fixture; not a sufficiency judgment', 'conflicts': []}),
+            'coverage': [{'requirement_id': requirement['id'], 'status': 'missing',
+                          'source_span_ids': [], 'kind': 'explicit',
+                          'reason': 'This fixture makes no semantic coverage claim'}
+                         for requirement in data['requirements']]}
+
+
 @contextmanager
 def scripted_models(question, vector):
     requests, errors = [], []
@@ -98,6 +112,8 @@ def scripted_models(question, vector):
                              'unresolved_inputs': [], 'unresolved_guards': [], 'refinements': []}
                 elif system.startswith('Audit the compiled evidence support alternatives'):
                     value = {'conflicts': [], 'unresolved_guards': []}
+                elif system.startswith('Review source documents'):
+                    value = scripted_final_selection(json.loads(messages[1]['content']))
                 elif system.startswith('You are a long-document QA reader'):
                     content = 'Answer: ' + FIXTURE_ANSWER
                     self.respond({'choices': [{'message': {'content': content}, 'finish_reason': 'stop'}],
@@ -153,7 +169,11 @@ def test_actual_packaged_hotpot_question_both_algorithms_with_scripted_http(tmp_
         fusion = rows[fusion_arm]
         expected_version = ('evidence_bridge_v1' if fusion_arm == 'fusion'
                             else 'day2_proxy_free_requirements_ann_v1')
-        assert fusion['ranking']['trace'][0]['trace']['search_archive']['method_version'] == expected_version
+        # V3 performs a separate original-query dense baseline before each
+        # method's actual node search; inspect the latter by its archive.
+        searches = [record['trace'] for record in fusion['ranking']['trace']
+                    if 'search_archive' in record.get('trace', {})]
+        assert searches and searches[0]['search_archive']['method_version'] == expected_version
         diag = fusion['diagnostics']
         assert diag['spans'] and diag['support_graph']['nodes'][0]['status'] == 'supported'
         if fusion_arm == 'fusion':
@@ -161,12 +181,15 @@ def test_actual_packaged_hotpot_question_both_algorithms_with_scripted_http(tmp_
         else:
             assert diag['ledger']['used'].get('set_score',0) == 0
             assert diag['ledger']['used'].get('rerank_http',0) == 0
-            trace=fusion['ranking']['trace'][0]['trace']
+            trace=searches[0]
             assert any(b['stage']=='conditional' and b['premise_ids']
                        for b in trace['retrieval']['proposal_batches'])
         assert diag['ledger']['used']['ann'] <= 12
         assert diag['ledger']['used'].get('set_score',0) <= 64
         assert any(e['event'] == 'reader_input' and e['raw_only'] for e in diag['events'])
+        assert any(e['event'] == 'semantic_selection_complete' for e in diag['events'])
+        assert any(r['payload'].get('messages', [{}])[0].get('content', '').startswith('Review source documents')
+                   for r in requests)
         assert rows['original']['ranking']['nodes'][0]['resolved']
         assert all(row['runner']['cost']['http_attempts'] > 0 for row in rows.values())
         # Same packaged question goes to both planners; evaluation fields never go to HTTP.

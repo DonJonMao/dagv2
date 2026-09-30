@@ -17,10 +17,12 @@ def call_reservation(settings, stage, reserve=None, extra_reserve=0):
     """Keep the existing audit/flat allowance and optionally protect more work."""
     stage_text='/'.join(map(str,stage)) if isinstance(stage,(tuple,list)) else str(stage)
     if reserve is None:
-        flat=int(settings.get('selection')=='flat')
-        reserve=(0 if stage_text.split('/')[0].startswith('select') else flat
+        final=settings.get('final_selection_calls',int(settings.get('selection')=='flat'))
+        if isinstance(final,bool) or not isinstance(final,int) or final<0:
+            raise ValueError('final_selection_calls must be a nonnegative integer')
+        reserve=(0 if stage_text.split('/')[0].startswith(('select','reader')) else final
                  if stage_text.split('/')[0].startswith('audit')
-                 else int(settings.get('reserved_audit_calls',1))+flat)
+                 else int(settings.get('reserved_audit_calls',1))+final)
     for name,value in (('reserve',reserve),('extra_reserve',extra_reserve)):
         if isinstance(value,bool) or not isinstance(value,int) or value<0:
             raise ValueError(name+' must be a nonnegative integer')

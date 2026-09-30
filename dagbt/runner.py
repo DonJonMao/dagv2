@@ -14,6 +14,7 @@ import importlib
 import importlib.util
 import importlib.metadata
 import json
+import math
 import multiprocessing as mp
 import os
 import random
@@ -106,6 +107,8 @@ def frozen_sources():
             paths.extend(p for p in base.rglob("*") if p.is_file() and "__pycache__" not in p.parts
                          and p.suffix not in (".pyc", ".log"))
     paths.extend(p for p in (ROOT / "scripts").glob("*paired*") if p.is_file())
+    if (ROOT / "scripts" / "run_v3.sh").is_file():
+        paths.append(ROOT / "scripts" / "run_v3.sh")
     return {str(p.relative_to(ROOT)): file_hash(p) for p in sorted(set(paths))}
 
 
@@ -194,6 +197,7 @@ def probe_fusion_planner(config, output=None):
     from dagbt.model_runtime import load_tokenizer
     from dagbt.reasoning import Reasoner
     from dagbt.transport import Transport
+    from dagbt import prompts
 
     base = Path(output) if output else ROOT / "outputs" / "preflight"
     trace = base / "preflight_calls" / f"planner-{time.time_ns()}"
@@ -210,7 +214,7 @@ def probe_fusion_planner(config, output=None):
     reasoner = Reasoner(transport, tokenizer, effective, settings, ledger, observe)
     e, repair, _ = legacy_modules()
     query = "Which city hosts the science museum visited by the fictional traveler Mira?"
-    report = {"check": "fusion_planner_protocol", "version": "dagbt_fusion_reliability_v2", "status": "running",
+    report = {"check": "fusion_planner_protocol", "version": "dagbt_fusion_reliability_v3", "status": "running",
               "trace_directory": str(trace), "configured_protocol": settings.get("response_format", "plain"),
               "schema_sha256": digest(e.PLAN_SCHEMA), "synthetic_query": query,
               "logical_call_limit": 1, "repair_calls": 0, "protocol_fallback": False,
@@ -224,7 +228,8 @@ def probe_fusion_planner(config, output=None):
             if len(plan["steps"]) > settings["max_initial_nodes"]:
                 raise ValueError("Initial node cap exceeded")
             return plan
-        plan = reasoner.request("planner", e.PLAN_SYSTEM, query, validate_plan, e.PLAN_SCHEMA, reserve=0)
+        plan = reasoner.request("planner", prompts.plan_system(e.PLAN_SYSTEM, personal=False), query,
+                                validate_plan, e.PLAN_SCHEMA, reserve=0)
     except Exception as exc:
         report.update(status="failed", **redacted_error(exc))
         raise
@@ -349,8 +354,10 @@ class AuditedCalls:
         key = e.native.digest({"unit_id": self.unit, "url": url, "payload": final})
         path = self.output / "requests" / (key + ".json")
         before = load(path) if path.exists() else {}
+        stage_text = "/".join(map(str, stage)) if isinstance(stage, (list, tuple)) else str(stage)
+        kind = "embedding_http" if embedding else "reader" if stage_text.startswith("reader/") else "llm"
         event = {"event": "call_started", "unix": time.time(), "stage": stage, "request_ref": key,
-                 "kind": "embedding" if embedding else "llm", "cache_hit": "response" in before}
+                 "kind": kind, "cache_hit": "response" in before}
         append_jsonl(self.output / "call_events.jsonl", event)
         try:
             result = self._inner.get(stage, url, payload)
@@ -374,7 +381,7 @@ def request_cost(output):
         except json.JSONDecodeError:
             incomplete_event_lines += 1
     logical = [e for e in events if e.get("event") == "call_started"]
-    result = {"logical_calls": len(logical), "cache_hits": sum(e["cache_hit"] for e in logical),
+    result = {"logical_calls": len(logical), "cache_hits": sum(bool(e.get("cache_hit")) for e in logical),
               "unique_requests": 0, "http_attempts": 0, "http_retries": 0, "successful_http_requests": 0,
               "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "requests_by_stage": {},
               "incomplete_or_failed_http_attempts": 0,
@@ -382,6 +389,21 @@ def request_cost(output):
               "malformed_request_records": 0,
               "token_scope": "observed successful nonseeded API responses; failed/lost server work may be unreported"}
     stages = Counter()
+    by_kind = {}
+    def layer(kind):
+        kind = "embedding_http" if kind == "embedding" else kind
+        kind = kind if kind in {"llm", "reader", "embedding_http", "rerank_http"} else "unknown"
+        return by_kind.setdefault(kind, {"logical_calls": 0, "cache_hits": 0, "unique_requests": 0,
+            "http_attempts": 0, "http_retries": 0, "successful_http_requests": 0,
+            "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+            "missing_usage_responses": 0, "incomplete_or_failed_http_attempts": 0,
+            "observed_http_seconds": 0.0, "timed_http_attempts": 0})
+    logical_kinds = {}
+    for event in logical:
+        current = layer(event.get("kind"))
+        current["logical_calls"] += 1
+        current["cache_hits"] += int(bool(event.get("cache_hit")))
+        logical_kinds[event.get("request_ref")] = event.get("kind")
     for path in (output / "requests").glob("*.json"):
         try:
             record = load(path)
@@ -392,23 +414,47 @@ def request_cost(output):
             continue
         stages[json.dumps(record.get("stage"), ensure_ascii=False)] += 1
         result["unique_requests"] += 1
+        attempts = record.get("attempts", [])
+        kind = logical_kinds.get(path.stem) or next((a.get("kind") for a in attempts if a.get("kind")), None)
+        current = layer(kind)
+        current["unique_requests"] += 1
         if path.stem in seeded:
             continue
-        attempts = record.get("attempts", [])
         result["http_attempts"] += len(attempts)
         result["http_retries"] += max(0, len(attempts) - 1)
         result["incomplete_or_failed_http_attempts"] += sum(a.get("http_status") != 200 for a in attempts)
+        current["http_attempts"] += len(attempts)
+        current["http_retries"] += max(0, len(attempts) - 1)
+        current["incomplete_or_failed_http_attempts"] += sum(a.get("http_status") != 200 for a in attempts)
+        for attempt in attempts:
+            start, end = attempt.get("started_unix"), attempt.get("finished_unix")
+            if (_finite_number(start) and _finite_number(end) and end >= start):
+                current["observed_http_seconds"] += end - start
+                current["timed_http_attempts"] += 1
         if "response" in record:
             result["successful_http_requests"] += 1
+            current["successful_http_requests"] += 1
             usage = record["response"].get("usage", {})
             if not isinstance(usage, dict) or not usage:
                 result["missing_usage_responses"] += 1
+                current["missing_usage_responses"] += 1
                 usage = {}
             for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
                 result[key] += int(usage.get(key, 0) or 0)
+                current[key] += int(usage.get(key, 0) or 0)
     result["requests_by_stage"] = dict(stages)
+    result["by_kind"] = by_kind
+    result["reasoning_logical_calls"] = by_kind.get("llm", {}).get("logical_calls", 0)
+    result["reader_logical_calls"] = by_kind.get("reader", {}).get("logical_calls", 0)
+    result["physical_llm_attempts"] = by_kind.get("llm", {}).get("http_attempts", 0)
+    result["physical_reader_attempts"] = by_kind.get("reader", {}).get("http_attempts", 0)
+    result["layer_scope"] = "logical invocations include cache replay; physical attempts/usage exclude seeded old requests; reasoning and reader are separate"
     result["token_usage_complete"] = not any(result[k] for k in ("missing_usage_responses", "incomplete_or_failed_http_attempts", "malformed_request_records"))
     return result
+
+
+def _finite_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
 def original_question(q, resources, calls, e):
@@ -525,7 +571,14 @@ def native_worker(connection, dataset, arm, config):
                 row = original_question(generation_question, question_resources, calls, e)
             else:
                 from dagbt.engine import run_question
-                row = run_question(generation_question, question_resources, calls, e.CONFIG, method=arm)
+                if dataset == "personamem":
+                    # Only the current request reaches fusion planning/evidence;
+                    # the final MCQ reader receives the original public options.
+                    fusion_question = {"id": q["id"], "question": q["user_question"]}
+                    row = run_question(fusion_question, question_resources, calls, e.CONFIG,
+                                       method=arm, reader_question=q["question"])
+                else:
+                    row = run_question(generation_question, question_resources, calls, e.CONFIG, method=arm)
             if memory_scopes is not None:
                 from dagbt.personamem import parse_choice
                 row.setdefault("diagnostics", {})["memory_scope"] = {
@@ -718,38 +771,99 @@ def all_terminal(output, scopes, arms):
 
 def total_cost(output, dataset, arm):
     numeric = Counter()
+    layers = {}
     for attempt in (Path(output) / dataset / arm / "attempts").glob("*/attempt-*"):
-        for key, value in request_cost(attempt).items():
-            if isinstance(value, (int, float)) and not isinstance(value, bool):
+        cost = request_cost(attempt)
+        for key, value in cost.items():
+            if _finite_number(value):
                 numeric[key] += value
+        for kind, values in cost["by_kind"].items():
+            layers.setdefault(kind, Counter()).update(values)
     result = dict(numeric)
+    result["by_kind"] = {kind: dict(values) for kind, values in layers.items()}
     result["token_usage_complete"] = not any(result.get(k, 0) for k in ("missing_usage_responses", "incomplete_or_failed_http_attempts", "malformed_request_records"))
     result["token_scope"] = "observed successful responses only; incomplete usage means token totals are lower bounds, not zero cost"
     return result
 
 
-def module_metrics(row, label, dataset, output):
-    """Gold-based discovery metrics and model/structural diagnostics stay distinct."""
+def current_diagnostics(row, output):
+    """Recover only a failed current row's latest snapshot, never old outcomes."""
     diag = row.get("diagnostics", {})
-    if row.get("attempt_directories") and (not diag or
-            (row.get("answer", {}).get("status") != "ok" and "reliability" not in diag)):
+    diag = dict(diag) if isinstance(diag, dict) else {}
+    if row.get("answer", {}).get("status") != "ok" and row.get("attempt_directories"):
         partial = Path(output) / row["attempt_directories"][-1] / "fusion_partial.json"
         if partial.is_file():
             snapshot = load(partial)
             snapshot_diag = snapshot.get("diagnostics", {})
             snapshot_diag = snapshot_diag if isinstance(snapshot_diag, dict) else {}
-            snapshot_reliability = snapshot_diag.get("reliability", snapshot.get("reliability"))
             if not diag:
                 diag = {**snapshot, **snapshot_diag, "candidate_doc_ids": snapshot.get("candidates", []),
                         "support_graph": {"nodes": snapshot.get("nodes", [])}}
-                if row.get("answer", {}).get("status") == "ok":
-                    diag.pop("reliability", None)
-            if row.get("answer", {}).get("status") != "ok" and isinstance(snapshot_reliability, dict):
-                diag = {**diag, "reliability": snapshot_reliability}
+            for name in ("reliability", "semantic_evidence"):
+                value = snapshot_diag.get(name, snapshot.get(name))
+                if name not in diag and isinstance(value, dict):
+                    diag[name] = value
+            for name in ("reasoning_call_count", "evidence_logical_calls", "reader_logical_calls",
+                         "budgeted_llm_attempts", "budgeted_reader_attempts"):
+                value = snapshot_diag.get(name, snapshot.get(name))
+                if name not in diag and _finite_number(value):
+                    diag[name] = value
+    return diag
+
+
+def normalized_semantic_evidence(diag):
+    """Evidence/coverage are independent of transport protocol reliability."""
+    source = diag.get("semantic_evidence")
+    result = dict(source) if isinstance(source, dict) else {}
+    state = result.get("evidence_state", "unknown")
+    if state not in EVIDENCE_STATES:
+        state = "unknown"
+    selection_unknown = (state == "unknown" and "evidence_state" in result
+                         or result.get("phase") == "selection_pending")
+    if selection_unknown:
+        state = "unknown"
+    keys = ("selected_doc_ids", "selected_mapped_doc_ids", "selected_raw_only_doc_ids")
+    if all(isinstance(result.get(key), list) for key in keys):
+        selected, mapped, raw = (set(result[key]) for key in keys)
+        if mapped.isdisjoint(raw) and selected == mapped | raw:
+            if not selection_unknown:
+                state = "mixed" if mapped and raw else "mapped_only" if mapped else "raw_only" if raw else "empty_context"
+        else:
+            state = "unknown"
+            result["state_integrity"] = "selected evidence lists do not form a disjoint complete partition"
+    result["evidence_state"] = state
+    complete = result.get("coverage_validation_complete")
+    unassessed = result.get("unassessed_requirement_ids")
+    if complete is False or bool(unassessed):
+        coverage = "unassessed"
+    elif complete is True:
+        coverage = "complete"
+    else:
+        coverage = "unknown"
+    result["coverage_state"] = coverage
+    for name in ("evidence_logical_calls", "reader_logical_calls", "budgeted_llm_attempts", "budgeted_reader_attempts"):
+        # Authoritative per-run counters, never sums of copied event snapshots.
+        if name not in result and _finite_number(diag.get(name)):
+            result[name] = diag[name]
+    if _finite_number(diag.get("reasoning_call_count")):
+        # A selection-progress snapshot can predate the failed HTTP request.
+        # The current engine counter includes that attempted logical call.
+        result["evidence_logical_calls"] = diag["reasoning_call_count"]
+    return result
+
+
+def normalized_reliability(diag):
     reliability = diag.get("reliability")
     reliability = dict(reliability) if isinstance(reliability, dict) else {}
     if reliability.get("cohort") not in RELIABILITY_COHORTS:
         reliability["cohort"] = "unknown"
+    return reliability
+
+
+def module_metrics(row, label, dataset, output):
+    """Gold-based discovery metrics and model/structural diagnostics stay distinct."""
+    diag = current_diagnostics(row, output)
+    reliability = normalized_reliability(diag)
     candidates = diag.get("candidate_doc_ids")
     def group_recall(ids):
         if dataset == "personamem":
@@ -791,6 +905,7 @@ def module_metrics(row, label, dataset, output):
             "set_score_count": ledger.get("set_score", 0 if "set_score" in metered_limits or "retrieval_query_count" in diag else None),
             "ledger_used": ledger,
             "reliability": reliability,
+            "semantic_evidence": normalized_semantic_evidence(diag),
             "interpretation": ("PersonaMem has no gold document support labels; gold_* metrics are unavailable. "
                                "Model/structural statuses do not prove semantic correctness." if dataset == "personamem" else
                                "gold_* uses held-out title-group labels after generation; model/structural statuses and complete_required do not prove semantic entailment")}
@@ -811,6 +926,30 @@ def summarize_modules(rows):
 
 
 RELIABILITY_COHORTS = ("normal", "truncated", "partially_mapped", "truncated_and_partially_mapped", "unknown")
+EVIDENCE_STATES = ("empty_context", "mapped_only", "raw_only", "mixed", "unknown")
+COVERAGE_STATES = ("complete", "unassessed", "unknown")
+
+
+def latest_cost_statistics(rows):
+    """Top-level metrics retain their schema; named layers use dotted paths."""
+    def numeric_paths(value, prefix=""):
+        result = {}
+        for key, item in value.items():
+            name = prefix + key
+            if _finite_number(item):
+                result[name] = item
+            elif isinstance(item, dict) and (prefix or key == "by_kind"):
+                result.update(numeric_paths(item, name + "."))
+        return result
+    observed = [r.get("latest_attempt_cost") for r in rows]
+    values = [numeric_paths(cost) if isinstance(cost, dict) else {} for cost in observed]
+    metrics = {}
+    for key in sorted({key for cost in values for key in cost}):
+        numbers = [cost[key] for cost in values if key in cost]
+        metrics[key] = {"observed_tasks": len(numbers), "missing_tasks": len(rows) - len(numbers),
+                        "sum": sum(numbers), "mean": sum(numbers) / len(numbers)}
+    return {"observed_tasks": sum(isinstance(cost, dict) for cost in observed),
+            "missing_tasks": sum(not isinstance(cost, dict) for cost in observed), "metrics": metrics}
 
 
 def summarize_reliability(rows, answer_metric):
@@ -819,20 +958,6 @@ def summarize_reliability(rows, answer_metric):
     Costs here describe each row's latest attempt. Historical failed attempts
     remain in cost_all_attempts, never in a success cohort after a retry.
     """
-    def costs(subset):
-        observed = [r.get("latest_attempt_cost") for r in subset]
-        keys = sorted({key for cost in observed if isinstance(cost, dict)
-                       for key, value in cost.items()
-                       if isinstance(value, (int, float)) and not isinstance(value, bool)})
-        result = {}
-        for key in keys:
-            values = [cost[key] for cost in observed if isinstance(cost, dict)
-                      and isinstance(cost.get(key), (int, float)) and not isinstance(cost[key], bool)]
-            result[key] = {"observed_tasks": len(values), "missing_tasks": len(subset) - len(values),
-                           "sum": sum(values), "mean": sum(values) / len(values) if values else None}
-        return {"observed_tasks": sum(isinstance(cost, dict) for cost in observed),
-                "missing_tasks": sum(not isinstance(cost, dict) for cost in observed), "metrics": result}
-
     groups = {}
     for cohort in RELIABILITY_COHORTS:
         subset = [r for r in rows if r["valid"] and
@@ -840,12 +965,56 @@ def summarize_reliability(rows, answer_metric):
         correct = sum(r[answer_metric] == 1 for r in subset)
         groups[cohort] = {"tasks": len(subset), "correct": correct,
                           answer_metric: correct / len(subset) if subset else None,
-                          "cost_latest_attempt": costs(subset)}
+                          "cost_latest_attempt": latest_cost_statistics(subset)}
     failed = [r for r in rows if not r["valid"]]
     return {"answer_metric": answer_metric, "completion_cohorts": groups,
-            "failed_tasks": len(failed), "failure_cost_latest_attempt": costs(failed),
+            "failed_tasks": len(failed), "failure_cost_latest_attempt": latest_cost_statistics(failed),
             "scope": "current authoritative task rows; cohorts contain successful answers only; costs use latest attempts; all retry costs remain in cost_all_attempts",
             "interpretation": "Cohorts contain different questions; their accuracies and costs are descriptive, not evidence of a causal benefit from truncation or partial mapping."}
+
+
+def summarize_semantic_evidence(rows, answer_metric=None):
+    """Current outcomes only; labels are optional for read-only live diagnostics."""
+    def semantic(row):
+        return row.get("modules", {}).get("semantic_evidence", {})
+    def group(subset):
+        result = {"tasks": len(subset), "cost_latest_attempt": latest_cost_statistics(subset)}
+        if answer_metric is not None:
+            correct = sum(r[answer_metric] == 1 for r in subset)
+            result.update(correct=correct)
+            result[answer_metric] = correct / len(subset) if subset else None
+        return result
+    def counts(subset, key, names):
+        return {name: sum(semantic(row).get(key, "unknown") == name for row in subset) for name in names}
+    successful = [r for r in rows if r["valid"]]
+    failed = [r for r in rows if not r["valid"]]
+    evidence_groups = {state: group([r for r in successful if semantic(r).get("evidence_state", "unknown") == state])
+                       for state in EVIDENCE_STATES}
+    coverage_groups = {state: group([r for r in successful if semantic(r).get("coverage_state", "unknown") == state])
+                       for state in COVERAGE_STATES}
+    cross_counts = Counter((r.get("modules", {}).get("reliability", {}).get("cohort", "unknown"),
+                            semantic(r).get("evidence_state", "unknown"),
+                            semantic(r).get("coverage_state", "unknown")) for r in successful)
+    numeric = {}
+    for name in ("baseline_retention_ratio", "evidence_logical_calls", "reader_logical_calls",
+                 "budgeted_llm_attempts", "budgeted_reader_attempts"):
+        values = [semantic(r)[name] for r in rows if _finite_number(semantic(r).get(name))]
+        numeric[name] = {"observed_tasks": len(values), "missing_tasks": len(rows) - len(values),
+                         "sum": sum(values), "mean": sum(values) / len(values) if values else None}
+    return {"answer_metric": answer_metric, "completion_cohorts": evidence_groups,
+            "coverage_completion_cohorts": coverage_groups,
+            "all_task_evidence_state_counts": counts(rows, "evidence_state", EVIDENCE_STATES),
+            "all_task_coverage_state_counts": counts(rows, "coverage_state", COVERAGE_STATES),
+            "failed_tasks": len(failed),
+            "failed_evidence_state_counts": counts(failed, "evidence_state", EVIDENCE_STATES),
+            "failed_coverage_state_counts": counts(failed, "coverage_state", COVERAGE_STATES),
+            "failure_cost_latest_attempt": latest_cost_statistics(failed),
+            "successful_reliability_evidence_coverage_counts": [
+                {"reliability": cohort, "evidence_state": evidence, "coverage_state": coverage, "tasks": count}
+                for (cohort, evidence, coverage), count in sorted(cross_counts.items())],
+            "current_task_diagnostic_metrics": numeric,
+            "scope": "current authoritative task rows only; latest failed partial snapshot may enrich missing diagnostics; live events and historical attempt results are not additional outcomes",
+            "interpretation": "Protocol normality, semantic evidence composition and coverage validation are independent. Complete coverage validation does not prove that evidence is sufficient or the answer is correct. Cohort comparisons are descriptive, not causal."}
 
 
 def paired_bootstrap_interval(differences, *, replicates=1000, seed=20260918):
@@ -985,6 +1154,7 @@ def score_all(output, scopes, arms, *, label_loader=None):
                 "common_success_metrics_percent": {k: 100 * sum(all_scores[arm][u][k] for u in common) / len(common) for k in metric_names} if common else None,
                 "module_metrics": summarize_modules(rows),
                 "reliability": summarize_reliability(rows, answer_metric),
+                "semantic_evidence": summarize_semantic_evidence(rows, answer_metric),
                 "cost_all_attempts": total_cost(output, dataset, arm)}
             if is_personamem:
                 persona_scores = {}
@@ -1141,6 +1311,51 @@ def status(output):
             "log": str(output / "launcher.log")}
 
 
+def diagnostics(output):
+    """Read current outcomes without scoring, reading labels or changing files."""
+    output = Path(output)
+    report = {"output": str(output), **status(output), "datasets": {},
+              "labels_read": False, "answer_accuracy_available": False,
+              "scope": "manifest question IDs and current rows only; no historical result/event replay"}
+    manifest_path = output / "manifest.json"
+    if not manifest_path.is_file():
+        return {**report, "state": "no_manifest", "note": "No run manifest found; no experiment was started."}
+    manifest = load(manifest_path)
+    for dataset in manifest.get("datasets", []):
+        units = manifest.get("question_ids", {}).get(dataset, [])
+        if len(set(units)) != len(units):
+            raise ValueError("Duplicate manifest question IDs")
+        dataset_report = {}
+        for arm in manifest.get("arms", []):
+            rows, invalid = [], []
+            for unit in units:
+                path = result_path(output, dataset, arm, unit)
+                if not path.is_file():
+                    continue
+                try:
+                    row = validate_result(load(path), unit)
+                except (ValueError, KeyError, TypeError) as exc:
+                    invalid.append({"unit_id": unit, "path": str(path.relative_to(output)), **redacted_error(exc)})
+                    continue
+                diag = current_diagnostics(row, output)
+                rows.append({"unit_id": unit, "valid": row["answer"]["status"] == "ok",
+                             "answer_status": row["answer"]["status"],
+                             "latest_attempt_cost": row.get("runner", {}).get("cost"),
+                             "modules": {"reliability": normalized_reliability(diag),
+                                         "semantic_evidence": normalized_semantic_evidence(diag)}})
+            dataset_report[arm] = {
+                "expected_tasks": len(units), "current_tasks": len(rows),
+                "pending_or_invalid_tasks": len(units) - len(rows), "invalid_current_rows": invalid,
+                "answer_status_counts": dict(Counter(r["answer_status"] for r in rows)),
+                "successful_reliability_counts": {cohort: sum(r["valid"] and
+                    r["modules"]["reliability"]["cohort"] == cohort for r in rows) for cohort in RELIABILITY_COHORTS},
+                "semantic_evidence": summarize_semantic_evidence(rows),
+                "cost_latest_attempt": latest_cost_statistics(rows),
+                "cost_all_attempts": total_cost(output, dataset, arm)}
+        report["datasets"][dataset] = dataset_report
+    return report
+
+
 def stop(output):
     output = Path(output).resolve()
     info = status(output)
@@ -1195,7 +1410,7 @@ def main(argv=None):
             command.add_argument("--arms", nargs="+", default=["original", "fusion"])
             command.add_argument("--limit", type=int)
             command.add_argument("--retry-failed", action="store_true")
-    for name in ("status", "stop"):
+    for name in ("status", "stop", "diagnostics"):
         command = sub.add_parser(name)
         command.add_argument("--output", required=True)
     command = sub.add_parser("prepare-index", help="build/resume BT-profile corpus embeddings without running question generation")
@@ -1223,6 +1438,8 @@ def main(argv=None):
                 result = {d: inspect_index(config, d) for d in args.datasets}
         elif args.command == "stop":
             result = stop(args.output)
+        elif args.command == "diagnostics":
+            result = diagnostics(args.output)
         else:
             result = status(args.output)
         print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)

@@ -8,6 +8,8 @@ DEFAULTS = {
     'reserved_gap_ann_calls': 2, 'reserved_audit_calls': 1,
     'json_repairs': 6, 'max_repairs_per_request': 2,
     'response_format': 'plain', 'input_margin': 256,
+    'selection_review': True, 'raw_memory_review': True, 'allow_unassessed_coverage': True,
+    'final_selection_calls': 3, 'reserved_selection_repairs': 2,
     'max_initial_nodes': 6, 'max_refinement_nodes': 2,
     'max_alternatives': 2, 'max_enumeration_states': 10000,
     'initial_width': 12, 'proposal_width': 4, 'pair_rescue_width': 4,
@@ -28,6 +30,8 @@ METHODS = {
     'dense_dependency': {'retrieval': 'dense'},
     'bt_flat': {'selection': 'flat'},
     'dense_flat': {'retrieval': 'dense', 'selection': 'flat'},
+    'fusion_no_raw_review': {'raw_memory_review': False},
+    'fusion_strict_coverage': {'allow_unassessed_coverage': False},
     'fusion_no_conditions': {'condition_audit': False},
     'fusion_single_support': {'allow_alternatives': False},
     'fusion_no_invalidation': {'invalidation': False},
@@ -53,10 +57,11 @@ def resolve(config, method='fusion'):
         if not isinstance(result[name], int) or isinstance(result[name], bool) or result[name] < 1:
             raise ValueError(f'{name} must be positive integer')
     for name in ('reserved_gap_ann_calls','reserved_audit_calls','max_refinement_nodes',
-                 'max_feedback_rounds','json_repairs','max_repairs_per_request','input_margin','pair_rescue_width'):
+                 'max_feedback_rounds','json_repairs','max_repairs_per_request','input_margin','pair_rescue_width',
+                 'final_selection_calls','reserved_selection_repairs'):
         if not isinstance(result[name], int) or isinstance(result[name], bool) or result[name] < 0:
             raise ValueError(f'{name} must be nonnegative integer')
-    for name in ('condition_audit','allow_alternatives','invalidation','refinement','reader_chain','navigation_closure'):
+    for name in ('condition_audit','allow_alternatives','invalidation','refinement','reader_chain','navigation_closure','selection_review','raw_memory_review','allow_unassessed_coverage'):
         if not isinstance(result[name], bool):
             raise ValueError(f'{name} must be boolean')
     if result['selection'] not in ('dependency','flat') or result['retrieval'] not in ('bridge','dense'):
@@ -84,7 +89,16 @@ def resolve(config, method='fusion'):
         raise ValueError('At most two support alternatives per node')
     if result['reserved_gap_ann_calls'] >= result['ann_calls']:
         raise ValueError('ANN gap reservation leaves no discovery budget')
-    final_calls = result['reserved_audit_calls'] + int(result['selection'] == 'flat')
+    if not result['selection_review']:
+        result['final_selection_calls'] = int(result['selection'] == 'flat')
+        result['reserved_selection_repairs'] = 0
+    elif result['final_selection_calls'] < 1:
+        raise ValueError('selection_review requires a final selection call reservation')
+    if 'reserved_selection_repairs' not in supplied:
+        result['reserved_selection_repairs'] = min(result['reserved_selection_repairs'], result['json_repairs'])
+    if result['reserved_selection_repairs'] > result['json_repairs']:
+        raise ValueError('Selection repair reservation exceeds global repair budget')
+    final_calls = result['reserved_audit_calls'] + result['final_selection_calls']
     if final_calls >= result['llm_calls']:
         raise ValueError('LLM audit/selection reservation leaves no reasoning budget')
     if result['reasoning_output_tokens'] + result['input_margin'] + 8 >= result['context_tokens']:

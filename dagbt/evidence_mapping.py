@@ -304,7 +304,7 @@ class EvidenceMapper:
             raise ValueError("remaining_nodes must be a positive integer")
         e, s = self.engine, self.engine.s
         self._sync_chunks()
-        reserve = s["reserved_audit_calls"] + int(s["selection"] == "flat") + remaining_nodes
+        reserve = s["reserved_audit_calls"] + s.get('final_selection_calls', int(s['selection'] == 'flat')) + remaining_nodes
         available = max(0, e.ledger.remaining("llm") - reserve)
         quota = max(1, available // remaining_nodes) if available else 0
         max_attempts = 1 + s.get("max_repairs_per_request", 2)
@@ -350,7 +350,7 @@ class EvidenceMapper:
             if not batch:
                 continue
             retry = any(self.attempts[u, n] for u in batch for n in targets[u])
-            if retry and e.ledger.remaining("json_repairs") < 1:
+            if retry and e.ledger.remaining("json_repairs") <= s.get("reserved_selection_repairs", 0):
                 for u in batch:
                     self._unavailable(u, targets[u], "global_repair_budget")
                 continue
@@ -378,7 +378,9 @@ class EvidenceMapper:
                 e.reasoner.request("map_repair" if retry else "map", prompts.MAP, payload,
                     lambda raw: self._validate(raw, batch, targets, visible), self.schema,
                     reserve=0, extra_reserve=reserve)
-            except BudgetExceeded:
+            except BudgetExceeded as exc:
+                e.event({'event':'mapping_budget_exhausted','unit_ids':batch,'error_type':type(exc).__name__,
+                         'error':str(exc),'remaining_llm':e.ledger.remaining('llm'),'downstream_reserve':reserve})
                 break
             except ProtocolError as exc:
                 error = {"stage": "map", "unit_ids": list(batch), "type": type(exc).__name__,
@@ -391,6 +393,7 @@ class EvidenceMapper:
                 if exc.category == "refusal":
                     for u in remaining:
                         self._unavailable(u, targets[u], "refusal")
+                    raise
                 elif remaining:
                     for u in list(remaining):
                         exhausted = {n for n in self._missing(u) & targets[u] if self.attempts[u, n] >= max_attempts}

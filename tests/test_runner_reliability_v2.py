@@ -58,7 +58,7 @@ def test_real_engine_failure_snapshot_reliability_reaches_runner_metrics(setup, 
     snapshot = r.load(calls.output / "fusion_partial.json")
     assert "reliability" not in snapshot
     expected = snapshot["diagnostics"]["reliability"]
-    assert expected["version"] == "dagbt_fusion_reliability_v2"
+    assert expected["version"] == "dagbt_fusion_reliability_v3"
     result = r.failure_row(question, RuntimeError("synthetic reader failure"))
     result["attempt_directories"] = ["latest"]
     actual = r.module_metrics(result, {"gold_groups": [["a"]]}, "hotpotqa", tmp_path)
