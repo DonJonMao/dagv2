@@ -63,6 +63,8 @@ def make_corpus(runtime, mode='switch'):
         doc_id, f'Unrelated catalogue entry {doc_id}.')) for doc_id in ids}
     if mode == 'primary_supported':
         documents['chen'] = runtime.e.Document('chen', '', TEXTS['chen'] + '\n' + PRIMARY_SUPPORT)
+    elif mode in ('joint_judge', 'invalid_primary_quote'):
+        documents['binding'] = runtime.e.Document('binding', '', CO_SUPPORT)
     elif mode == 'legal_multivalue':
         for doc_id in ('chen', 'lin'):
             documents[doc_id] = runtime.e.Document(doc_id, '', TEXTS[doc_id] + '\n' + CO_SUPPORT)
@@ -128,6 +130,12 @@ def completion_value(payload, mode='switch'):
     prompt = payload['prompt']
     schema = payload['structured_outputs']['json']['properties']
     if 'candidates' in schema and 'answer' not in schema:
+        if mode in ('joint_judge', 'invalid_primary_quote'):
+            quote = reference(prompt, CO_SUPPORT)
+            primary_quote = {**quote, 'quote': 'Invalid primary citation.'} if mode == 'invalid_primary_quote' else quote
+            return {'legal_multivalue': True, 'candidates': [
+                {'id': 'h1', 'assessments': [assessment('supported', [primary_quote])]},
+                {'id': 'h2', 'assessments': [assessment('supported', [quote])]}]}
         quote = reference(prompt, BINDING)
         primary = 'contradicted' if mode in ('switch', 'contra_without_alt') else 'unknown'
         alternative = 'supported' if mode in ('switch', 'quote_invalid') else 'unknown'
@@ -153,6 +161,9 @@ def completion_value(payload, mode='switch'):
             result['candidates'] = result['candidates'][:1]
         elif mode == 'invalid_anchor':
             result['candidates'][1]['evidence'][0]['quote'] = 'No passage says this.'
+        elif mode == 'invalid_proposal_assessment':
+            result['candidates'][0]['assessments'] = [assessment('supported',
+                [{'panel_index': 0, 'quote': 'No passage says this.'}])]
         elif mode == 'primary_supported':
             result['candidates'][0]['assessments'] = [assessment('supported',
                 [reference(prompt, PRIMARY_SUPPORT)])]
@@ -204,7 +215,8 @@ def execute(runtime, tokenizer, mode='switch', node_count=2):
 
 
 @pytest.mark.parametrize('mode,reason', [
-    ('single', 'no_competing_candidate'), ('invalid_anchor', 'no_competing_candidate'),
+    ('single', 'no_competing_candidate'), ('invalid_anchor', 'proposal_protocol_invalid'),
+    ('invalid_proposal_assessment', 'proposal_protocol_invalid'),
     ('primary_supported', 'primary_supported'), ('legal_multivalue', 'legal_multivalue')])
 def test_no_unresolved_sourced_competition_spends_no_optional_requests(
         frozen_runtime, real_tokenizer, mode, reason):
@@ -269,7 +281,29 @@ def test_uncertain_or_failed_optional_clarification_preserves_primary_path(
     elif mode == 'judge_length':
         assert ranking['trace'][0]['clarify']['status'] == 'failed'
     elif mode == 'quote_invalid':
-        assert ranking['trace'][0]['clarify']['judgment']['diagnostic_errors']
+        clarify = ranking['trace'][0]['clarify']
+        assert clarify['status'] == 'failed' and clarify['reason'] == 'judge_protocol_invalid'
+        assert not clarify['judgment']['protocol_valid'] and clarify['judgment']['diagnostic_errors']
+
+
+@pytest.mark.parametrize('mode', ['joint_judge', 'invalid_primary_quote'])
+def test_primary_citation_corruption_preserves_jointly_supported_primary_child(
+        frozen_runtime, real_tokenizer, mode):
+    result, calls, _, _ = execute(frozen_runtime, real_tokenizer, mode)
+    first, child = result['ranking']['trace']
+    assert first['state']['answer'] == 'Chen Hai'
+    assert child['query'] == 'In which city was Chen Hai born?'
+    assert len([r for r in calls.requests if tuple(r['stage']) == ('resolve', 'node', '1', 'embedding')]) == 1
+    if mode == 'joint_judge':
+        assert first['clarify']['status'] == 'judged'
+        assert first['binding_decision']['binding_status'] == 'legal_multivalue'
+        assert first['state']['source_doc_ids'] == ['chen', 'binding']
+    else:
+        assert first['clarify']['status'] == 'failed'
+        assert first['clarify']['reason'] == 'judge_protocol_invalid'
+        assert [c['status'] for c in first['clarify']['judgment']['candidates']] == ['invalid', 'supported']
+        assert first['binding_decision']['binding_status'] == 'invalid'
+        assert first['state']['source_doc_ids'] == ['chen']
 
 
 def test_explicit_primary_refutation_without_supported_alternative_uses_origin_unresolved_grounding(

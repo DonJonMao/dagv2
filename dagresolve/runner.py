@@ -17,7 +17,8 @@ from .flow import solve
 from .runtime import DATASETS, ROOT, import_originals, load_runtime, validate_config
 
 
-METRICS = ("f1", "em", "r@5", "r@10", "r@20", "all@5", "all@10", "all@20")
+METRICS = ("f1", "em", "r@5", "r@10", "r@20", "all@5", "all@10", "all@20",
+           "reader_support_recall", "reader_all_support", "reader_context_trim_rate")
 
 
 def code_hashes():
@@ -319,6 +320,11 @@ def evaluate(output, *, dataset=None, config=None):
         import_originals(dataset)
         metrics = importlib.import_module("metrics")
         scored = []
+        def normalized_ids(doc_ids):
+            ids = set(doc_ids)
+            if dataset == "musique":
+                ids = {str(doc) if str(doc).startswith("musique:") else "musique:" + str(doc) for doc in ids}
+            return ids
         for unit in manifest["unit_ids"]:
             row, label = by_unit[unit], labels[unit]
             valid = row["answer"]["status"] == "ok"
@@ -329,22 +335,52 @@ def evaluate(output, *, dataset=None, config=None):
             if not groups or not all(groups):
                 raise ValueError("Invalid evaluation support groups")
             for k in ("5", "10", "20"):
-                ids = set(row["budgets"][k]["selected_doc_ids"])
-                if dataset == "musique":
-                    ids = {str(doc) if str(doc).startswith("musique:") else "musique:" + str(doc) for doc in ids}
+                ids = normalized_ids(row["budgets"][k]["selected_doc_ids"])
                 hits = [bool(ids.intersection(group)) for group in groups]
                 item["r@" + k] = sum(hits) / len(hits)
                 item["all@" + k] = float(all(hits))
+            # The selector's pre-capacity panel is not necessarily the panel
+            # submitted to Reader. Missing panels stay in the full evaluation
+            # denominator with zero recall; answer success is independent of
+            # the recorded input panel and does not change its evidence scope.
+            ranking = row.get("ranking")
+            reader = ranking.get("reader", {}) if isinstance(ranking, dict) else {}
+            reader = reader if isinstance(reader, dict) else {}
+            panel = reader.get("panel_doc_ids")
+            panel_observed = isinstance(panel, list) and all(type(doc) in (str, int) for doc in panel)
+            reader_ids = normalized_ids(panel) if panel_observed else set()
+            reader_available = panel_observed
+            reader_hits = [reader_available and bool(reader_ids.intersection(group)) for group in groups]
+            item["reader_support_recall"] = sum(reader_hits) / len(reader_hits)
+            item["reader_all_support"] = float(all(reader_hits))
+            removed = reader.get("context_removed_doc_ids")
+            trimmed = (isinstance(removed, list) and bool(removed)) or (
+                panel_observed and bool(normalized_ids(row["budgets"]["20"]["selected_doc_ids"]) - reader_ids))
+            item["reader_context_trim_rate"] = float(trimmed)
+            item["reader_panel_observed"] = panel_observed
+            item["reader_evidence_available"] = reader_available
             scored.append(item)
         n = len(scored)
         if not n:
             raise ValueError("Empty evaluation scope")
+        observed_panels = sum(item["reader_panel_observed"] for item in scored)
+        trimmed_panels = sum(item["reader_panel_observed"] and bool(item["reader_context_trim_rate"])
+                             for item in scored)
         summary = {"method": METHOD, "dataset": dataset, "n": n, "scope": manifest["scope"],
                    "invalid_answers": sum(not item["valid"] for item in scored),
                    "answer_status_counts": dict(Counter(row["answer"]["status"] for row in rows)),
                    "metrics_percent": {name: 100 * sum(item[name] for item in scored) / n for name in METRICS},
                    "labels_sha256": file_hash(labels_path), "cost": collect_cost(output)["totals"],
-                   "support_metric": "macro recall of gold title groups; any matching document satisfies a group"}
+                   "support_metric": "selector output before Reader capacity trimming; macro recall of gold title groups; any matching document satisfies a group",
+                   "reader_support_metric": "recorded ranking.reader.panel_doc_ids, independent of answer success; same gold-group rule; missing/malformed panels score zero; a recorded panel does not establish successful model processing",
+                   "reader_evidence_scope": {
+                       "denominator": n,
+                       "panel_observed_rows": observed_panels,
+                       "unavailable_rows": sum(not item["reader_evidence_available"] for item in scored),
+                       "context_trimmed_rows": sum(int(item["reader_context_trim_rate"]) for item in scored),
+                       "observed_panel_trim_rate_denominator": observed_panels,
+                       "observed_panel_trim_rate_percent": 100 * trimmed_panels / observed_panels if observed_panels else None,
+                       "trim_rate_definition": "recorded removals or selector@20 documents absent from the observed Reader panel, divided by all evaluated rows; missing panels alone do not assert trimming"}}
         save(output / "scores.json", scored)
         save(output / "summary.json", summary)
         print(json.dumps(summary, ensure_ascii=False, indent=2))

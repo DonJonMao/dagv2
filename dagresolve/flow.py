@@ -325,7 +325,11 @@ def controller(row, documents, tokenizer, index, calls, runtime):
                                 clarify['response_refs'].append(judged.get('response_ref'))
                                 judgment = protocol.decode_judgment(_choice(judged), proposal, joint, documents)
                                 result = protocol.adopt(proposal, judgment)
-                                clarify.update(status='judged', judgment=judgment)
+                                if judgment['protocol_valid']:
+                                    clarify.update(status='judged', judgment=judgment)
+                                else:
+                                    clarify.update(status='failed', reason='judge_protocol_invalid',
+                                                   judgment=judgment)
                             except Exception as failure:
                                 # Optional retrieval/judgment failure cannot fabricate contradiction.
                                 judgment = protocol.decode_judgment('', proposal, panel, documents)

@@ -102,7 +102,7 @@ def local_runtime(monkeypatch, frozen_runtime, real_tokenizer, endpoint):
         hashes={'scripted_public_corpus': r.digest([ids, [documents[d].passage for d in ids]])})
 
 
-def protect_labels(monkeypatch):
+def protect_labels(monkeypatch, labels=None):
     """Use fictional labels only after the complete-run guard passes."""
     real_load, real_hash = r.load, r.file_hash
     state = {'evaluating': False, 'loads': [], 'integrity': []}
@@ -111,8 +111,9 @@ def protect_labels(monkeypatch):
         if Path(path).name == 'evaluation_only.json':
             assert state['evaluating'], 'Generation attempted to open evaluation labels'
             state['loads'].append(str(path))
-            return [{'id': 'scripted-binding-case', 'answers': ['Suzhou'],
-                     'gold_groups': [['lin', 'binding'], ['lin_birth']]}]
+            return labels if labels is not None else [
+                {'id': 'scripted-binding-case', 'answers': ['Suzhou'],
+                 'gold_groups': [['lin', 'binding'], ['lin_birth']]}]
         return real_load(path)
 
     def file_hash(path):
@@ -261,3 +262,102 @@ def test_unknown_or_malformed_usage_keeps_physical_work_and_marks_cost_incomplet
     assert not cost['token_usage_complete']
     assert all(type(cost[key]) is int and cost[key] >= 0
                for key in ('prompt_tokens', 'completion_tokens', 'total_tokens'))
+
+
+def evaluate_saved_fixture(tmp_path, monkeypatch, frozen_runtime, rows, labels, dataset='hotpotqa'):
+    """Score completed synthetic results without model calls or real labels."""
+    state = protect_labels(monkeypatch, labels)
+    state['evaluating'] = True
+    # Use native answer metrics already imported by frozen_runtime. Dataset
+    # loading is unnecessary for these self-contained, fictional label groups.
+    monkeypatch.setattr(r, 'import_originals', lambda _: frozen_runtime)
+    r.save(tmp_path / 'manifest.json', {'method': r.METHOD, 'dataset': dataset,
+        'unit_ids': [row['unit_id'] for row in rows], 'code_hashes': r.code_hashes(),
+        'scope': 'explicit_subset'})
+    r.save(tmp_path / 'progress.json', {'state': 'complete', 'completed': len(rows)})
+    for row in rows:
+        r.save(r.row_path(tmp_path, row['unit_id']), row)
+    summary = r.evaluate(tmp_path)
+    assert len(state['loads']) == len(state['integrity']) == 1
+    return summary, r.load(tmp_path / 'scores.json')
+
+
+def metric_row(unit, selected, *, panel=None, status='ok', removed=None):
+    row = {'unit_id': unit, 'answer': {'status': status, 'prediction': 'Suzhou'},
+           'budgets': {str(k): {'selected_doc_ids': list(selected)} for k in (5, 10, 20)},
+           'ranking': {}}
+    if panel is not None:
+        row['ranking']['reader'] = {'panel_doc_ids': panel}
+        if removed is not None:
+            row['ranking']['reader']['context_removed_doc_ids'] = removed
+    return row
+
+
+def test_selector_recall_does_not_claim_reader_saw_trimmed_support(
+        tmp_path, monkeypatch, frozen_runtime):
+    row = metric_row('trimmed', ['lin', 'lin_birth'], panel=['lin'], removed=['lin_birth'])
+    labels = [{'id': 'trimmed', 'answers': ['Suzhou'],
+               'gold_groups': [['lin', 'binding'], ['lin_birth']]}]
+    summary, scores = evaluate_saved_fixture(tmp_path, monkeypatch, frozen_runtime, [row], labels)
+    values = summary['metrics_percent']
+    assert values['r@20'] == values['all@20'] == 100
+    assert values['reader_support_recall'] == 50
+    assert values['reader_all_support'] == 0
+    assert values['reader_context_trim_rate'] == 100
+    assert scores[0]['reader_evidence_available']
+    assert summary['reader_evidence_scope']['context_trimmed_rows'] == 1
+    assert 'selector output before Reader capacity trimming' in summary['support_metric']
+
+
+def test_reader_metrics_keep_answer_failures_separate_and_missing_panels_in_denominator(
+        tmp_path, monkeypatch, frozen_runtime):
+    rows = [metric_row('ok', ['lin'], panel=['lin']),
+            metric_row('failed', ['lin', 'filler'], panel=['lin'], status='reader_failed', removed=['filler']),
+            metric_row('missing', ['lin']),
+            metric_row('malformed', ['lin'], panel=[{'lin': True}])]
+    labels = [{'id': row['unit_id'], 'answers': ['Suzhou'], 'gold_groups': [['lin']]}
+              for row in rows]
+    summary, scores = evaluate_saved_fixture(tmp_path, monkeypatch, frozen_runtime, rows, labels)
+    assert summary['n'] == 4 and summary['invalid_answers'] == 1
+    assert summary['metrics_percent']['r@20'] == 100
+    assert summary['metrics_percent']['reader_support_recall'] == 50
+    assert summary['metrics_percent']['reader_all_support'] == 50
+    assert summary['metrics_percent']['reader_context_trim_rate'] == 25
+    assert summary['reader_evidence_scope']['denominator'] == 4
+    assert summary['reader_evidence_scope']['panel_observed_rows'] == 2
+    assert summary['reader_evidence_scope']['unavailable_rows'] == 2
+    assert summary['reader_evidence_scope']['observed_panel_trim_rate_denominator'] == 2
+    assert summary['reader_evidence_scope']['observed_panel_trim_rate_percent'] == 50
+    assert scores[1]['reader_support_recall'] == scores[1]['reader_all_support'] == 1
+    assert not scores[1]['valid']
+    assert all(item['reader_support_recall'] == item['reader_all_support'] == 0 for item in scores[2:])
+
+
+def test_no_reader_panels_scores_zero_without_inventing_a_conditional_trim_rate(
+        tmp_path, monkeypatch, frozen_runtime):
+    rows = [metric_row('missing', ['lin'], status='planner_failed')]
+    labels = [{'id': 'missing', 'answers': ['Suzhou'], 'gold_groups': [['lin']]}]
+    summary, _ = evaluate_saved_fixture(tmp_path, monkeypatch, frozen_runtime, rows, labels)
+    assert summary['metrics_percent']['reader_support_recall'] == 0
+    assert summary['metrics_percent']['reader_all_support'] == 0
+    assert summary['metrics_percent']['reader_context_trim_rate'] == 0
+    assert summary['reader_evidence_scope']['unavailable_rows'] == 1
+    assert summary['reader_evidence_scope']['observed_panel_trim_rate_denominator'] == 0
+    assert summary['reader_evidence_scope']['observed_panel_trim_rate_percent'] is None
+
+
+def test_reader_support_groups_and_trim_comparison_use_musique_normalized_ids(
+        tmp_path, monkeypatch, frozen_runtime):
+    rows = [metric_row('mixed', ['one', 'musique:two'], panel=['musique:one', 'two']),
+            metric_row('trimmed', ['one', 'musique:two'], panel=['musique:one'])]
+    labels = [{'id': row['unit_id'], 'answers': ['Suzhou'],
+               'gold_groups': [['musique:one', 'musique:alternate'], ['musique:two']]}
+              for row in rows]
+    summary, scores = evaluate_saved_fixture(
+        tmp_path, monkeypatch, frozen_runtime, rows, labels, dataset='musique')
+    assert summary['metrics_percent']['r@20'] == summary['metrics_percent']['all@20'] == 100
+    assert summary['metrics_percent']['reader_support_recall'] == 75
+    assert summary['metrics_percent']['reader_all_support'] == 50
+    assert summary['metrics_percent']['reader_context_trim_rate'] == 50
+    assert scores[0]['reader_context_trim_rate'] == 0
+    assert scores[1]['reader_support_recall'] == .5

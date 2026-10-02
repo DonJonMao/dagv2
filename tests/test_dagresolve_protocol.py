@@ -149,7 +149,8 @@ def test_multivalue_flag_without_support_is_not_accepted():
     obj = raw_proposal()
     obj['legal_multivalue'] = True
     proposal = decode(obj)
-    assert proposal['trigger']['eligible']
+    assert not proposal['trigger']['eligible']
+    assert not proposal['protocol_valid']
     assert 'legal_multivalue:not_established' in proposal['diagnostic_errors']
 
 
@@ -216,8 +217,8 @@ def test_one_valid_quote_does_not_rescue_an_invalid_cited_conjunction():
     obj['candidates'][0]['assessments'] = [assessment('supported', [
         ref(0, DOCUMENTS['chen'].passage), ref(1, 'missing part of the proof')])]
     proposal = decode(obj)
-    assert proposal['candidates'][0]['status'] == 'unknown'
-    assert proposal['trigger']['eligible']
+    assert proposal['candidates'][0]['status'] == 'invalid'
+    assert not proposal['trigger']['eligible']
 
 
 @pytest.mark.parametrize('rid,status', [([], 'supported'), ({}, 'supported'), ('r1', []), ('r1', {})])
@@ -225,7 +226,7 @@ def test_malformed_assessment_types_fall_back_instead_of_crashing(rid, status):
     obj = raw_proposal()
     obj['candidates'][0]['assessments'] = [assessment(status, rid=rid)]
     proposal = decode(obj)
-    assert proposal['candidates'][0]['status'] == 'unknown'
+    assert proposal['candidates'][0]['status'] == 'invalid'
     assert proposal['answer'] == 'Chen Hai'
 
 
@@ -250,11 +251,14 @@ def test_candidate_requires_every_necessary_requirement_to_be_supported():
     obj['requirements'].append({**obj['requirements'][0], 'id': 'r2', 'kind': 'identity'})
     obj['candidates'][0]['assessments'] = [assessment('supported', [ref(0, DOCUMENTS['chen'].passage)])]
     proposal = decode(obj)
-    assert proposal['candidates'][0]['status'] == 'unknown'
+    assert proposal['candidates'][0]['status'] == 'invalid'
+    assert not proposal['trigger']['eligible']
 
 
 def test_unknown_primary_supported_alternative_adopts_only_alternative_proof():
-    result = p.adopt(decode(), judgment())
+    judged = judgment()
+    assert judged['protocol_valid'] and judged['candidates'][0]['status'] == 'unknown'
+    result = p.adopt(decode(), judged)
     assert result['answer'] == 'Lin Zhou'
     assert result['sources'] == ['lin', 'new']
     assert 'chen' not in result['sources']
@@ -299,17 +303,19 @@ def test_same_scope_support_and_refutation_is_conflict_without_source_voting():
                                json.dumps({'candidates': [{'id': [], 'assessments': []},
                                                           {'id': 'h2', 'assessments': []}],
                                            'legal_multivalue': False})])
-def test_failed_judge_is_unknown_and_keeps_primary(raw):
+def test_failed_judge_is_invalid_and_keeps_primary(raw):
     proposal = decode()
     result = p.decode_judgment(raw, proposal, PANEL, DOCUMENTS)
-    assert all(c['status'] == 'unknown' for c in result['candidates'])
+    assert not result['protocol_valid']
+    assert all(c['status'] == 'invalid' for c in result['candidates'])
     assert p.adopt(proposal, result)['answer'] == 'Chen Hai'
     assert result['diagnostic_errors']
 
 
 def test_invalid_judge_reference_does_not_prune_unknown_candidate():
     result = judgment('contradicted', 'unknown', evidence=[ref(99, 'not displayed')])
-    assert result['candidates'][0]['status'] == 'unknown'
+    assert result['candidates'][0]['status'] == 'invalid'
+    assert not result['protocol_valid']
     assert p.adopt(decode(), result)['answer'] == 'Chen Hai'
 
 
@@ -320,6 +326,91 @@ def test_jointly_supported_judgment_keeps_primary_without_forcing_uniqueness():
     assert p.adopt(decode(), result)['answer'] == 'Chen Hai'
     assert p.adopt(decode(), result)['binding_status'] == 'legal_multivalue'
     assert p.adopt(decode(), result)['sources'] == ['chen', 'co']
+
+
+def test_invalid_primary_quote_cannot_turn_joint_support_into_a_switch():
+    proposal = decode()
+    panel = PANEL + ['co']
+    values = [{'id': cid, 'assessments': [assessment('supported',
+              [ref(2, DOCUMENTS['co'].passage)])]} for cid in ('h1', 'h2')]
+    obj = {'candidates': values, 'legal_multivalue': True}
+    valid = p.decode_judgment(json.dumps(obj), proposal, panel, DOCUMENTS)
+    assert valid['protocol_valid'] and valid['legal_multivalue']
+    assert p.adopt(proposal, valid)['selected_candidate_id'] == 'h1'
+
+    # Only the citation changes; candidates, labels and raw text remain fixed.
+    obj['candidates'][0]['assessments'][0]['evidence'][0]['quote'] = 'not in the source'
+    invalid = p.decode_judgment(json.dumps(obj), proposal, panel, DOCUMENTS)
+    assert [c['status'] for c in invalid['candidates']] == ['invalid', 'supported']
+    assert not invalid['protocol_valid']
+    assert 'h1:quote_not_in_passage' in invalid['diagnostic_errors']
+    assert 'judge:legal_multivalue_not_established' in invalid['diagnostic_errors']
+    adopted = p.adopt(proposal, invalid)
+    assert adopted['answer'] == proposal['answer']
+    assert adopted['sources'] == proposal['sources']
+    assert adopted['binding_status'] == 'invalid'
+    assert adopted['decision_reason'] == 'judge_protocol_invalid'
+    assert adopted['selected_candidate_id'] == 'h1'
+    assert not adopted['unexcluded_competitor']
+
+
+@pytest.mark.parametrize('first,second,broken', [
+    ('unknown', 'supported', 'h1'),
+    ('contradicted', 'unknown', 'h2'),
+    ('supported', 'unknown', 'h2'),
+])
+@pytest.mark.parametrize('failure', ['quote', 'missing', 'structure'])
+def test_any_invalid_candidate_preserves_primary_without_partial_judge_proof(
+        first, second, broken, failure):
+    proposal = decode()
+    panel = PANEL + ['new']
+    values = [{'id': cid, 'assessments': [assessment(status,
+              [] if status == 'unknown' else [ref(2, DOCUMENTS['new'].passage)])]}
+              for cid, status in (('h1', first), ('h2', second))]
+    target = next(c for c in values if c['id'] == broken)
+    if failure == 'quote':
+        target['assessments'][0]['evidence'] = [ref(2, 'not in the source')]
+    elif failure == 'missing':
+        target['assessments'] = []
+    else:
+        target['assessments'][0]['status'] = []
+    result = p.decode_judgment(json.dumps({'candidates': values, 'legal_multivalue': False}),
+                               proposal, panel, DOCUMENTS)
+    assert not result['protocol_valid']
+    assert next(c for c in result['candidates'] if c['id'] == broken)['status'] == 'invalid'
+    adopted = p.adopt(proposal, result)
+    assert adopted['answer'] == proposal['answer'] and adopted['sources'] == proposal['sources']
+    assert adopted['binding_status'] == 'invalid' and adopted['selected_candidate_id'] == 'h1'
+
+
+def test_unestablished_multivalue_flag_invalidates_otherwise_legal_unknown_judgment():
+    proposal = decode()
+    panel = PANEL + ['new']
+    obj = {'legal_multivalue': True, 'candidates': [
+        {'id': 'h1', 'assessments': [assessment()]},
+        {'id': 'h2', 'assessments': [assessment('supported', [ref(2, DOCUMENTS['new'].passage)])]}]}
+    judged = p.decode_judgment(json.dumps(obj), proposal, panel, DOCUMENTS)
+    assert not judged['protocol_valid']
+    assert p.adopt(proposal, judged)['sources'] == proposal['sources']
+    assert p.adopt(proposal, judged)['answer'] == 'Chen Hai'
+
+
+def test_missing_one_of_multiple_requirements_is_invalid_not_semantic_unknown():
+    obj = raw_proposal()
+    obj['requirements'].append({**obj['requirements'][0], 'id': 'r2', 'kind': 'identity'})
+    for candidate in obj['candidates']:
+        candidate['assessments'].append(assessment(rid='r2'))
+    proposal = decode(obj)
+    panel = PANEL + ['new']
+    values = [
+        {'id': 'h1', 'assessments': [assessment()]},
+        {'id': 'h2', 'assessments': [assessment('supported', [ref(2, DOCUMENTS['new'].passage)], rid)
+                                    for rid in ('r1', 'r2')]}]
+    judged = p.decode_judgment(json.dumps({'candidates': values, 'legal_multivalue': False}),
+                               proposal, panel, DOCUMENTS)
+    assert not judged['protocol_valid']
+    assert 'h1:missing_assessment:r2' in judged['diagnostic_errors']
+    assert p.adopt(proposal, judged)['answer'] == 'Chen Hai'
 
 
 def test_prompts_keep_original_task_raw_text_and_semantic_unknown_guard():

@@ -180,21 +180,26 @@ def _assessments(values, requirements, panel, documents, errors, label):
         previous_errors = len(errors)
         evidence = _references(value['evidence'], panel, documents, errors, label)
         status = value['status']
-        if status != 'unknown' and len(errors) != previous_errors:
-            # A missing piece of a cited conjunction cannot be silently discarded.
-            status = 'unknown'
+        if len(errors) != previous_errors:
+            # Protocol failure is not semantic absence of evidence, even for unknown.
+            status = 'invalid'
         if status in ('supported', 'contradicted') and not evidence:
             errors.append(label + ':label_without_evidence')
-            status = 'unknown'
+            status = 'invalid'
         if status == 'conflict' and len(evidence) < 2:
             errors.append(label + ':conflict_without_two_references')
-            status = 'unknown'
+            status = 'invalid'
         groups[value['requirement_id']].append({'status': status, 'evidence': evidence})
     assessments = []
     for requirement in requirements:
         records = groups[requirement['id']]
         labels = {r['status'] for r in records}
-        if 'conflict' in labels or {'supported', 'contradicted'} <= labels:
+        if not records:
+            errors.append(label + ':missing_assessment:' + requirement['id'])
+            status = 'invalid'
+        elif 'invalid' in labels:
+            status = 'invalid'
+        elif 'conflict' in labels or {'supported', 'contradicted'} <= labels:
             status = 'conflict'
         elif 'contradicted' in labels:
             status = 'contradicted'
@@ -204,7 +209,7 @@ def _assessments(values, requirements, panel, documents, errors, label):
             status = 'unknown'
         evidence, seen = [], set()
         for record in records:
-            if record['status'] == 'unknown':
+            if record['status'] in ('unknown', 'invalid'):
                 continue
             for reference in record['evidence']:
                 key = (reference['doc_id'], reference['start'], reference['end'])
@@ -219,6 +224,8 @@ def _status(assessments):
     labels = {a['status'] for a in assessments}
     if not assessments:
         return 'unknown'
+    if 'invalid' in labels:
+        return 'invalid'
     if 'conflict' in labels:
         return 'conflict'
     if 'contradicted' in labels:
@@ -266,9 +273,12 @@ def decode_proposal(raw, panel, documents, question):
         if not anchors or not any(value['name_quote'] in e['quote'] for e in anchors):
             errors.append(value['id'] + ':name_not_in_anchor')
             continue
+        previous_errors = len(errors)
         assessments = _assessments(value['assessments'], requirements, panel, documents, errors, value['id'])
+        assessment_valid = len(errors) == previous_errors
         candidates.append({**value, 'evidence': anchors, 'assessments': assessments,
-                           'status': _status(assessments), 'support_doc_ids': _support_ids(assessments)})
+                           'status': _status(assessments) if assessment_valid else 'invalid',
+                           'support_doc_ids': _support_ids(assessments) if assessment_valid else []})
         seen_ids.add(value['id'])
         seen_names.add(_name(value['answer']))
     candidates.sort(key=lambda c: c['id'])
@@ -280,6 +290,8 @@ def decode_proposal(raw, panel, documents, question):
         errors.append('legal_multivalue:not_established')
     if not answer.strip() or not sources:
         reason = 'primary_unresolved'
+    elif errors:
+        reason = 'proposal_protocol_invalid'
     elif len(candidates) < 2:
         reason = 'no_competing_candidate'
     elif not requirements:
@@ -293,7 +305,7 @@ def decode_proposal(raw, panel, documents, question):
     return {'answer': answer, 'sources': sources, 'candidates': candidates,
             'requirements': requirements, 'legal_multivalue': legal_multivalue,
             'trigger': {'eligible': reason == 'primary_binding_unverified', 'reason': reason},
-            'diagnostic_errors': errors}
+            'protocol_valid': not errors, 'diagnostic_errors': errors}
 
 
 def binding_queries(proposal):
@@ -315,7 +327,7 @@ def judge_schema(proposal, panel_size):
     ids = [c['id'] for c in proposal['candidates']]
     requirements = [r['id'] for r in proposal['requirements']]
     candidate = _object({'id': {'type': 'string', 'enum': ids},
-                         'assessments': _array(_assessment_schema(panel_size, requirements), 4)})
+                         'assessments': _array(_assessment_schema(panel_size, requirements), 4, len(requirements))})
     return _object({'candidates': _array(candidate, len(ids), len(ids)),
                     'legal_multivalue': {'type': 'boolean'}})
 
@@ -343,7 +355,7 @@ def judge_messages(question, step, proposal, panel, documents):
 
 
 def decode_judgment(raw, proposal, panel, documents):
-    """A failed judge returns unknown, never a new candidate or a repair request."""
+    """Keep protocol validity separate from semantic uncertainty in the evidence."""
     errors = []
     try:
         obj = json.loads(raw)
@@ -371,20 +383,31 @@ def decode_judgment(raw, proposal, panel, documents):
         mapped = {}
     candidates = []
     for candidate in proposal['candidates']:
+        previous_errors = len(errors)
         assessments = _assessments(mapped.get(candidate['id'], {}).get('assessments', []),
                                    proposal['requirements'], panel, documents, errors, candidate['id'])
-        candidates.append({'id': candidate['id'], 'status': _status(assessments),
-                           'assessments': assessments, 'support_doc_ids': _support_ids(assessments)})
+        assessment_valid = len(errors) == previous_errors
+        candidates.append({'id': candidate['id'],
+                           'status': _status(assessments) if assessment_valid else 'invalid',
+                           'assessments': assessments,
+                           'support_doc_ids': _support_ids(assessments) if assessment_valid else []})
     legal_multivalue = len(candidates) == 2 and all(c['status'] == 'supported' for c in candidates)
     if valid and obj['legal_multivalue'] and not legal_multivalue:
         errors.append('judge:legal_multivalue_not_established')
     return {'candidates': candidates, 'legal_multivalue': legal_multivalue,
-            'diagnostic_errors': errors}
+            'protocol_valid': not errors, 'diagnostic_errors': errors}
 
 
 def adopt(proposal, judgment):
     """Submit one value using the fixed MVP policy, preserving ordinary primary proof."""
     primary = next((c for c in proposal['candidates'] if c['id'] == 'h1'), None)
+    if (proposal.get('protocol_valid') is not True
+            or (judgment is not None and judgment.get('protocol_valid') is not True)):
+        return {'answer': proposal['answer'], 'sources': list(proposal['sources']),
+                'binding_status': 'invalid', 'unexcluded_competitor': False,
+                'selected_candidate_id': 'h1' if primary else None,
+                'decision_reason': 'proposal_protocol_invalid' if not proposal.get('protocol_valid')
+                                   else 'judge_protocol_invalid'}
     outcomes = {c['id']: c for c in judgment['candidates']} if judgment else {}
     first = outcomes.get('h1', {'status': primary['status'] if primary and judgment is None else 'unknown',
                                 'support_doc_ids': primary['support_doc_ids'] if primary and judgment is None else []})

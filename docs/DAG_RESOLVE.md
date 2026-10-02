@@ -6,6 +6,8 @@
 
 每题按原 plan 的依赖顺序，在**第一个有后代的桥节点**使用一次候选输出协议，替代该节点原有回答调用。其余节点保留 ordinary `answer/sources` 协议。
 
+这里先固定干预节点，再检查是否有合格竞争；没有在全部节点之间按歧义或终态影响选择干预位置。因此当前实验可评价该干预范围内的绑定查询，不能评价终态敏感调度。自然错误审计应分别报告：错误绑定位于首个桥节点的比例、这些实例中正确替代项已在初始面板／候选中的比例，以及实际触发覆盖率。分母和不触发实例必须保留；触发子集收益与全任务收益分别报告。
+
 候选协议保留 primary 的完整普通来源，允许 **0、1 或 2 个候选，两个候选包含 primary**。第二候选必须确实出现在当前原文中，并有逐字出处；不能靠模型猜名字、猜别名或凑够两个。只识别到一个候选时，继续原单值路径，没有额外检索或判读。
 
 补查同时要求：
@@ -31,12 +33,15 @@
 
 一次联合 LLM 判读检查所有候选、所有必要条件，返回 supported、contradicted、unknown 或 conflict。程序检查文档索引与逐字 quote，并保存 `doc_id/start/end/quote`。语义蕴涵由模型判读，引用存在本身不等于事实充分。缺资料、另一年份或较低检索分数都不是反证。
 
+**协议无效与语义 unknown 分开。** 每个候选须明确判读所有必要条件；空列表、漏判条件、坏引用、无证据的支持／反驳、无依据的多值标志或响应结构错误，均属于内部 `invalid`，并将本次结果标记为 `protocol_valid=false`。unknown 所附引用也必须合法。任一部分无效即退出整次可选修正，原样保留 primary 普通答案和来源，不采纳部分有效判读，不追加其支持文档；trace 记录 `failed / judge_protocol_invalid` 与具体诊断。提议的附加字段无效时同样不触发补查。模型不输出 invalid 标签，它是程序校验结果。
+
 | 判读结果 | 提交规则 |
 |---|---|
 | primary supported | 保留 primary，加入其新支持证据。 |
-| 替代项 supported，primary unknown | 改选替代项，标记 `unexcluded_competitor=true`；不声称证明唯一。 |
+| 判读协议合法，替代项 supported，primary unknown | 改选替代项，标记 `unexcluded_competitor=true`；不声称证明唯一。 |
 | 替代项 supported，primary contradicted | 改选替代项。 |
-| 双 unknown、冲突、判读无效或可选 HTTP 失败 | 保留 primary，记录 unknown/conflict 和失败 trace。 |
+| 双 unknown、冲突 | 保留 primary，记录相应语义状态。 |
+| 判读协议 invalid 或可选 HTTP 失败 | 原样保留 primary 普通答案与来源，记录 invalid 和失败原因；不计作证据纠正。 |
 | primary contradicted，无 supported 替代 | 清空答案和来源，成为 origin 式 unresolved；下一跳沿用原未解父问题接地。 |
 | 双 supported／合法多值 | 记录事件，保留 primary；只加入 primary 支持，不混入替代项来源。 |
 
@@ -72,6 +77,20 @@
 同样支持 `2wikimultihopqa` 和 `musique`。无 `--limit` 时使用该数据集固定 1000 题。生成阶段不读取标签；显式评分仅在 complete、精确行范围与代码身份检查后打开 labels，失败题按零分计入全任务指标。
 
 输出包含 `manifest.json`、`progress.json`、不可变 `inputs/`、`rows/`、逐题 `calls/` 和 `cost.json`。manifest 绑定方法、代码、配置、数据、问题范围和预算。相同输入可恢复、缓存重放；已经完成的失败行不会自动重跑，改变代码或范围必须使用新目录。CLI 使用单数据集、单 worker；原模块包含全局配置，不应在同一进程交错执行多个不同 runtime。
+
+## 证据召回的范围
+
+原有 R@5/10/20 和 all@5/10/20 保持原定义，计算 `budgets[k].selected_doc_ids` 的 selector 输出召回。Reader 为满足容量可能继续裁剪，因此 selector 的 R@20 不能解释为 Reader 已看到全部支持证据。
+
+评分同时报告以下百分比，均使用原来的 gold 支持组规则，MuSiQue ID 使用相同归一化：
+
+- `reader_support_recall`：根据 `ranking.reader.panel_doc_ids`，逐题计算支持组召回，再对完整任务范围宏平均。
+- `reader_all_support`：记录的 Reader 面板覆盖全部支持组的题目比例。
+- `reader_context_trim_rate`：记录已移除文档，或 selector@20 文档未进入记录的 Reader 面板的题目比例，分母为完整任务题数。
+
+缺失／畸形 Reader 面板的题仍计入全题分母，Reader 召回为零；缺失面板本身不推断发生裁剪。另在 `reader_evidence_scope` 报告已记录面板数、不可用数、裁剪题数及以已记录面板题为分母的裁剪比例；无面板时该条件比例为 null。答案生成失败不自动抹掉已记录输入面板的召回。该面板衡量记录的 Reader 输入范围，并不保证远端服务已完成推理。
+
+代码更新后仍须通过生成 manifest 的代码身份校验，旧版本生成目录不会被当前 evaluate 自动重解释；新实验使用独立目录。
 
 ## 自检与研究范围
 
