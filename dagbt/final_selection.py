@@ -1,17 +1,19 @@
-"""V3 raw-source review with DAG certificates and scoped coverage recovery.
+"""Proof revision followed by whole-source closure selection.
 
-Adapted from BridgeTree c4b04c9's raw review / evidence_recovery contract.
-Original raw documents may be selected without a mapping. They never acquire
-fabricated support; the actual chosen set gets a fresh DAG closure certificate.
+DocumentSelector retains the v3 document-review protocol for flat ablations.
+Dependency methods use FinalSelector: review may change the graph, but only the
+graph selector chooses adopted proofs and their complete raw source closures.
 """
 from copy import deepcopy
+from math import prod
+from types import SimpleNamespace
 
 from . import prompts
 from .budget import BudgetExceeded
 from .evidence_spans import document_source_metadata
 from .evidence_views import build_view
 from .reasoning import ProtocolError, InputOverflow, OutputTruncated, RefusalError
-from .support import select_support, _protected_groups
+from .support import select_support, _protected_groups, validate_selection
 from .transport import digest
 
 
@@ -51,7 +53,7 @@ def independent_assessments(facts):
     return len({root(i) for i in range(len(facts))})
 
 
-class FinalSelector:
+class DocumentSelector:
     def __init__(self, engine, graph, proposal):
         self.e, self.graph, self.proposal = engine, graph, proposal
         self.requirements = [{'id': step['output_slot'], 'description': step['question'],
@@ -391,5 +393,263 @@ class FinalSelector:
             'coverage_rows': rows, 'coverage_failures': self.failures, 'recovery_actions': self.actions,
             'candidate_dispositions': dispositions, 'evidence_logical_calls': len(e.reasoner.requests),
             'budgeted_llm_attempts': e.ledger.used['llm'], 'budgeted_reader_attempts': e.ledger.used['reader']}
+        e.event({'event': 'semantic_selection_complete', **deepcopy(e.semantic_evidence)})
+        return selections
+
+
+class FinalSelector:
+    """Review a graph transaction, then select whole proofs for every budget."""
+
+    def __init__(self, engine, graph, proposal):
+        self.e, self.graph, self.proposal = engine, deepcopy(graph), proposal
+        self.view = None
+        self.review_complete = False
+        self.review_error = None
+
+    def _data(self, raw_ids):
+        e = self.e
+        visible = set(raw_ids)
+        nodes, alt_ids, span_ids = [], set(), set()
+        spans = {s['id']: s for s in self.graph['spans']}
+        graph_nodes = {node['id']: node for node in self.graph['nodes']}
+        visible_parent_sources = set()
+        for node in self.graph['nodes']:
+            row = {k: deepcopy(node[k]) for k in (
+                'id', 'answer', 'status', 'declared_status', 'version', 'applicable_scope',
+                'planned_parent_ids', 'unresolved_inputs', 'unresolved_guards') if k in node}
+            row['alternatives'] = []
+            for alt in node['alternatives']:
+                # A parent is an OR of its proofs, not an AND of every source
+                # ever used for that parent. Display one complete provenance
+                # route per actual parent. This is visibility only: unavailable
+                # historical routes remain reviewable without becoming eligible.
+                direct = {spans[s]['doc_id'] for s in alt['source_span_ids'] + alt['guard_span_ids']}
+                if direct <= visible and set(alt['used_parent_ids']) <= visible_parent_sources:
+                    displayed = deepcopy(alt)
+                    missing = [parent for parent in alt['used_parent_ids'] if not graph_nodes[parent]['alternatives']]
+                    if missing:
+                        # An explicitly absent parent proof is reviewable
+                        # negative information, unlike a proof omitted by the
+                        # input budget. It never establishes a new parent.
+                        displayed['missing_parent_proof_ids'] = missing
+                    row['alternatives'].append(displayed)
+                    alt_ids.add(alt['id'])
+                    span_ids.update(alt['source_span_ids'] + alt['guard_span_ids'])
+            if row['alternatives'] or not node['alternatives']:
+                visible_parent_sources.add(node['id'])
+            row['omitted_alternative_ids'] = [a['id'] for a in node['alternatives'] if a['id'] not in alt_ids]
+            nodes.append(row)
+        conflicts = []
+        for conflict in self.graph.get('conflicts', []):
+            refs = conflict['source_span_ids'] + conflict.get('resolution', {}).get('source_span_ids', [])
+            if (set(conflict.get('protected_doc_ids', [])) <= visible
+                    and all(spans[s]['doc_id'] in visible for s in refs)):
+                conflicts.append(deepcopy(conflict))
+                span_ids.update(refs)
+        evidence = [deepcopy(s) for s in self.graph['spans'] if s['id'] in span_ids]
+        data = {
+            'original_question': e.q['question'],
+            'requirements': deepcopy(self.graph['requirements']),
+            'subquestions': deepcopy(e.steps),
+            'nodes': nodes, 'evidence': evidence, 'known_conflicts': conflicts,
+            'candidate_doc_ids': [d for d in e.docs if d in visible],
+            'raw_memory_candidates': [{'doc_id': d, 'passage': e.docs[d].passage,
+                                       'metadata': document_source_metadata(e.docs[d])}
+                                      for d in e.docs if d in visible],
+            'max_alternatives_per_node': e.s['max_alternatives'] if e.s['allow_alternatives'] else 1,
+            'max_quote_chars': e.s['max_quote_chars'],
+            'original_proposal_doc_ids': list(self.proposal.get('selected_doc_ids', [])),
+            'mapping_incomplete': e.mapper.diagnostics()['mapping_incomplete'],
+            'condition_audit_enabled': e.s['condition_audit'],
+            'invalidation_enabled': e.s['invalidation'],
+            'review_contract': 'Revise only fully displayed routes. Omitted routes remain in the graph. '
+                               'Supplementary documents do not create support. Final selection is performed by Python.'}
+        return data, alt_ids, span_ids
+
+    def _display_source_groups(self):
+        """Small provenance unions for displaying routes, with parent ORs.
+
+        This never ranks support or decides semantic eligibility. Each group
+        contains a route's direct sources and a complete source route for every
+        actual parent, or explicit absence when a parent has no routes at all.
+        Superset groups need no separate display opportunity:
+        the smaller group already makes that same node's provenance visible.
+        """
+        spans = {s['id']: s for s in self.graph['spans']}
+        parent_groups, groups = {}, set()
+
+        def minimal(values):
+            kept = []
+            for value in sorted(set(values), key=lambda ids: (len(ids), tuple(sorted(ids)))):
+                if not any(old <= value for old in kept):
+                    kept.append(value)
+            return kept
+
+        for node in self.graph['nodes']:
+            routes = []
+            for alt in node['alternatives']:
+                direct = frozenset(spans[s]['doc_id'] for s in alt['source_span_ids'] + alt['guard_span_ids'])
+                choices = [direct]
+                for parent in alt['used_parent_ids']:
+                    choices = minimal(base | source for base in choices for source in parent_groups[parent])
+                routes.extend(choices)
+                groups.update(choices)
+            # No existing parent route has no hidden source to preserve. Its
+            # explicit absence must not make a broken descendant impossible
+            # to review; semantic eligibility is still checked by apply_review.
+            parent_groups[node['id']] = minimal(routes) if node['alternatives'] else [frozenset()]
+        return groups
+
+    def prepare_view(self):
+        from .proof_review import REVIEW_SCHEMA
+        e = self.e
+        limit = e.s['context_tokens'] - e.s['reasoning_output_tokens'] - e.s['input_margin'] - 8 - 384
+        mapped = {s['doc_id'] for s in self.graph['spans']}
+        candidates = list(dict.fromkeys(list(e.baseline_ids) + list(e.candidates)))
+        allowed = set(candidates if e.s['raw_memory_review'] else [d for d in candidates if d in mapped])
+        allowed.update(mapped)
+        estimates = {}
+        def estimate(ids):
+            key = frozenset(ids)
+            if key not in estimates:
+                data, _, _ = self._data(key)
+                estimates[key] = e.reasoner.estimate('select', prompts.SUPPORT_REVIEW, data, REVIEW_SCHEMA)
+            return estimates[key]
+        def fits(ids):
+            return estimate(ids) <= limit
+        if not fits([]):
+            raise InputOverflow('Support review fixed schema and graph metadata exceed input budget')
+        groups = [self.proposal.get('selected_doc_ids', [])]
+        groups.extend(sorted(self._display_source_groups(),
+                             key=lambda ids: (estimate(ids), len(ids), tuple(sorted(ids)))))
+        groups.extend([d] for d in candidates)
+        kept = set()
+        for group in groups:
+            trial = kept | (set(group) & allowed)
+            # Never truncate raw text. Complete routes get first opportunity;
+            # any unreviewed route remains available to the final graph search.
+            if fits(trial):
+                kept = trial
+        data, alt_ids, span_ids = self._data(kept)
+        all_alt_ids = {a['id'] for n in self.graph['nodes'] for a in n['alternatives']}
+        audit = {'operation': 'support_review', 'policy_version': 'full_raw_proof_revision_v4',
+                 'input_token_limit': limit,
+                 'input_tokens_after': e.reasoner.estimate('select', prompts.SUPPORT_REVIEW, data, REVIEW_SCHEMA),
+                 'raw_review_visible_doc_ids': data['candidate_doc_ids'],
+                 'omitted_raw_review_doc_ids': [d for d in candidates if d in allowed and d not in kept],
+                 'omitted_alternative_ids': sorted(all_alt_ids - alt_ids),
+                 'input_truncated': bool((allowed - kept) or (all_alt_ids - alt_ids))}
+        self.view = SimpleNamespace(data=data, audit=audit, visible_doc_ids=kept,
+                                    visible_alternative_ids=alt_ids, visible_span_ids=span_ids)
+        e.input_views.append(deepcopy(audit))
+        e.event({'event': 'raw_review_prepared', **audit})
+        return self.view
+
+    def _snapshot(self, phase, selected=(), complete=None):
+        e = self.e
+        mapped = {s['doc_id'] for s in self.graph['spans']}
+        selected = list(selected)
+        mapped_ids = [d for d in selected if d in mapped]
+        raw_ids = [d for d in selected if d not in mapped]
+        unknown = phase == 'selection_pending'
+        e.semantic_evidence = {
+            'version': 'dagbt_semantic_evidence_v4', 'phase': phase,
+            'evidence_state': 'unknown' if unknown else 'empty_context' if not selected else
+                              'mixed' if mapped_ids and raw_ids else 'mapped_only' if mapped_ids else 'raw_only',
+            'selected_doc_ids': selected, 'selected_mapped_doc_ids': mapped_ids,
+            'selected_raw_only_doc_ids': raw_ids, 'baseline_doc_ids': list(e.baseline_ids),
+            'candidate_doc_ids': list(e.candidates),
+            'raw_review_visible_doc_ids': [] if self.view is None else self.view.audit['raw_review_visible_doc_ids'],
+            'omitted_raw_review_doc_ids': [] if self.view is None else self.view.audit['omitted_raw_review_doc_ids'],
+            'coverage_validation_complete': None if unknown else True,
+            'structural_validation_complete': not unknown,
+            'complete_required': complete, 'support_state': 'unknown' if complete is None else
+                                                           'complete' if complete else 'incomplete',
+            'review_complete': self.review_complete, 'review_error': deepcopy(self.review_error),
+            'unassessed_requirement_ids': [], 'coverage_rows': [],
+            'evidence_logical_calls': len(e.reasoner.requests),
+            'budgeted_llm_attempts': e.ledger.used['llm'], 'budgeted_reader_attempts': e.ledger.used['reader']}
+        e.event({'event': 'selection_progress', **deepcopy(e.semantic_evidence)})
+
+    def _select(self, supplements, maximum):
+        e = self.e
+        graph = deepcopy(self.graph)
+        # Raw observations may supplement an incomplete proof without acquiring
+        # fabricated mapping records, edges, or terminal coverage.
+        available = set(graph['document_order']) | set(supplements)
+        graph['document_order'] = [d for d in e.docs if d in available]
+        # The graph is capped at 8 nodes x 2 alternatives (at most 6561 states).
+        # Final selection must not miss a feasible proof because a smaller
+        # exploratory enumeration limit was configured.
+        states = prod(1 + sum(bool(a.get('eligible')) for a in n['alternatives']) for n in graph['nodes'])
+        feasibility = lambda ids: e.feasible(ids, maximum)
+        result = select_support(graph, feasibility, max_states=states)
+        if not result['complete_required']:
+            groups = [{'id': f'raw_{i:06d}', 'doc_ids': [d], 'kind': 'raw_supplement'}
+                      for i, d in enumerate(supplements)]
+            result = select_support(graph, feasibility, max_states=states,
+                                    partial_groups=groups, fill_partial=True)
+        certificate = validate_selection(graph, result, e.docs)
+        if not feasibility(result['selected_doc_ids'])['feasible']:
+            raise InputOverflow('Selected proof union exceeds final Reader budget')
+        result.update(selection_review=True, selection_unit='support_route',
+                      review_complete=self.review_complete,
+                      support_state='complete' if result['complete_required'] else 'incomplete',
+                      verified_support_doc_ids=certificate['support_selected_doc_ids'],
+                      structural_validation_complete=True,
+                      coverage_validation_complete=True,
+                      final_enumeration_states=states,
+                      configured_exploratory_enumeration_limit=e.s['max_enumeration_states'])
+        return result
+
+    def run(self):
+        from .proof_review import REVIEW_SCHEMA, apply_review
+        e = self.e
+        self._snapshot('selection_pending')
+        try:
+            view = self.prepare_view()
+            def validate(value):
+                if not e.s['invalidation'] and (value.get('invalidations') or value.get('resolutions')):
+                    raise ProtocolError('Invalidation ablation cannot revise conflict state')
+                return apply_review(self.graph, value, e.docs,
+                    visible_doc_ids=view.visible_doc_ids,
+                    visible_alternative_ids=view.visible_alternative_ids,
+                    visible_span_ids=view.visible_span_ids,
+                    max_nodes=e.s['max_initial_nodes'] + e.s['max_refinement_nodes'],
+                    max_alternatives=e.s['max_alternatives'] if e.s['allow_alternatives'] else 1,
+                    max_quote_chars=e.s['max_quote_chars'])
+            revised = e.reasoner.json('select', prompts.SUPPORT_REVIEW, view.data, validate,
+                                      REVIEW_SCHEMA, reserve=0, reserve_repairs=0)
+            self.graph = revised
+            self.review_complete = True
+            supplements = list(revised['supplemental_doc_ids'])
+        except RefusalError:
+            raise
+        except (ProtocolError, InputOverflow, BudgetExceeded) as exc:
+            # Invalid patches are transactional: preserve the real old graph,
+            # expose failure explicitly, and keep the raw-answer fallback.
+            if not e.s['allow_unassessed_coverage']:
+                raise
+            self.review_error = {'error_type': type(exc).__name__, 'error': str(exc)}
+            e.errors.append({'stage': 'support_review', **self.review_error})
+            e.event({'event': 'support_review_incomplete', **self.review_error})
+            mapped = {s['doc_id'] for s in self.graph['spans']}
+            supplements = list(dict.fromkeys(list(e.baseline_ids) + [d for d in e.candidates if d in mapped]))
+            if not e.s['raw_memory_review']:
+                supplements = [d for d in supplements if d in mapped]
+        e.nodes = deepcopy(self.graph['nodes'])
+        e.spans = {s['id']: deepcopy(s) for s in self.graph['spans']}
+        e.conflicts = deepcopy(self.graph.get('conflicts', []))
+        e.graph = self.graph
+        selections = {str(k): self._select(supplements, k) for k in (5, 10, 20)}
+        final = selections['20']
+        self._snapshot('selection_complete', final['selected_doc_ids'], final['complete_required'])
+        e.semantic_evidence.update(
+            proof_review=deepcopy(self.graph.get('proof_review', {})),
+            chosen_alternatives=deepcopy(final['chosen_alternatives']),
+            covered_requirement_ids=list(final['covered_requirement_ids']),
+            uncovered_requirement_ids=list(final['uncovered_requirement_ids']),
+            verified_support_doc_ids=list(final['verified_support_doc_ids']),
+            review_supplemental_doc_ids=list(supplements))
         e.event({'event': 'semantic_selection_complete', **deepcopy(e.semantic_evidence)})
         return selections

@@ -19,7 +19,8 @@ import numpy as np
 
 from dagbt import runner
 from dagbt.resources import inspect_index
-from test_system_http import FIXTURE_ANSWER, scripted_source_mapping, scripted_final_selection
+from test_system_http import (FIXTURE_ANSWER, scripted_source_mapping,
+                              scripted_final_selection, scripted_support_review)
 
 
 @contextmanager
@@ -102,6 +103,8 @@ def scripted_bt_models(question):
                              "unresolved_inputs": [], "unresolved_guards": [], "refinements": []}
                 elif system.startswith("Audit the compiled evidence support alternatives"):
                     value = {"conflicts": [], "unresolved_guards": []}
+                elif system.startswith("Review support proofs"):
+                    value = scripted_support_review(json.loads(messages[1]["content"]))
                 elif system.startswith("Review source documents"):
                     value = scripted_final_selection(json.loads(messages[1]["content"]))
                 elif system.startswith("You are a long-document QA reader"):
@@ -207,9 +210,11 @@ def test_bt_profile_chat_only_and_model_specific_full_corpus_index(tmp_path, mon
         assert feasibility["token_estimator_id"]
         assert rows["fusion"]["diagnostics"]["ledger"]["used"]["set_score"] > 0
         assert any(e['event'] == 'semantic_selection_complete' for e in rows['fusion']['diagnostics']['events'])
+        assert rows['fusion']['diagnostics']['semantic_evidence']['review_complete'] is True
+        assert rows['fusion']['diagnostics']['semantic_evidence']['version'] == 'dagbt_semantic_evidence_v4'
         assert rows["original"]["ranking"]["nodes"][0]["resolved"]
         chat_requests = [r for r in requests if r["path"] == "/v1/chat/completions"]
-        assert any(r['payload']['messages'][0]['content'].startswith('Review source documents') for r in chat_requests)
+        assert any(r['payload']['messages'][0]['content'].startswith('Review support proofs') for r in chat_requests)
         planners = [r for r in chat_requests if r["payload"]["messages"][0]["content"].startswith("Decompose a multi-hop question")]
         assert len(planners) == 3  # Independent protocol gate, original question, fusion question.
         assert sum(q["question"] in r["payload"]["messages"][1]["content"] for r in planners) == 2

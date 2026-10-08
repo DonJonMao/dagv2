@@ -214,7 +214,7 @@ def probe_fusion_planner(config, output=None):
     reasoner = Reasoner(transport, tokenizer, effective, settings, ledger, observe)
     e, repair, _ = legacy_modules()
     query = "Which city hosts the science museum visited by the fictional traveler Mira?"
-    report = {"check": "fusion_planner_protocol", "version": "dagbt_fusion_reliability_v3", "status": "running",
+    report = {"check": "fusion_planner_protocol", "version": "dagbt_fusion_support_review_v4", "status": "running",
               "trace_directory": str(trace), "configured_protocol": settings.get("response_format", "plain"),
               "schema_sha256": digest(e.PLAN_SCHEMA), "synthetic_query": query,
               "logical_call_limit": 1, "repair_calls": 0, "protocol_fallback": False,
@@ -841,6 +841,13 @@ def normalized_semantic_evidence(diag):
     else:
         coverage = "unknown"
     result["coverage_state"] = coverage
+    # V3 coverage_state described annotation validation, not proof existence.
+    # Keep that historical field and expose the v4 structural result separately.
+    proof_complete = result.get("complete_required")
+    result["support_state"] = (
+        "complete" if proof_complete else "incomplete"
+    ) if (not selection_unknown and result.get("structural_validation_complete") is True
+          and type(proof_complete) is bool) else "unknown"
     for name in ("evidence_logical_calls", "reader_logical_calls", "budgeted_llm_attempts", "budgeted_reader_attempts"):
         # Authoritative per-run counters, never sums of copied event snapshots.
         if name not in result and _finite_number(diag.get(name)):
@@ -928,6 +935,7 @@ def summarize_modules(rows):
 RELIABILITY_COHORTS = ("normal", "truncated", "partially_mapped", "truncated_and_partially_mapped", "unknown")
 EVIDENCE_STATES = ("empty_context", "mapped_only", "raw_only", "mixed", "unknown")
 COVERAGE_STATES = ("complete", "unassessed", "unknown")
+SUPPORT_STATES = ("complete", "incomplete", "unknown")
 
 
 def latest_cost_statistics(rows):
@@ -992,6 +1000,8 @@ def summarize_semantic_evidence(rows, answer_metric=None):
                        for state in EVIDENCE_STATES}
     coverage_groups = {state: group([r for r in successful if semantic(r).get("coverage_state", "unknown") == state])
                        for state in COVERAGE_STATES}
+    support_groups = {state: group([r for r in successful if semantic(r).get("support_state", "unknown") == state])
+                      for state in SUPPORT_STATES}
     cross_counts = Counter((r.get("modules", {}).get("reliability", {}).get("cohort", "unknown"),
                             semantic(r).get("evidence_state", "unknown"),
                             semantic(r).get("coverage_state", "unknown")) for r in successful)
@@ -1003,11 +1013,14 @@ def summarize_semantic_evidence(rows, answer_metric=None):
                          "sum": sum(values), "mean": sum(values) / len(values) if values else None}
     return {"answer_metric": answer_metric, "completion_cohorts": evidence_groups,
             "coverage_completion_cohorts": coverage_groups,
+            "support_completion_cohorts": support_groups,
             "all_task_evidence_state_counts": counts(rows, "evidence_state", EVIDENCE_STATES),
             "all_task_coverage_state_counts": counts(rows, "coverage_state", COVERAGE_STATES),
+            "all_task_support_state_counts": counts(rows, "support_state", SUPPORT_STATES),
             "failed_tasks": len(failed),
             "failed_evidence_state_counts": counts(failed, "evidence_state", EVIDENCE_STATES),
             "failed_coverage_state_counts": counts(failed, "coverage_state", COVERAGE_STATES),
+            "failed_support_state_counts": counts(failed, "support_state", SUPPORT_STATES),
             "failure_cost_latest_attempt": latest_cost_statistics(failed),
             "successful_reliability_evidence_coverage_counts": [
                 {"reliability": cohort, "evidence_state": evidence, "coverage_state": coverage, "tasks": count}

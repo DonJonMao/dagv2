@@ -64,7 +64,11 @@ class FakeCalls:
             elif operation == "audit":
                 value = self.auditor(data) if self.auditor else {"conflicts": [], "unresolved_guards": []}
             elif operation in ("select", "select_repair"):
-                if payload['messages'][0]['content'].startswith('Review source documents'):
+                if payload['messages'][0]['content'].startswith('Review support proofs'):
+                    value = self.selector(data) if self.selector else {
+                        'new_spans': [], 'invalidations': [], 'resolutions': [], 'node_updates': [],
+                        'supplemental_doc_ids': [], 'reason': 'Fixture preserves existing support proofs'}
+                elif payload['messages'][0]['content'].startswith('Review source documents'):
                     header = data.get('repair_scope', {}).get('fixed_header') or {
                         'selected_doc_ids': data.get('proposed_doc_ids') or data['candidate_doc_ids'],
                         'reason': 'fixture review', 'conflicts': []}

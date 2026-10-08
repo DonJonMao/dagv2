@@ -627,3 +627,58 @@ def select_support(graph, feasibility, max_states=10000, partial_groups=(), fill
     if navigation.get("enabled"):
         best["diagnostics"]["navigation_policy"] = "frozen_first_discovery; final_context_only; not_semantic_support"
     return best
+
+
+def validate_selection(graph, selection, documents):
+    """Check the adopted proof against the *actual* Reader document set.
+
+    This is a structural assertion, not a fresh semantic judgment or a second
+    optimizer. Supplemental raw documents are legal even without any proof.
+    """
+    ids = _ids(selection.get('selected_doc_ids'), 'selected_doc_ids')
+    selected_docs = set(ids)
+    if not selected_docs <= set(documents):
+        raise SupportError('reader_contains_unknown_document')
+    chosen = selection.get('chosen_alternatives')
+    if not isinstance(chosen, dict):
+        raise SupportError('selected_support_assignments_required')
+    span_map = {s['id']: s for s in graph['spans']}
+    established, closures = set(), {}
+    for node in graph['nodes']:
+        if node['id'] not in chosen:
+            continue
+        alt = next((a for a in node['alternatives'] if a['id'] == chosen[node['id']]), None)
+        if alt is None or not alt.get('eligible') or node['status'] != 'supported':
+            raise SupportError('reader_adopts_unavailable_support: ' + node['id'])
+        if not set(alt['used_parent_ids']) <= established:
+            raise SupportError('reader_support_parent_missing: ' + node['id'])
+        docs = {span_map[s]['doc_id'] for s in alt['source_span_ids'] + alt['guard_span_ids']}
+        for parent in alt['used_parent_ids']:
+            docs.update(closures[parent])
+        if not docs <= selected_docs:
+            raise SupportError('reader_support_source_missing: ' + node['id'])
+        closures[node['id']] = docs
+        established.add(node['id'])
+    if established != set(chosen):
+        raise SupportError('reader_support_unknown_node')
+    covered = [r['id'] for r in graph['requirements']
+               if (all(n in established for n in r['terminal_node_ids'])
+                   if r['terminal_mode'] == 'all' else
+                   any(n in established for n in r['terminal_node_ids']))]
+    complete = all(r['id'] in covered for r in graph['requirements'] if r['necessary'])
+    if selection.get('complete_required') is not complete:
+        raise SupportError('reader_complete_support_misreported')
+    if set(selection.get('covered_requirement_ids', [])) != set(covered):
+        raise SupportError('reader_coverage_misreported')
+    for group in _protected_groups(graph):
+        required = set(group['doc_ids'])
+        if selected_docs & required and not required <= selected_docs:
+            raise SupportError('reader_disputed_sources_split')
+    navigation = graph.get('navigation_closure', {})
+    if navigation.get('enabled'):
+        for doc in ids:
+            if not set(navigation['ancestors'].get(doc, ())) <= selected_docs:
+                raise SupportError('reader_navigation_closure_split')
+    return {'complete_required': complete, 'covered_requirement_ids': covered,
+            'support_selected_doc_ids': [d for d in documents if any(d in c for c in closures.values())],
+            'semantic_correctness_guaranteed': False}

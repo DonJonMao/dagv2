@@ -1,4 +1,8 @@
-"""V3 selection uses real protocol/closure code and explicitly scripted models."""
+"""Retained document-review regressions plus default v4 Engine integration.
+
+DocumentSelector keeps the v3 protocol for flat selection. The final Engine
+tests exercise the new support-review protocol with real graph/reader wiring.
+"""
 from copy import deepcopy
 import json
 from types import SimpleNamespace
@@ -7,7 +11,7 @@ import pytest
 
 from dagbt.budget import BudgetExceeded, Ledger
 from dagbt.config import resolve
-from dagbt.final_selection import FinalSelector, SELECT_SCHEMA
+from dagbt.final_selection import DocumentSelector as FinalSelector, SELECT_SCHEMA
 from dagbt.model_runtime import BTTokenAccounting
 from dagbt.reasoning import InputOverflow, OutputTruncated, ProtocolError, Reasoner, RefusalError
 from dagbt.support import compile_graph, invalidate_support, make_span, with_navigation_closure
@@ -443,13 +447,20 @@ def test_subbudget_report_must_not_split_disputed_source_group():
         assert not (chosen & {'d0', 'd5'}) or {'d0', 'd5'} <= chosen
 
 
-class EngineV3Calls(FakeCalls):
+def no_op_review(data, supplemental=None):
+    return {'new_spans': [], 'invalidations': [], 'resolutions': [], 'node_updates': [],
+            'supplemental_doc_ids': list(supplemental if supplemental is not None else
+                                         [row['doc_id'] for row in data.get('raw_memory_candidates', [])]),
+            'reason': 'Scripted review preserves the graph and useful unmapped raw history'}
+
+
+class EngineReviewCalls(FakeCalls):
     def get(self, stage, url, payload):
-        if stage[0].startswith('select') and payload['messages'][0]['content'].startswith('Review source documents'):
+        if stage[0].startswith('select') and payload['messages'][0]['content'].startswith('Review support proofs'):
             self.counts[stage[0]] += 1
             self.requests.append({'operation': stage[0], 'payload': deepcopy(payload)})
             data = json.loads(payload['messages'][1]['content'])
-            value = missing(data, [r['doc_id'] for r in data.get('raw_memory_candidates', [])])
+            value = no_op_review(data)
             return {'response_ref': 'final_fixture', 'response': {'choices': [
                 {'message': {'content': json.dumps(value)}, 'finish_reason': 'stop'}]}}
         return super().get(stage, url, payload)
@@ -460,7 +471,7 @@ def test_formal_engine_unmapped_baseline_history_reaches_final_raw_reader(setup)
     bridge, resources, config = setup
     config['fusion']['selection_review'] = True
     config['fixed_candidate_pools'] = {'q': ['a', 'b']}
-    calls = EngineV3Calls([step('answer')], lambda data: unknown(),
+    calls = EngineReviewCalls([step('answer')], lambda data: unknown(),
                           mapper=lambda data: {'units': [{'unit_id': unit['unit_id'], 'assessments': [],
                                                          'irrelevance_reason': 'Scripted mapper missed this history'}
                                                         for unit in data['units']]})
@@ -468,8 +479,10 @@ def test_formal_engine_unmapped_baseline_history_reaches_final_raw_reader(setup)
     assert result['budgets']['20']['selected_doc_ids'] == ['a', 'b']
     assert not result['budgets']['20']['complete_required'] and result['diagnostics']['spans'] == []
     reader_request = next(record for record in calls.requests if record['operation'] == 'reader')
-    reader = json.dumps(reader_request['payload'], ensure_ascii=False)
-    assert resources[0]['a'].text in reader and resources[0]['b'].text in reader
+    reader = reader_request['payload']['messages'][1]['content']
+    passages = reader.split('Context passages:\n', 1)[1].split('\n\nCommitted demand-state evidence:', 1)[0]
+    assert resources[0]['a'].passage in passages and resources[0]['b'].passage in passages
+    assert 'source_doc_id=a' in passages and 'source_doc_id=b' in passages
 
 
 @pytest.mark.parametrize('failed_stage,empty_selection,expected_state', [
@@ -485,7 +498,7 @@ def test_formal_failure_artifact_refreshes_attempt_counts_without_erasing_semant
     config['fusion']['selection_review'] = True
     config['fixed_candidate_pools'] = {'q': ['a', 'b']}
 
-    class FailureCalls(EngineV3Calls):
+    class FailureCalls(EngineReviewCalls):
         def get(self, stage, url, payload):
             operation = stage[0]
             if operation == failed_stage:
@@ -497,7 +510,7 @@ def test_formal_failure_artifact_refreshes_attempt_counts_without_erasing_semant
                 self.requests.append({'operation': operation, 'payload': deepcopy(payload)})
                 data = json.loads(payload['messages'][1]['content'])
                 return {'response_ref': 'empty_selection_fixture', 'response': {'choices': [
-                    {'message': {'content': json.dumps(missing(data, []))}, 'finish_reason': 'stop'}]}}
+                    {'message': {'content': json.dumps(no_op_review(data, []))}, 'finish_reason': 'stop'}]}}
             return super().get(stage, url, payload)
 
     calls = FailureCalls([step('answer')], lambda data: unknown(),

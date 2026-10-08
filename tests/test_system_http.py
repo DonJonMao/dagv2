@@ -53,6 +53,14 @@ def scripted_final_selection(data):
                          for requirement in data['requirements']]}
 
 
+def scripted_support_review(data):
+    """V4 wire fixture: preserve real proofs without inventing support edits."""
+    assert isinstance(data['nodes'], list) and isinstance(data['evidence'], list)
+    assert isinstance(data['raw_memory_candidates'], list)
+    return {'new_spans': [], 'invalidations': [], 'resolutions': [], 'node_updates': [],
+            'supplemental_doc_ids': [], 'reason': 'Scripted protocol fixture preserves the existing support graph'}
+
+
 @contextmanager
 def scripted_models(question, vector):
     requests, errors = [], []
@@ -112,6 +120,8 @@ def scripted_models(question, vector):
                              'unresolved_inputs': [], 'unresolved_guards': [], 'refinements': []}
                 elif system.startswith('Audit the compiled evidence support alternatives'):
                     value = {'conflicts': [], 'unresolved_guards': []}
+                elif system.startswith('Review support proofs'):
+                    value = scripted_support_review(json.loads(messages[1]['content']))
                 elif system.startswith('Review source documents'):
                     value = scripted_final_selection(json.loads(messages[1]['content']))
                 elif system.startswith('You are a long-document QA reader'):
@@ -169,7 +179,7 @@ def test_actual_packaged_hotpot_question_both_algorithms_with_scripted_http(tmp_
         fusion = rows[fusion_arm]
         expected_version = ('evidence_bridge_v1' if fusion_arm == 'fusion'
                             else 'day2_proxy_free_requirements_ann_v1')
-        # V3 performs a separate original-query dense baseline before each
+        # Fusion performs a separate original-query dense baseline before each
         # method's actual node search; inspect the latter by its archive.
         searches = [record['trace'] for record in fusion['ranking']['trace']
                     if 'search_archive' in record.get('trace', {})]
@@ -188,7 +198,9 @@ def test_actual_packaged_hotpot_question_both_algorithms_with_scripted_http(tmp_
         assert diag['ledger']['used'].get('set_score',0) <= 64
         assert any(e['event'] == 'reader_input' and e['raw_only'] for e in diag['events'])
         assert any(e['event'] == 'semantic_selection_complete' for e in diag['events'])
-        assert any(r['payload'].get('messages', [{}])[0].get('content', '').startswith('Review source documents')
+        assert diag['semantic_evidence']['review_complete'] is True
+        assert diag['semantic_evidence']['version'] == 'dagbt_semantic_evidence_v4'
+        assert any(r['payload'].get('messages', [{}])[0].get('content', '').startswith('Review support proofs')
                    for r in requests)
         assert rows['original']['ranking']['nodes'][0]['resolved']
         assert all(row['runner']['cost']['http_attempts'] > 0 for row in rows.values())

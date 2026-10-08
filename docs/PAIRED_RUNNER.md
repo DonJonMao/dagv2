@@ -1,12 +1,20 @@
 # 成对实验启动、恢复和结果解释
 
-这是 RAG **推理与评测实验**，不会更新模型参数。默认对包内 HotpotQA、2WikiMultihopQA、MuSiQue 各 1,000 个问题，以及 PersonaMem-v1 官方 32k 文件全部 589 题，分别执行原 DAG v2 和融合版，共 **3,589 题、7,178 个方法任务**。同一道题的两方法共享当前问题、最终 reader 的公共选项、可见语料范围和向量；融合 v3 的规划/检索/证据阶段仅接收用户当前问题，original 仍保留问题加公开选项的既有协议。原三套数据仍是包内子集；PersonaMem 的 589 题是所固定官方 32k 文件的全部题目，不代表所有上下文长度设置，也不声称复现 BT 的 train/validation/test 划分。
+这是 RAG **推理与评测实验**，不会更新模型参数。默认对包内 HotpotQA、2WikiMultihopQA、MuSiQue 各 1,000 个问题，以及 PersonaMem-v1 官方 32k 文件全部 589 题，分别执行原 DAG v2 和融合版，共 **3,589 题、7,178 个方法任务**。同一道题的两方法共享当前问题、最终 reader 的公共选项、可见语料范围和向量；融合版的规划/检索/证据阶段仅接收用户当前问题，original 仍保留问题加公开选项的既有协议。原三套数据仍是包内子集；PersonaMem 的 589 题是所固定官方 32k 文件的全部题目，不代表所有上下文长度设置，也不声称复现 BT 的 train/validation/test 划分。
 
 PersonaMem 的来源、按题可见记忆和单选评测详见 [PERSONAMEM.md](PERSONAMEM.md)。默认省略 `--datasets` 即运行四套数据；仅运行新数据可指定 `--datasets personamem`。
 
-当前融合可靠性版本为 `dagbt_fusion_reliability_v3`，适配 BT `c4b04c9` 的个人历史提示、原文独立复核、有界覆盖修复和语义诊断。新部署包为 `dagv2_bt_deploy_20260930_reliability_v3.tar.gz`，默认结果目录为 `outputs/paired_full_reliability_v3`。实现和验证边界见 [v3 说明](FUSION_RELIABILITY_V3.md)；[v2 记录](FUSION_RELIABILITY_V2.md) 保留历史协议与当时测试结果，不作为 v3 验证。旧结果没有相应诊断时记为 unknown。
+当前实验分支的融合可靠性版本为 `dagbt_fusion_support_review_v4`，默认 dependency 分支改为模型复核支持图、程序选择完整来源闭包，语义诊断为 `dagbt_semantic_evidence_v4`。实现、对照方法语义和验证边界见 [v4 支持复核说明](SUPPORT_REVIEW_V4.md)。**必须使用新输出目录，不可恢复或混写 v3 结果。** 默认仍是 original/fusion 两臂、四套数据：
 
-## 一键后台运行
+```bash
+.venv/bin/python -m dagbt.runner launch \
+  --config configs/paired.example.json --output outputs/paired_support_review_v4
+.venv/bin/python -m dagbt.runner status --output outputs/paired_support_review_v4
+```
+
+有本地端点覆盖时替换为 `configs/paired.local.json`。`scripts/run_v3.sh` 的名字是历史名称，运行的是当前代码；使用它启动 v4 时也必须显式指定新 `--output`。下文保留 v3 部署命令和文档选择协议的历史细节，其中 v3 包名、默认目录、固定 header 与覆盖修复不代表 v4 支持复核。通用运行、恢复、数据隔离和评分规则继续适用。[v3 说明](FUSION_RELIABILITY_V3.md) 与 [v2 记录](FUSION_RELIABILITY_V2.md) 仅记录各自版本的验证，不作为 v4 验证。旧结果没有相应诊断时记为 unknown。
+
+## 通用运行说明与 v3 历史命令
 
 默认配置已与 BT 当前部署一致：DeepSeek-V4-Flash、Qwen3-Embedding-8B、Qwen3-Reranker-8B，具体服务和继承来源见 [模型对齐说明](MODEL_ALIGNMENT.md)。可将 `configs/paired.example.json` 复制为本地配置覆盖端点。原版和融合版共用这些模型；原版方法本身不额外调用 reranker。首次运行会在后台先重建 Qwen3 语料索引，保留旧 NV 数组；维度相同也不会混用。
 

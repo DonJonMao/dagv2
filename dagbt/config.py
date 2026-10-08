@@ -22,8 +22,9 @@ DEFAULTS = {
     'navigation_closure': False,
     'search': {},
 }
-# Full factorial discovery x selection has identical solver and raw reader.
-# Legacy dagv2 is a separate unchanged method, never called a matched control.
+# Discovery variants share the pre-review solver and raw reader. Flat arms keep
+# v3 document review; they are historical controls, not a single-factor ablation
+# of the v4 proof-revision protocol. Legacy dagv2 remains a separate native arm.
 METHODS = {
     'fusion': {},
     'fusion_proxy_free': {'proxy_mode': 'none'},

@@ -18,14 +18,14 @@ from .model_runtime import token_accounting, count_request_tokens
 from . import prompts
 from .support import (SupportError, make_span, compile_graph, select_support,
                       invalidate_support, resolve_conflict, normalized_answer, text_hash,
-                      with_navigation_closure)
+                      with_navigation_closure, validate_selection)
 
 from .reasoning import Reasoner, InputOverflow, ProtocolError, RefusalError
 from .evidence_mapping import EvidenceMapper
 from .evidence_views import build_view
 from .row_recovery import recover_rows
 
-RELIABILITY_VERSION = "dagbt_fusion_reliability_v3"
+RELIABILITY_VERSION = "dagbt_fusion_support_review_v4"
 
 
 def legacy_modules():
@@ -96,11 +96,18 @@ class Engine:
 
     def compile(self):
         if digest(self.requirements)!=self.requirements_hash:raise ProtocolError('Frozen terminal requirements changed')
+        prior = self.graph or {}
         graph=compile_graph(self.nodes,list(self.spans.values()),self.requirements,self.docs,
              max_nodes=self.s['max_initial_nodes']+self.s['max_refinement_nodes'],
              max_alternatives=self.s['max_alternatives'] if self.s['allow_alternatives'] else 1)
         graph['conflicts']=deepcopy(self.conflicts)
-        graph['revision']=max([int(c['id'].split('_')[-1]) for c in self.conflicts if c.get('id','').startswith('conflict_')]+[0])
+        graph['revision']=max([int(c['id'].split('_')[-1]) for c in self.conflicts if c.get('id','').startswith('conflict_')]+[prior.get('revision',0)])
+        # These records belong to the same graph transaction. In particular,
+        # recompilation must not erase the history preventing a withdrawn proof
+        # from returning under a new ID in a later review.
+        for key in ('proof_review', 'supplemental_doc_ids', 'navigation_closure'):
+            if key in prior:
+                graph[key] = deepcopy(prior[key])
         self.graph=graph;self.nodes=deepcopy(graph['nodes'])
         return graph
 
@@ -392,11 +399,14 @@ class Engine:
             if not set(self.candidates)<=set(self.navigation_provenance):
                 raise ProtocolError('Navigation-closure ablation requires actual first-discovery provenance for every candidate')
             graph=with_navigation_closure(graph,{doc_id:x['source_doc_ids'] for doc_id,x in self.navigation_provenance.items()},self.docs)
+            self.graph=graph
         if self.s['selection']=='dependency':
             selections={}
             partial=[{'id':f'partial_{i:06d}', 'doc_ids':[d], 'kind':'partial'}
                      for i,d in enumerate(self.candidates) if any(sp['doc_id']==d for sp in self.spans.values())]
-            for k in (5,10,20):
+            # Review consumes only the 20-document proposal. All reported
+            # budgets are solved afresh on its revised graph afterwards.
+            for k in ((20,) if self.s['selection_review'] else (5,10,20)):
                 choice=select_support(graph,lambda ids,k=k:self.feasible(ids,k),max_states=self.s['max_enumeration_states'])
                 if not choice['complete_required']:
                     choice=select_support(graph,lambda ids,k=k:self.feasible(ids,k),
@@ -422,8 +432,9 @@ class Engine:
                 selections[str(k)]={'selected_doc_ids':ids,'status':'flat_model_selection','token_count':self.feasible(ids,k)['token_count'],
                      'model_coverage':value.get('covered_requirement_ids',[]) if k==20 else [],'reason':value.get('reason','')}
         if self.s['selection_review']:
-            from .final_selection import FinalSelector
-            selections=FinalSelector(self,graph,selections['20']).run()
+            from .final_selection import FinalSelector, DocumentSelector
+            selector = FinalSelector if self.s['selection'] == 'dependency' else DocumentSelector
+            selections=selector(self,graph,selections['20']).run()
         self.event({'event':'final_selection','selection_mode':self.s['selection'],'selections':selections,
                     'candidate_doc_ids':self.candidates,'excluded_doc_ids':[d for d in self.candidates if d not in selections['20']['selected_doc_ids']]})
         return selections
@@ -497,6 +508,10 @@ class Engine:
         selections=self.select()
         ids=selections['20']['selected_doc_ids'];feasible=self.feasible(ids)
         if not feasible['feasible']:raise InputOverflow('Final reader context exceeds actual token budget')
+        if self.s['selection']=='dependency':
+            # Recheck the actual set sent to Reader, including sources of
+            # guards and shared parents. No capacity layer may trim a proof.
+            validate_selection(self.graph,selections['20'],self.docs)
         messages=self.reader_messages(ids,self.graph)
         self.event({'event':'reader_input','selected_doc_ids':ids,'raw_only':not self.s['reader_chain'],
                     'messages':messages,'feasibility':feasible})
