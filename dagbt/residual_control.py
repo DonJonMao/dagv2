@@ -176,6 +176,9 @@ class ResidualControl:
     def grounded(self,step):
         values,_,_=self.state.valid()
         query=step['question']
+        binding=self.state.initial_program.get('rule_binding')
+        if binding and step['output_slot']==self.state.initial_program['variables'][binding['variable']]['demand'] and self.rules_completion_needed():
+            query+='\nRemaining local gap: obtain applicable original evidence confirming the complete rule collection; the currently bound rules are incomplete.'
         for parent in step['inputs']:
             projection=self.task_projection(parent)
             if projection is not None:
@@ -194,12 +197,21 @@ class ResidualControl:
                 query+='\nEstablished '+parent+': '+replacement
         return query
 
+    def rules_completion_needed(self):
+        if not self.state.initial_program.get('rule_binding') or not self.state.rule_route_ids or self.state.program.get('rules_complete',True):
+            return False
+        values,_,_=self.state.valid()
+        # A necessary-condition failure can suffice without completing all
+        # rules. Other outputs retain completeness as a residual rule demand.
+        return certify_output(self.state.program,values,self.state.contract,
+            max_states=self.e.s['max_enumeration_states']) is None
+
     def active(self,outcome):
         values,_,_=self.state.valid()
         live=set(outcome['live_variables'])|self.state.pending
         tasks={self.state.program['variables'][v]['demand'] for v in live if v in self.state.program['variables'] and (v not in values or v in self.state.pending)}
         binding=self.state.initial_program.get('rule_binding')
-        if binding and not self.state.rule_route_ids:
+        if binding and (not self.state.rule_route_ids or self.rules_completion_needed()):
             tasks.add(self.state.initial_program['variables'][binding['variable']]['demand'])
         if not self.e.capabilities.residual_control:
             tasks|={s['output_slot'] for s in self.e.steps if s['execution']=='retrieval' and s['output_slot'] not in self.visited}
@@ -463,6 +475,8 @@ class ResidualControl:
                         self.e.discoveries.append(deepcopy(found));self.e.record_navigation(found)
                         local=found['local_candidate_ids']
                         if not local:
+                            if found['trace'].get('search_status')=='empty_probe':
+                                executed=True;break
                             self.exhausted.add(key);continue
                     self.local_pools[nid]=list(dict.fromkeys(self.local_pools.get(nid,[])+local))
                     self.e.add_candidates(local)
@@ -498,6 +512,7 @@ class ResidualControl:
             'local_pools':self.local_pools,'exhausted':list(self.exhausted),
             'visited':list(self.visited),'audited':list(self.audited),'last_active':self.last_active,
             'reader':{'read_states':[[*k,v] for k,v in self.reader.read_states.items()],
+                **self.reader.obligation_snapshot(),
                 'gaps':[[*k,v] for k,v in self.reader.gaps.items()],'clues':self.reader.clues,
                 'batches':self.reader.batches,'semantic_inputs':self.reader.semantic_inputs,
                 'semantic_prediction':self.reader.semantic_prediction,'semantic_result':self.reader.semantic_result},
@@ -523,6 +538,7 @@ class ResidualControl:
         self.exhausted=set(snapshot['exhausted']);self.visited=set(snapshot['visited'])
         self.audited=set(snapshot['audited']);self.last_active=snapshot['last_active']
         r=snapshot['reader']
+        self.reader.restore_obligations(r)
         self.reader.read_states={(i,a):v for i,a,v in r['read_states']}
         self.reader.gaps={(i,a):v for i,a,v in r['gaps']}
         self.reader.clues=deepcopy(r['clues']);self.reader.batches=deepcopy(r['batches'])

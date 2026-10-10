@@ -17,6 +17,10 @@ class ProgramError(ValueError):
     pass
 
 
+class DomainConflict(ProgramError):
+    pass
+
+
 class _Unknown:
     def __repr__(self):
         return 'UNKNOWN'
@@ -99,6 +103,28 @@ def validate_value(value, declaration):
     if kind == 'number' and interval(value, declaration.get('unit')).empty:
         raise ProgramError('Supported numeric fact has an empty interval')
     domain = declaration.get('domain')
+    if kind == 'number' and isinstance(domain, dict):
+        numeric_unit=declaration.get('unit',domain.get('unit'))
+        observed, allowed = interval(value,numeric_unit), interval(domain,numeric_unit)
+        if observed.dimension != allowed.dimension:
+            raise ProgramError('Numeric fact and domain have incompatible units')
+        lower,upper=max(observed.lower,allowed.lower),min(observed.upper,allowed.upper)
+        overlap=Interval(lower,upper,
+            all(i.lower_closed for i in (observed,allowed) if i.lower==lower),
+            all(i.upper_closed for i in (observed,allowed) if i.upper==upper),observed.dimension)
+        if overlap.empty:
+            raise DomainConflict('Numeric fact outside its declared legal domain')
+        if overlap != observed:
+            value={'lower':overlap.lower if math.isfinite(overlap.lower) else None,
+                'upper':overlap.upper if math.isfinite(overlap.upper) else None,
+                'lower_closed':overlap.lower_closed,'upper_closed':overlap.upper_closed}
+            if overlap.dimension != 'scalar':
+                value['unit']='s' if overlap.dimension=='time' else 'm'
+        elif numeric_unit and not declaration.get('unit'):
+            if type(value) in (int,float):
+                value={'number':value,'unit':numeric_unit}
+            elif isinstance(value,dict) and 'lower' in value:
+                value={**value,'unit':value.get('unit',numeric_unit)}
     if isinstance(domain, list) and not declaration.get('open', False):
         if digest(value) not in {digest(v) for v in domain}:
             raise ProgramError('Fact outside its finite declared domain')
@@ -355,6 +381,7 @@ def reduce(program, valid_facts):
 
 def _domain(declaration, value=UNKNOWN):
     if value is not UNKNOWN:
+        value=validate_value(value,declaration)
         return [interval(value, declaration.get('unit')) if declaration['type'] == 'number' else value]
     domain = declaration.get('domain')
     if isinstance(domain, list):
@@ -378,7 +405,12 @@ def possible_outputs(program, valid_facts, *, max_states=10000):
     program = validate_program(program)
     if type(max_states) is not int or max_states < 1:
         raise ProgramError('Enumeration limit must be positive')
-    reduction = reduce(program, valid_facts)
+    try:
+        reduction = reduce(program, valid_facts)
+    except DomainConflict:
+        return {'status':'inconsistent','outputs':[], 'reduction':reduce(program,{}),
+                'live_variables':[], 'nonempty_proven':False,'worlds_checked':0,
+                'inconsistency':'fact_outside_declared_domain'}
     constraints = program.get('constraints', [])
     names = set(reduction['remaining_variables']) | set().union(*(references(c) for c in constraints))
     domains = {k: _domain(d, valid_facts.get(k, UNKNOWN)) for k, d in program['variables'].items()}

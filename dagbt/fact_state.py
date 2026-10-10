@@ -59,6 +59,10 @@ class FactState:
 
     def integrate(self, rows, pending=()):
         """Validated complete batch first; no evaluator/publication in this loop."""
+        # Validate all supported values before mutating any route, including
+        # callers outside JointReader and numeric domain intersections.
+        rows=[{**r,'value':validate_value(r['value'],self.program['variables'][r['variable']])}
+              if r['stance']=='support' else r for r in rows]
         for row in rows:
             if row['stance'] in ('unknown','partial','irrelevant'):
                 continue

@@ -529,6 +529,7 @@ class BridgeSession:
         local = []
         if self.ledger.remaining('ann') == 0:
             trace['stop_reason'] = 'ann_budget_exhausted'
+            trace['search_status'] = 'budget_exhausted'
             return self._result(trace, local)
         self._active = True
         try:
@@ -551,6 +552,7 @@ class BridgeSession:
                 retriever, search = state['retriever'], state['search']
                 if not state['initialized']:
                     trace['stop_reason'] = 'initial_request_failed'
+                    trace['search_status'] = 'service_failed'
                     return self._result(trace, [])
                 search.resume()
                 retriever.max_ann_calls = retriever.ann_calls + self.ledger.remaining('ann')
@@ -560,6 +562,10 @@ class BridgeSession:
                 local = list(batch.ids)
                 state['consumed'] = len(retriever.proposal_batches)
             trace['stop_reason'] = batch.stop_reason or 'batch_completed' if batch else search.archive['stop_reason']
+            trace['frontier_available'] = search.frontier_available()
+            trace['search_status'] = ('budget_exhausted' if self.ledger.remaining('ann')==0 else
+                'batch_completed' if local else 'empty_probe' if trace['frontier_available'] else
+                'frontier_exhausted')
             trace['retrieval'] = retriever.public_dict()
             trace['search_archive'] = search.partial_public_dict(stop_reason=trace['stop_reason'])
             trace['ann_calls_completed'] = retriever.ann_calls
@@ -567,7 +573,8 @@ class BridgeSession:
             self._accumulate(local)
             return self._result(trace, local)
         except BaseException as exc:
-            trace.update(stop_reason='execution_error', error_type=type(exc).__name__, error=str(exc))
+            trace.update(stop_reason='execution_error', search_status='service_failed',
+                         error_type=type(exc).__name__, error=str(exc))
             raise
         finally:
             self._active = False

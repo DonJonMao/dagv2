@@ -112,6 +112,12 @@ class ProxyFreeSearch:
         self.paused = True
         self.archive['stop_reason'] = 'paused'
 
+    def frontier_available(self):
+        """Empty probes do not exhaust other roots or continuation states."""
+        return any(any((target,()) not in lane['seen'] for target in lane['roots']) or
+                   any((s[0],s[1]) not in lane['seen'] for s in lane['continuations'])
+                   for lane in self.lanes)
+
     def resume(self):
         self.paused = False
         self.archive['stop_reason'] = 'ready'

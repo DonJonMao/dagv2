@@ -1,5 +1,7 @@
 # residual_memory_v1 验证记录（2026-10-10）
 
+本文件保留 `a895695` 的历史交付记录；后续审查发现的两处缺陷、两处控制流边界及修复验证见 [审查跟进报告](RESIDUAL_MEMORY_REVIEW_FIXES_a895695.md)。历史 801 项回归和当时调用量不代表修复后的最新结果。
+
 状态：`IMPLEMENTED_AND_TESTED_OFFLINE`。固定代码基线 `f4e38df23b5b621a4d0e759c018c60e1fe25dd9b`，目标分支 `feat/residual-memory-f4e38df`，从已有远端 `eaeb5b2aadc2c881a32b11b245412340bbe5f7dd` 的两份规格文档继续实现。独立 worktree 为 `/Users/mao/projects/dagv2-residual-f4`。原 `feat/local-scoring-terminal-answer` 分支及其未跟踪研究资料、用户 PDF、旧报告和 trace 均保留。
 
 直接继承 f4 的无额外 Q dense、当前子问题局部评分基线、指定终端直接输出和无独立 Reader / FinalSelector。新增类型化剩余求值、可暂停零评分桥接、联合阅读、规则实例化、事实与实际依赖版本、审计后重新求值、证书发布及观察边界恢复。用户补充的完整初始 DAG 要求已经进入 planner 提示、验证器和两份原规格文档，撤销了案例中仅预规划规则任务的旧表述。

@@ -35,6 +35,10 @@ preplanned condition demands are allowed. Instantiate thresholds ONLY from appli
 source text. Rules must preserve the fixed output mode; one_reason uses one_reason,
 all_failures uses failures. Conditions can use numeric observations with units and
 comparisons, not a guessed deletion latency. Mark incomplete rule collections false.
+If rules_completion_required is true, seek explicit applicable completeness evidence.
+When a sourced complete rule supersedes a known incomplete rule, cite its original
+sources, retract the superseded route with a contradiction observation, and return
+the complete rule as a separate support observation; never silently overwrite it.
 A successful observation at one time does not establish a universal no-return rule.
 Represent a witnessed violation as IF(violation,false,unbound_compliance), keeping
 positive compliance unknown until explicit adequate scoped evidence supports it.
@@ -65,6 +69,21 @@ class JointReader:
         self.current_terminal_output = False
         self.clues = {}
         self.current_identity = None
+        # Source-window obligations and failed validation obligations have
+        # different lifetimes. Successful later windows settle only unread work.
+        self.unread_obligations = {}
+        self.failed_obligations = {}
+
+    def pending_variables(self):
+        return set().union(*self.unread_obligations.values(), *self.failed_obligations.values())
+
+    def obligation_snapshot(self):
+        return {name:[[i,a,sorted(v)] for (i,a),v in getattr(self,name).items()]
+                for name in ('unread_obligations','failed_obligations')}
+
+    def restore_obligations(self, snapshot):
+        for name in ('unread_obligations','failed_obligations'):
+            setattr(self,name,{(i,a):set(v) for i,a,v in snapshot.get(name,[])})
 
     def _source(self, alias):
         source = self.e.mapper.sources[alias]
@@ -116,6 +135,7 @@ class JointReader:
                 for a in all_aliases]}
         controller=getattr(self.e,'residual_control',None)
         if controller:
+            data['rules_completion_required']=controller.rules_completion_needed()
             data['supported_task_outputs']={p:certificate for p in step['inputs']
                 if (certificate:=controller.task_projection(p)) is not None}
         if semantic or self.current_terminal_output:
@@ -154,7 +174,7 @@ class JointReader:
         if row['stance']=='support':
             if variable in self.state.program.get('task_expressions',{}):
                 raise ProtocolError('Model observations cannot replace a deterministic DAG binding')
-            validate_value(row['value'], self.state.program['variables'][variable])
+            row={**row,'value':validate_value(row['value'], self.state.program['variables'][variable])}
         elif row['value'] is not None:
             raise ProtocolError('Non-support observation must not bind a value')
         if row['stance']!='contradiction' and row['retract_ids']:
@@ -199,6 +219,9 @@ class JointReader:
                    and (audit or (identity,a) not in self.read_states)]
         if not aliases and not semantic and not audit:
             return False
+        external_pending=set(self.state.pending)-self.pending_variables()
+        for alias in aliases:
+            self.unread_obligations[identity,alias]=set(variables)
         # Source windows are explicit partitions, with same-document neighbours.
         groups = []
         for alias in aliases:
@@ -209,7 +232,6 @@ class JointReader:
             groups=[[]]
         pending = list(groups)
         progressed = False
-        pending_variables = set(self.state.pending)
         while pending:
             batch=[]
             while pending:
@@ -220,8 +242,7 @@ class JointReader:
             if not batch and pending:
                 self.batches.append({'operation':operation,'identity':identity,'status':'capacity_unavailable',
                                      'unread_source_aliases':pending})
-                pending_variables.update(variables)
-                self.state.integrate([],pending_variables)
+                self.state.integrate([],external_pending|self.pending_variables())
                 raise InputOverflow('Local sources/parents/counters exceed real wire capacity')
             data=self._payload(step,query,variables,batch,semantic)
             if audit:
@@ -313,10 +334,10 @@ class JointReader:
             related={k[0] for k in failures}
             # A later independent reading cannot erase a failed counter slot.
             # Only this batch's scoped repair can settle its own failed rows.
-            pending_variables-= (completed-related) - set(self.state.pending)
-            pending_variables|=related
-            if pending:
-                pending_variables|=set(variables)
+            for alias in batch:
+                self.unread_obligations.pop((identity,alias),None)
+            if related:
+                self.failed_obligations.setdefault((identity,digest(batch)),set()).update(related)
             # Apply all valid facts AND all counters before any residual check.
             self.clues.setdefault(identity, [])
             for row in valid:
@@ -324,7 +345,7 @@ class JointReader:
                     for sid in row['source_ids']:
                         a=self.e.mapper.source_aliases[sid]
                         if a not in self.clues[identity]:self.clues[identity].append(a)
-            self.state.integrate(valid,pending_variables)
+            self.state.integrate(valid,external_pending|self.pending_variables())
             diagnostic={'operation':operation,'identity':identity,'source_aliases':batch,
                 'visible_source_aliases':list(visible),'valid_rows':len(valid),'failed_slots':[
                     {'variable':v,'id':rid,'error':err} for (v,rid),err in failures.items()],
@@ -350,6 +371,7 @@ class JointReader:
 
     def public_dict(self):
         return {'mapping_calls':0,'batches':deepcopy(self.batches),
+            **self.obligation_snapshot(),
             'read_states':[{'query_identity':i,'source_alias':a,'state':s} for (i,a),s in self.read_states.items()],
             'gaps':[{'query_identity':i,'variable':v,'unresolved':g} for (i,v),g in self.gaps.items()],
             'unread_sources':[a for a in self.e.mapper.sources if not any(k[1]==a for k in self.read_states)],
