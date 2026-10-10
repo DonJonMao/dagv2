@@ -304,7 +304,8 @@ class EvidenceMapper:
             raise ValueError("remaining_nodes must be a positive integer")
         e, s = self.engine, self.engine.s
         self._sync_chunks()
-        reserve = s["reserved_audit_calls"] + s.get('final_selection_calls', int(s['selection'] == 'flat')) + remaining_nodes
+        final_reserve = 0 if getattr(e,'local_terminal',False) else s.get('final_selection_calls', int(s['selection'] == 'flat'))
+        reserve = s["reserved_audit_calls"] + final_reserve + remaining_nodes
         available = max(0, e.ledger.remaining("llm") - reserve)
         quota = max(1, available // remaining_nodes) if available else 0
         max_attempts = 1 + s.get("max_repairs_per_request", 2)

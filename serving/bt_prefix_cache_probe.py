@@ -188,6 +188,8 @@ def observe_proxy(args):
             n = ordinal; ordinal += 1
         started = time.perf_counter()
         row = {"ordinal": n, "request_id": ctx["request_id"], "question_id": ctx.get("question_id", ctx["query_sha256"]),
+               'algorithm_version':ctx.get('algorithm_version','dagbt_fusion_reliability_v3'),
+               'scoring_context_id':ctx.get('scoring_context_id'),
                "dataset": ctx.get("dataset"), "source_ordinal": ctx.get("source_ordinal"),
                "rerank_payload": ctx["rerank_payload"], "batch_indices": list(range(len(payload["prompt"]))),
                "payload": payload, "payload_sha256": digest(payload), "observed_at": "proxy_post_json",
@@ -217,6 +219,8 @@ def observe_proxy(args):
                     raise ValueError("Frozen request order/input differs; no observation remapping")
                 request_id = expected["request_id"] + ":" + str(expected["ordinal"])
                 extra = {"question_id": expected["question_id"], "dataset": expected["dataset"],
+                         'algorithm_version':expected.get('algorithm_version','dagbt_fusion_reliability_v3'),
+                         'scoring_context_id':expected.get('scoring_context_id'),
                          "source_ordinal": expected["ordinal"]}
         token = context.set({"request_id": request_id, "query_sha256": digest(query), **extra,
                              "rerank_payload": {"query": query, "documents": documents, "instruction": instruction}})

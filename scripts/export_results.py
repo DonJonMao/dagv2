@@ -71,7 +71,8 @@ def read_answer(path):
                     continue
                 if text[end:].strip() not in ('', ','):
                     raise ValueError('Unexpected data after answer object')
-                if not isinstance(value, dict) or not isinstance(value.get('status'), str) or not isinstance(value.get('prediction'), str):
+                nullable_terminal = isinstance(value, dict) and value.get('answer_source') == 'dag_terminal' and value.get('status') != 'ok' and value.get('prediction') is None
+                if not isinstance(value, dict) or not isinstance(value.get('status'), str) or (not isinstance(value.get('prediction'), str) and not nullable_terminal):
                     raise ValueError('Invalid answer status/prediction')
                 return value
     raise ValueError('Top-level answer not found in native indent=2 JSON')

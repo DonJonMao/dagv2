@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from copy import deepcopy
 
 DEFAULTS = {
+    'algorithm_version': 'dagbt_fusion_reliability_v3',
     'ann_calls': 36, 'set_score_calls': 512, 'llm_calls': 24, 'reader_calls': 1,
     'reserved_gap_ann_calls': 2, 'reserved_audit_calls': 1,
     'json_repairs': 6, 'max_repairs_per_request': 2,
@@ -25,6 +26,12 @@ DEFAULTS = {
 # Full factorial discovery x selection has identical solver and raw reader.
 # Legacy dagv2 is a separate unchanged method, never called a matched control.
 METHODS = {
+    'dagbt_local_terminal_v1': {'algorithm_version': 'dagbt_local_terminal_v1',
+        'reader_calls': 0, 'selection_review': False, 'raw_memory_review': False,
+        'retrieval':'bridge','proxy_mode':'activation','selection':'dependency',
+        'condition_audit':True,'invalidation':True,'allow_alternatives':True,
+        'reader_chain':False,'navigation_closure':False,
+        'final_selection_calls': 0, 'reserved_selection_repairs': 0},
     'fusion': {},
     'fusion_proxy_free': {'proxy_mode': 'none'},
     'dense_dependency': {'retrieval': 'dense'},
@@ -50,12 +57,19 @@ def resolve(config, method='fusion'):
     if unknown:
         raise ValueError('Unknown fusion settings: ' + ', '.join(sorted(map(str, unknown))))
     result = {**deepcopy(DEFAULTS), **deepcopy(dict(supplied)), **METHODS[method]}
-    for name in ('ann_calls','set_score_calls','llm_calls','reader_calls','context_tokens',
+    local = method == 'dagbt_local_terminal_v1'
+    if result['algorithm_version'] != ('dagbt_local_terminal_v1' if local else DEFAULTS['algorithm_version']):
+        raise ValueError('Algorithm version must match the selected method')
+    if local and any(type(result[k]) is int and result[k] > cap for k,cap in (('ann_calls',36),('set_score_calls',512),('llm_calls',24))):
+        raise ValueError('Local method cannot expand the shared 36/512/24 budgets')
+    for name in ('ann_calls','set_score_calls','llm_calls','context_tokens',
                  'map_batch_tokens','reasoning_output_tokens','reader_output_tokens',
                  'max_initial_nodes','max_alternatives','max_enumeration_states',
                  'initial_width','proposal_width','max_quote_chars'):
         if not isinstance(result[name], int) or isinstance(result[name], bool) or result[name] < 1:
             raise ValueError(f'{name} must be positive integer')
+    if type(result['reader_calls']) is not int or (result['reader_calls'] != 0 if local else result['reader_calls'] < 1):
+        raise ValueError('reader_calls must be zero for local terminal and positive for legacy methods')
     for name in ('reserved_gap_ann_calls','reserved_audit_calls','max_refinement_nodes',
                  'max_feedback_rounds','json_repairs','max_repairs_per_request','input_margin','pair_rescue_width',
                  'final_selection_calls','reserved_selection_repairs'):
@@ -107,4 +121,8 @@ def resolve(config, method='fusion'):
         raise ValueError('Reader output reserve leaves no input context')
     if result['map_batch_tokens'] + result['reasoning_output_tokens'] + result['input_margin'] + 8 > result['context_tokens']:
         raise ValueError('Map batch plus reasoning output reserve exceeds context_tokens')
+    if local:
+        # These are legacy mechanisms, not tunable branches of the new method.
+        for name in ('final_selection_calls', 'reserved_selection_repairs'):
+            result.pop(name)
     return result

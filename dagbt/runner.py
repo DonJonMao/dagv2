@@ -109,6 +109,9 @@ def frozen_sources():
     paths.extend(p for p in (ROOT / "scripts").glob("*paired*") if p.is_file())
     if (ROOT / "scripts" / "run_v3.sh").is_file():
         paths.append(ROOT / "scripts" / "run_v3.sh")
+    paths.extend(ROOT / 'scripts' / name for name in ('smoke_local_terminal.py','demo_local_terminal.py',
+        'benchmark_bt_reranker_prefix_cache.py') if (ROOT / 'scripts' / name).is_file())
+    paths.append(ROOT / 'serving' / 'bt_prefix_cache_probe.py')
     return {str(p.relative_to(ROOT)): file_hash(p) for p in sorted(set(paths))}
 
 
@@ -188,7 +191,7 @@ def probe_reranker(config, output=None):
     return result
 
 
-def probe_fusion_planner(config, output=None):
+def probe_fusion_planner(config, output=None, method='fusion'):
     """One real, label-free planner request; never repair or change protocols."""
     from copy import deepcopy
     from dagbt.budget import Ledger
@@ -201,7 +204,7 @@ def probe_fusion_planner(config, output=None):
 
     base = Path(output) if output else ROOT / "outputs" / "preflight"
     trace = base / "preflight_calls" / f"planner-{time.time_ns()}"
-    settings = resolve(config, "fusion")
+    settings = resolve(config, method)
     effective = deepcopy(config)
     effective["fusion"] = settings
     ledger = Ledger({}, sink=lambda event: append_jsonl(trace / "ledger_events.jsonl", event))
@@ -213,10 +216,14 @@ def probe_fusion_planner(config, output=None):
         append_jsonl(trace / "protocol_events.jsonl", event)
     reasoner = Reasoner(transport, tokenizer, effective, settings, ledger, observe)
     e, repair, _ = legacy_modules()
+    from dagbt import local_terminal
+    local = method == local_terminal.VERSION
+    schema = local_terminal.planner_contract(e.PLAN_SCHEMA) if local else e.PLAN_SCHEMA
+    system = local_terminal.PLAN_SYSTEM if local else e.PLAN_SYSTEM
     query = "Which city hosts the science museum visited by the fictional traveler Mira?"
-    report = {"check": "fusion_planner_protocol", "version": "dagbt_fusion_reliability_v3", "status": "running",
+    report = {"check": "fusion_planner_protocol", "version": settings['algorithm_version'], "status": "running",
               "trace_directory": str(trace), "configured_protocol": settings.get("response_format", "plain"),
-              "schema_sha256": digest(e.PLAN_SCHEMA), "synthetic_query": query,
+              "schema_sha256": digest(schema), "synthetic_query": query,
               "logical_call_limit": 1, "repair_calls": 0, "protocol_fallback": False,
               "experiment_task": False,
               "scope": "one synthetic planner request using the actual fusion schema/validator; no labels or question budget; does not establish map/select/reader compatibility or answer quality"}
@@ -224,12 +231,12 @@ def probe_fusion_planner(config, output=None):
     started = time.monotonic()
     try:
         def validate_plan(value):
-            plan = repair.validate_plan(value)
+            plan = local_terminal.validate_plan(value, repair.validate_plan) if local else repair.validate_plan(value)
             if len(plan["steps"]) > settings["max_initial_nodes"]:
                 raise ValueError("Initial node cap exceeded")
             return plan
-        plan = reasoner.request("planner", prompts.plan_system(e.PLAN_SYSTEM, personal=False), query,
-                                validate_plan, e.PLAN_SCHEMA, reserve=0)
+        plan = reasoner.request("planner", prompts.plan_system(system, personal=False), query,
+                                validate_plan, schema, reserve=0)
     except Exception as exc:
         report.update(status="failed", **redacted_error(exc))
         raise
@@ -245,7 +252,8 @@ def probe_fusion_planner(config, output=None):
 
 def preflight(config, datasets, *, endpoints=True, output=None, arms=None):
     validate_config(config)
-    arms = list(arms or ["fusion"])
+    default_method = 'dagbt_local_terminal_v1' if config.get('fusion', {}).get('algorithm_version') == 'dagbt_local_terminal_v1' else 'fusion'
+    arms = list(arms or [default_method])
     from dagbt.config import resolve
     for arm in arms or ["fusion"]:
         if arm != "original":
@@ -311,7 +319,11 @@ def preflight(config, datasets, *, endpoints=True, output=None, arms=None):
         if config.get("reranker"):
             report["endpoints"]["reranker"] = probe_reranker(config, output)
         if is_bridgetree(config) and any(arm != "original" for arm in arms):
-            report["endpoints"]["fusion_planner_protocol"] = probe_fusion_planner(config, output)
+            method = next(arm for arm in arms if arm != 'original')
+            if method == 'fusion':
+                report["endpoints"]["fusion_planner_protocol"] = probe_fusion_planner(config, output)
+            else:
+                report["endpoints"]["fusion_planner_protocol"] = probe_fusion_planner(config, output, method)
     else:
         report["endpoints"] = {"status": "not_checked_offline_preflight"}
     report["protocol_note"] = ("BT profile uses its declared deterministic token estimator and chat adapter; missing derived indices will be built before question generation. "
@@ -576,7 +588,7 @@ def native_worker(connection, dataset, arm, config):
                     # the final MCQ reader receives the original public options.
                     fusion_question = {"id": q["id"], "question": q["user_question"]}
                     row = run_question(fusion_question, question_resources, calls, e.CONFIG,
-                                       method=arm, reader_question=q["question"])
+                                       method=arm, reader_question=q["question"], output_options=q['options'])
                 else:
                     row = run_question(generation_question, question_resources, calls, e.CONFIG, method=arm)
             if memory_scopes is not None:
@@ -661,8 +673,16 @@ class Worker:
 def validate_result(row, unit):
     if row.get("unit_id") != unit or not isinstance(row.get("answer"), dict):
         raise ValueError("Malformed result identity/answer")
-    if not isinstance(row["answer"].get("status"), str) or not isinstance(row["answer"].get("prediction"), str):
+    local = row.get('algorithm_version') == 'dagbt_local_terminal_v1'
+    prediction = row['answer'].get('prediction')
+    if not isinstance(row["answer"].get("status"), str) or (not isinstance(prediction, str) and not (local and prediction is None and row['answer']['status'] != 'ok')):
         raise ValueError("Malformed answer fields")
+    if local:
+        if row['answer'].get('answer_source') != 'dag_terminal' or row.get('budgets') != {}:
+            raise ValueError('Malformed terminal result contract')
+        if row['answer']['status'] == 'ok' and (not prediction or not row['answer'].get('final_node_id') or not row['answer'].get('sources')):
+            raise ValueError('Successful terminal requires current supported sources')
+        return row
     for k in ("5", "10", "20"):
         ids = row.get("budgets", {}).get(k, {}).get("selected_doc_ids")
         if not isinstance(ids, list) or len(ids) > int(k) or len(set(ids)) != len(ids):
@@ -670,10 +690,14 @@ def validate_result(row, unit):
     return row
 
 
-def failure_row(q, exc):
-    return {"unit_id": q["id"], "answer": {"status": "timeout" if isinstance(exc, TimeoutError) else "execution_failed", "prediction": "", **redacted_error(exc)},
+def failure_row(q, exc, arm=None):
+    row = {"unit_id": q["id"], "answer": {"status": "timeout" if isinstance(exc, TimeoutError) else "execution_failed", "prediction": "", **redacted_error(exc)},
             "ranking": {"status": "execution_failed"},
             "budgets": {str(k): {"selected_doc_ids": []} for k in (5, 10, 20)}}
+    if arm == 'dagbt_local_terminal_v1':
+        row.update(algorithm_version=arm, method=arm, budgets={})
+        row['answer'].update(answer_source='dag_terminal', final_node_id=None, sources=None)
+    return row
 
 
 def result_path(output, dataset, arm, unit):
@@ -726,7 +750,7 @@ def generate_dataset(output, dataset, questions, arms, config, *, retry_failed=F
                 if len(previous) >= maximum:
                     # A killed coordinator may leave an attempt but no terminal row.
                     if not path.exists():
-                        row = failure_row(q, RuntimeError("Persisted question-attempt cap reached"))
+                        row = failure_row(q, RuntimeError("Persisted question-attempt cap reached"), arm)
                         row["attempt_directories"] = [str(p.relative_to(output)) for p in previous]
                         save(path, row)
                     counts["attempt_limit_reached"] += 1
@@ -741,7 +765,7 @@ def generate_dataset(output, dataset, questions, arms, config, *, retry_failed=F
                 try:
                     row = validate_result(workers[arm].run(q, attempt), q["id"])
                 except Exception as exc:
-                    row = failure_row(q, exc)
+                    row = failure_row(q, exc, arm)
                 row["runner"] = {"dataset": dataset, "arm": arm, "attempt": len(previous) + 1,
                                  "wall_seconds": time.monotonic() - started, "cost": request_cost(attempt)}
                 row["attempt_directories"] = [str(p.relative_to(output)) for p in [*previous, attempt]]
@@ -884,7 +908,7 @@ def module_metrics(row, label, dataset, output):
     ledger = diag.get("ledger", {}).get("used", {})
     metered_limits = diag.get("ledger", {}).get("limits", {})
     statuses = Counter(node.get("status", "legacy_resolved" if node.get("resolved") else "legacy_unresolved") for node in nodes)
-    return {"candidate_count": len(candidates) if candidates is not None else None,
+    result = {"candidate_count": len(candidates) if candidates is not None else None,
             "gold_candidate_title_group_recall": candidate_recall,
             "gold_candidate_all_support": candidate_all,
             "gold_discovery_minus_selection_recall_at20": candidate_recall - selected_recall if candidate_recall is not None else None,
@@ -909,6 +933,20 @@ def module_metrics(row, label, dataset, output):
             "interpretation": ("PersonaMem has no gold document support labels; gold_* metrics are unavailable. "
                                "Model/structural statuses do not prove semantic correctness." if dataset == "personamem" else
                                "gold_* uses held-out title-group labels after generation; model/structural statuses and complete_required do not prove semantic entailment")}
+    if row.get('algorithm_version') == 'dagbt_local_terminal_v1':
+        for key in ('gold_discovery_minus_selection_recall_at20','selected_doc_count_at20',
+                    'structural_complete_required_at20','structural_necessary_covered_at20',
+                    'reader_prompt_tokens_local','reader_context_tokens_with_output_reserve','reader_prompt_tokens_api'):
+            result[key] = None
+        source_ids = (row['answer'].get('sources') or {}).get('doc_ids', [])
+        result.update(legacy_reader_metrics='not_applicable',
+            semantic_evidence={'status':'not_applicable','reason':'Legacy FinalSelector evidence/coverage metrics'},
+            terminal_source_doc_count=len(source_ids),
+            gold_terminal_source_title_group_recall=group_recall(source_ids)[0],
+            terminal_input_doc_count=len(row['answer'].get('terminal_input_doc_ids', [])),
+            terminal_input_tokens_local=(diag.get('terminal_input') or {}).get('request', {}).get('input_tokens_local'),
+            answer_source='dag_terminal')
+    return result
 
 
 def summarize_modules(rows):
@@ -975,6 +1013,8 @@ def summarize_reliability(rows, answer_metric):
 
 def summarize_semantic_evidence(rows, answer_metric=None):
     """Current outcomes only; labels are optional for read-only live diagnostics."""
+    if rows and all(r.get('modules',{}).get('semantic_evidence',{}).get('status') == 'not_applicable' for r in rows):
+        return {'status':'not_applicable','reason':'Legacy FinalSelector evidence/coverage metrics; inspect terminal sources'}
     def semantic(row):
         return row.get("modules", {}).get("semantic_evidence", {})
     def group(subset):
@@ -1089,7 +1129,7 @@ def score_all(output, scopes, arms, *, label_loader=None):
     summaries = {}
     for dataset, questions in scopes.items():
         is_personamem = dataset == "personamem"
-        metric_names = ("accuracy",) if is_personamem else METRICS
+        metric_names = ("accuracy",) if is_personamem else ('f1','em') if 'dagbt_local_terminal_v1' in arms else METRICS
         answer_metric = "accuracy" if is_personamem else "em"
         labels = {r["id"]: r for r in label_loader(dataset)}
         all_scores, comparisons = {}, []
@@ -1124,10 +1164,13 @@ def score_all(output, scopes, arms, *, label_loader=None):
                 item["modules"] = module_metrics(row, label, dataset, output)
                 item["result_path"] = str(result_path(output, dataset, arm, q["id"]).relative_to(output))
                 item["attempt_directories"] = row.get("attempt_directories", [])
-                item["selected_doc_ids"] = {k: row["budgets"][k]["selected_doc_ids"] for k in ("5", "10", "20")}
+                local = row.get('algorithm_version') == 'dagbt_local_terminal_v1'
+                item["selected_doc_ids"] = {} if local else {k: row["budgets"][k]["selected_doc_ids"] for k in ("5", "10", "20")}
+                if local:
+                    item['legacy_selection_metrics'] = 'not_applicable'
                 item["latest_attempt_cost"] = row.get("runner", {}).get("cost")
                 for k in ("5", "10", "20"):
-                    if is_personamem:
+                    if is_personamem or local:
                         continue
                     ids = set(map(str, row["budgets"][k]["selected_doc_ids"]))
                     if dataset == "musique":

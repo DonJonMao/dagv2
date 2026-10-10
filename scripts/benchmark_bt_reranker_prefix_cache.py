@@ -25,6 +25,27 @@ import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
 ATOL, RTOL = 1e-6, 1e-5  # dagbt.bridge.probe_reranker_protocol defaults, frozen before runs
+LOCAL_ALGORITHM = 'dagbt_local_terminal_v1'
+LEGACY_ALGORITHM = 'dagbt_fusion_reliability_v3'
+
+
+def algorithm_identity(row):
+    version = row.get('algorithm_version', LEGACY_ALGORITHM)
+    if version not in (LOCAL_ALGORITHM, LEGACY_ALGORITHM):
+        raise ValueError('Unknown algorithm identity')
+    if version == LOCAL_ALGORITHM and not row.get('scoring_context_id'):
+        raise ValueError('Local scoring context missing')
+    return version, row.get('scoring_context_id')
+
+
+def score_bank_key(payload, row):
+    version, context = algorithm_identity(row)
+    task = [payload['query'], payload['documents'], payload.get('instruction')]
+    return digest([version, context, *task]) if version == LOCAL_ALGORITHM else digest(task)
+
+
+def transport_record_identity(record):
+    return {k:record[k] for k in ('unit_id','url','payload','algorithm_version','scoring_context_id') if k in record}
 
 
 def digest(value):
@@ -142,16 +163,18 @@ def collect_workload(config_path, output, questions=10, smoke=None):
     if questions not in {10, 50} or (questions == 50 and smoke is None):
         raise ValueError("Collection is limited to fixed 10-question smoke or gated fixed 50-question main")
     config = runner.validate_config(json.loads(Path(config_path).read_text()))
-    settings = resolve(config, "fusion")
+    method = LOCAL_ALGORITHM if config.get('fusion',{}).get('algorithm_version') == LOCAL_ALGORITHM else 'fusion'
+    settings = resolve(config, method)
     budgets = {k: settings[k] for k in ("ann_calls", "set_score_calls", "llm_calls", "reader_calls")}
-    if budgets != {"ann_calls": 36, "set_score_calls": 512, "llm_calls": 24, "reader_calls": 1}:
+    if budgets != {"ann_calls": 36, "set_score_calls": 512, "llm_calls": 24, "reader_calls": 0 if method == LOCAL_ALGORITHM else 1}:
         raise ValueError("Reference algorithm budgets changed")
     selected = runner.load_questions("personamem", questions)
     dataset_hash = file_hash(ROOT / "data/personamem/manifest.json")
     gate = main_collection_gate(smoke, config_path, selected, dataset_hash) if questions == 50 else None
     out = new_output(output)
     manifest = {"schema": 1, "kind": "real_dagbt_workload_capture_not_accuracy_experiment",
-                "datasets": ["personamem"], "arms": ["fusion"], "config": config,
+                "datasets": ["personamem"], "arms": [method], "config": config,
+                'algorithm_version':settings['algorithm_version'],
                 "question_ids": {"personamem": [q["id"] for q in selected]},
                 "questions_digest": {"personamem": digest(selected)}, "selection": f"first_{questions}_packaged_questions",
                 "source_hashes": runner.frozen_sources(), "algorithm_budgets": budgets,
@@ -172,12 +195,12 @@ def collect_workload(config_path, output, questions=10, smoke=None):
             runner.save(out / "pid.json", {"pid": os.getpid(), "pgid": os.getpgrp(), "output": str(out.resolve()),
                                           "started_unix": time.time(), "process_command": command})
             runner.save(out / "progress.json", {"state": "preflight", "updated_unix": time.time()})
-            report = runner.preflight(config, ["personamem"], endpoints=True, output=out, arms=["fusion"])
+            report = runner.preflight(config, ["personamem"], endpoints=True, output=out, arms=[method])
             runner.save(out / "preflight.json", report)
             runner.save(out / "progress.json", {"state": "preparing_index", "updated_unix": time.time()})
             ensure_index(config, "personamem", out)
             runner.save(out / "index_artifacts.json", {"personamem": inspect_index(config, "personamem")})
-            counts = runner.generate_dataset(out, "personamem", selected, ["fusion"], config, retry_failed=False)
+            counts = runner.generate_dataset(out, "personamem", selected, [method], config, retry_failed=False)
             runner.save(out / "capture_summary.json", {"terminal_counts": counts, "questions": len(selected), "labels_read": False})
             runner.save(out / "progress.json", {"state": "complete" if counts.get("ok", 0) == len(selected) else "complete_with_failures",
                                                 "terminal_counts": counts, "updated_unix": time.time()})
@@ -194,6 +217,7 @@ def scorer_metadata(events_path):
     IDs originate in the actual frozen scorer, not guessed from answers.
     """
     pending, active, requests, cache_counts = [], None, {}, None
+    contexts = {}
     for line, event in read_rows(events_path):
         if event.get("event") == "cache_lookup" and event.get("module") == "scoring" and event.get("source") == "cache_miss":
             pending.append(event["ids"])
@@ -210,13 +234,21 @@ def scorer_metadata(events_path):
                 raise ValueError("Scorer IDs/physical batch alignment differs")
             stage = "/".join(map(str, event["stage"]))
             value = {"set_ids": ids, "documents_sha256": digest(docs), "source_event_line": line}
+            if event.get('algorithm_version') == LOCAL_ALGORITHM:
+                algorithm_identity(event)
+                value.update(algorithm_version=LOCAL_ALGORITHM,
+                    scoring_context_id=event['scoring_context_id'],node_id=event.get('node_id'),
+                    scoring_query=event.get('query'))
             if stage in requests and requests[stage] != value:
                 raise ValueError("Ambiguous original rerank stage identity")
             requests[stage] = value
         elif event.get("event") == "bridge_discovery_completed":
             cost = event.get("trace", {}).get("scorer_cost_cumulative")
             if cost is not None:
-                cache_counts = {k: cost.get(k) for k in ("memory_cache_hits", "persistent_cache_hits", "scored_sets", "logical_input_tokens_estimate")}
+                trace = event.get('trace',{})
+                context = trace.get('scoring_context_id', 'legacy_global')
+                contexts[context] = {k:cost.get(k,0) for k in ('memory_cache_hits','persistent_cache_hits','scored_sets','logical_input_tokens_estimate')}
+                cache_counts = {k:sum(c[k] for c in contexts.values()) for k in contexts[context]}
     return requests, cache_counts
 
 
@@ -296,7 +328,7 @@ def _freeze_transport(source, output, limit=50):
     # denominator. task.json is authoritative, not an invented path identity.
     for task_path in sorted(source.rglob("task.json")):
         task = json.loads(task_path.read_text())
-        if task.get("arm") != "fusion" or not isinstance(task.get("question"), dict):
+        if task.get("arm") not in ('fusion',LOCAL_ALGORITHM) or not isinstance(task.get("question"), dict):
             continue
         unit, dataset = task["question"]["id"], task["dataset"]
         units.append(dataset + ":" + unit)
@@ -314,6 +346,7 @@ def _freeze_transport(source, output, limit=50):
     seen = set()
     physical_seen, journal_seen = set(), set()
     scorer_counts = []
+    algorithms = set()
 
     def rows():
         spool = out / ".physical_order.sqlite"
@@ -354,7 +387,7 @@ def _freeze_transport(source, output, limit=50):
                 if not record_path.exists():
                     raise ValueError("Missing complete Transport request record")
                 record = json.loads(record_path.read_text())
-                identity = {k: record[k] for k in ("unit_id", "url", "payload")}
+                identity = transport_record_identity(record)
                 if digest(identity) != event["request_ref"]:
                     raise ValueError("Transport request hash mismatch")
                 payload = record["payload"]
@@ -382,6 +415,9 @@ def _freeze_transport(source, output, limit=50):
                     counts["successful_attempts" if success else "failed_or_unknown_attempts"] += 1
                     counts["successful_model_score_samples"] += len(payload["documents"]) if success else 0
                     row = {"dataset": dataset, "question_id": unit,
+                           'algorithm_version':record.get('algorithm_version',LEGACY_ALGORITHM),
+                           'scoring_context_id':record.get('scoring_context_id'),
+                           'node_id':None if metadata is None else metadata.get('node_id'),
                            "request_id": event["request_ref"], "stage": call["stage"],
                            "journal_line": line, "attempt_index": attempt_index,
                            "started_unix": attempt.get("started_unix"), "payload": payload,
@@ -395,6 +431,9 @@ def _freeze_transport(source, output, limit=50):
                            "request_file_sha256": file_hash(record_path)}
                     if not isinstance(row["started_unix"], (int, float)):
                         raise ValueError("Missing physical timestamp; cannot invent replay order")
+                    algorithms.add(algorithm_identity(row)[0])
+                    if len(algorithms) > 1:
+                        raise ValueError('Cross-algorithm traces must be frozen separately')
                     db.execute("INSERT INTO attempts VALUES (?,?,?,?,?)", (row["started_unix"], row["question_id"],
                                row["journal_line"], row["attempt_index"], json.dumps(row, ensure_ascii=False)))
         # Disk sort streams selected requests; raw full-run bodies are never
@@ -408,6 +447,7 @@ def _freeze_transport(source, output, limit=50):
             spool.unlink()
     write_rows(out / "rerank_trace.jsonl", rows())
     manifest = {"schema": 1, "kind": "dagbt_transport_trace", "selection": "ascending SHA256(question identity)",
+                'algorithm_versions':sorted(algorithms),
                 "requested_questions": limit, "available_questions": len(set(units)),
                 "selected_question_identities": chosen, "smoke_question_identities": chosen[:10],
                 "counts": dict(counts), "source_journals": identities,
@@ -424,6 +464,7 @@ def _freeze_transport(source, output, limit=50):
 
 
 def validate_engine_row(row):
+    algorithm_identity(row)
     p = row["payload"]
     prompts = p.get("prompt")
     if not isinstance(prompts, list) or not prompts or not all(
@@ -691,6 +732,8 @@ def replay(trace, output, backend, identity_path, condition, reset=False):
             record = {k: row[k] for k in ("ordinal", "request_id", "payload_sha256", "computation_identity", "cache_namespace")}
             record["label_token_id"] = row["payload"].get("allowed_token_ids", [None])[0]
             record["rerank_payload"] = row.get("rerank_payload")
+            record.update(algorithm_version=row.get("algorithm_version",LEGACY_ALGORITHM),
+                          scoring_context_id=row.get("scoring_context_id"))
             record["final_inputs"] = [{"index": i, "token_ids_sha256": digest(tokens), "input_length": len(tokens)}
                                       for i, tokens in enumerate(prompts)]
             if row.get("rerank_payload"):
@@ -781,6 +824,8 @@ def normalized_scores(results, label_ids):
         if set(group) != {"yes", "no"}:
             raise ValueError("Incomplete yes/no computation pair")
         y, n = group["yes"], group["no"]
+        if algorithm_identity(y) != algorithm_identity(n):
+            raise ValueError("Label pair scoring context differs")
         p = y["rerank_payload"]
         if p is None or p != n["rerank_payload"] or len(y["raw_logprobs"]) != len(n["raw_logprobs"]):
             raise ValueError("Label pair rerank identity differs")
@@ -794,8 +839,9 @@ def normalized_scores(results, label_ids):
             score = math.exp(yes - offset) / (math.exp(yes - offset) + math.exp(no - offset))
             scores.append(score)
             per_sample.append({"request_id": request_id, "index": i, "score": score,
+                               "algorithm_version":algorithm_identity(y)[0], "scoring_context_id":algorithm_identity(y)[1],
                                "query_sha256": digest(p["query"]), "set_content_sha256": digest(p["documents"][i])})
-        key = digest([p["query"], p["documents"], p.get("instruction")])
+        key = score_bank_key(p,y)
         if key in bank and bank[key] != scores:
             raise ValueError("Repeated exact request varies; use per-physical request mapping, not a result-cache surrogate")
         bank[key] = scores
@@ -828,8 +874,9 @@ def build_search_bundles(source, output):
     source = Path(source).resolve()
     with quiescent_source(source):
         manifest = json.loads((source / "manifest.json").read_text())
-        if manifest.get("kind") != "real_dagbt_workload_capture_not_accuracy_experiment" or manifest.get("datasets") != ["personamem"] or manifest.get("arms") != ["fusion"]:
+        if manifest.get("kind") != "real_dagbt_workload_capture_not_accuracy_experiment" or manifest.get("datasets") != ["personamem"] or manifest.get("arms") not in (["fusion"],[LOCAL_ALGORITHM]):
             raise ValueError("Bundle export requires the original scoped PersonaMem fusion capture")
+        method = manifest["arms"][0]
         config = runner.validate_config(manifest["config"])
         if manifest.get("source_hashes") != runner.frozen_sources():
             raise ValueError("Original algorithm sources changed since capture")
@@ -842,7 +889,7 @@ def build_search_bundles(source, output):
         finally:
             if inherited is not None: os.environ["DAGV2_CONFIG"] = inherited
         _, resources, hashes = prepare_resources(config, "personamem", pipeline, load_tokenizer(config))
-        recorded_hashes = json.loads((source / "personamem/fusion/resource_hashes.json").read_text())
+        recorded_hashes = json.loads((source / "personamem" / method / "resource_hashes.json").read_text())
         if hashes != recorded_hashes:
             raise ValueError("Original corpus/index resource identity changed since capture")
         questions = {q["id"]: q for q in load_questions(ROOT)}
@@ -852,12 +899,12 @@ def build_search_bundles(source, output):
         entries = []
         for unit in selected:
             q = questions[unit]
-            attempts = sorted((source / "personamem/fusion/attempts" / runner.digest(unit)).glob("attempt-*"))
+            attempts = sorted((source / "personamem" / method / "attempts" / runner.digest(unit)).glob("attempt-*"))
             if not attempts:
                 entries.append({"question_id_sha256": digest(unit), "replayable": False, "reason": "no_original_attempt"})
             for attempt in attempts:
                 task = json.loads((attempt / "task.json").read_text())
-                if task.get("question") != q or task.get("dataset") != "personamem" or task.get("arm") != "fusion":
+                if task.get("question") != q or task.get("dataset") != "personamem" or task.get("arm") != method:
                     raise ValueError("Original task differs from frozen public question/scope")
                 if not (attempt / "result.json").is_file():
                     raise ValueError("Original question attempt is not terminal")
@@ -866,7 +913,9 @@ def build_search_bundles(source, output):
                 vector_path = directory / "vectors.npy"
                 with os.fdopen(os.open(vector_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as handle:
                     np.save(handle, vectors, allow_pickle=False)
-                bundle = {"dataset": "personamem", "method": "fusion", "config": pipeline.e.CONFIG,
+                bundle = {"dataset": "personamem", "method": method, "config": pipeline.e.CONFIG,
+                          "algorithm_version":LOCAL_ALGORITHM if method==LOCAL_ALGORITHM else LEGACY_ALGORITHM,
+                          "output_options":q.get("options"),
                           "question": {"id": unit, "question": q["user_question"]}, "reader_question": q["question"],
                           "attempt_dir": str(attempt), "ids": ids,
                           "documents": [{"doc_id": d, "title": docs[d].title, "text": docs[d].text,
@@ -900,9 +949,13 @@ def search_replay(bundle_path, scores_path, label_ids, output):
     import numpy as np
     from dagbt import engine as engine_module
     from dagbt.model_runtime import load_tokenizer
-    from dagbt.transport import Transport, normalize_response, prepare_request
+    from dagbt.transport import Transport, normalize_response, prepare_request, request_identity
     import threading
     bundle = json.loads(Path(bundle_path).read_text())
+    from dagbt.config import resolve
+    version = resolve(bundle["config"],bundle.get("method","fusion"))["algorithm_version"]
+    if bundle.get("algorithm_version",LEGACY_ALGORITHM) != version:
+        raise ValueError("Bundle algorithm identity differs from method")
     if bundle["config"].get("model_profile") != "bridgetree":
         raise ValueError("Only the existing BT model profile is supported")
     if bundle["config"].get("_test_transport"):
@@ -922,12 +975,14 @@ def search_replay(bundle_path, scores_path, label_ids, output):
         runtime.e.native.configure(runtime.e.CONFIG)
         runtime.e.validate_plan = runtime.repair.validate_plan
         configure_personamem_reader()
-    bank, _ = normalized_scores(scores_path, label_ids)
+    bank, samples = normalized_scores(scores_path, label_ids)
+    if any(s["algorithm_version"] != version for s in samples):
+        raise ValueError("Cross-algorithm score replay is forbidden")
     source = Path(bundle["attempt_dir"]) / "requests"
     records = {}
     for path in source.glob("*.json"):
         r = json.loads(path.read_text())
-        if digest({k: r[k] for k in ("unit_id", "url", "payload")}) != path.stem:
+        if digest(transport_record_identity(r)) != path.stem:
             raise ValueError("Original observation request identity mismatch")
         if "response" in r:
             records[path.stem] = r
@@ -935,16 +990,16 @@ def search_replay(bundle_path, scores_path, label_ids, output):
     requested = []
 
     class FrozenTransport(Transport):
-        def get(self, stage, url, payload, *, reserve=None, extra_reserve=0):
+        def get(self, stage, url, payload, *, reserve=None, extra_reserve=0, scoring_context_id=None):
             url, payload, legacy = prepare_request(stage, url, payload, self.config)
-            key = digest({"unit_id": self.unit, "url": url, "payload": payload})
+            key = digest(request_identity(self.unit,url,payload,self.config,scoring_context_id))
             requested.append({"stage": stage, "request_ref": key})
             if key not in records:
                 raise ValueError("TRAJECTORY_DIVERGENCE_UNSEEN_REQUEST:" + key)
             r = deepcopy(records[key])
             rerank = url == self.config.get("reranker", {}).get("url")
             if rerank:
-                lookup = digest([payload["query"], payload["documents"], payload.get("instruction")])
+                lookup = score_bank_key(payload, {"algorithm_version":version,"scoring_context_id":scoring_context_id})
                 if lookup not in bank:
                     raise ValueError("TRAJECTORY_DIVERGENCE_UNSCORED_SET:" + lookup)
                 r["response"] = {"results": [{"index": i, "relevance_score": s} for i, s in enumerate(bank[lookup])]}
@@ -969,7 +1024,7 @@ def search_replay(bundle_path, scores_path, label_ids, output):
     try:
         instance = engine_module.Engine(bundle["question"], resources, SimpleNamespace(output=out),
                                        bundle["config"], bundle.get("method", "fusion"),
-                                       reader_question=bundle.get("reader_question"))
+                                       reader_question=bundle.get("reader_question"),output_options=bundle.get("output_options"))
         result = instance.run()
     except Exception as exc:
         write(out / "replay_status.json", {"completed": False, "error_type": type(exc).__name__,
@@ -979,7 +1034,7 @@ def search_replay(bundle_path, scores_path, label_ids, output):
     finally:
         engine_module.Transport = prior
     write(out / "request_sequence.json", requested)
-    write(out / "trajectory.json", {"bridge_traces": instance.bridge.traces,
+    write(out / "trajectory.json", {"bridge_traces": instance.bridge.traces, "algorithm_version":version,
           "events": instance.events, "logical_counts": dict(instance.ledger.used),
           "requests": requested})
     # Full private trace captures queue/scheduler, candidates, decisions and budgets.
@@ -1000,6 +1055,8 @@ def compare_search(off, on, output):
         if isinstance(value, list): return [structural(v) for v in value]
         return value
     a, b = (json.loads((Path(p) / "trajectory.json").read_text()) for p in (off, on))
+    if a.get("algorithm_version",LEGACY_ALGORITHM) != b.get("algorithm_version",LEGACY_ALGORITHM):
+        raise ValueError("Cross-algorithm trajectory comparison is forbidden")
     sa, sb = structural(a), structural(b)
     first = None
     for section in ("requests", "bridge_traces", "events", "logical_counts"):
@@ -1083,6 +1140,8 @@ def compare_runs(off, on, output):
         raise ValueError("HTTP/sample sequence lengths differ")
     differences = []
     for (_, x), (_, y) in zip(ar, br):
+        if algorithm_identity(x) != algorithm_identity(y):
+            raise ValueError('Cross-algorithm/scoring-context comparison is forbidden')
         if any(x[k] != y[k] for k in ("ordinal", "request_id", "payload_sha256", "computation_identity", "cache_namespace")):
             raise ValueError("Complete final input or original order differs")
         comparison = compare_scores(x["raw_logprobs"], y["raw_logprobs"]) if x["success"] and y["success"] else None

@@ -24,6 +24,7 @@ from .reasoning import Reasoner, InputOverflow, ProtocolError, RefusalError
 from .evidence_mapping import EvidenceMapper
 from .evidence_views import build_view
 from .row_recovery import recover_rows
+from . import local_terminal
 
 RELIABILITY_VERSION = "dagbt_fusion_reliability_v3"
 
@@ -49,15 +50,29 @@ def _strings(value, name):
     return value
 
 class Engine:
-    def __init__(self,q,resources,calls,config,method,*,reader_question=None):
+    def __init__(self,q,resources,calls,config,method,*,reader_question=None,output_options=None):
         if set(q)-{'id','question'}:raise ProtocolError('Generation question must contain only id/question')
         self.q,self.docs,self.ids,self.vectors,self.index,self.tokenizer=q,*resources
         self.config=deepcopy(config);self.s=resolve(config,method);self.config['fusion']=self.s
         self.method=method;self.started=time.time();self.events=[]
+        self.local_terminal = self.s['algorithm_version'] == local_terminal.VERSION
+        self.final_node_id = None
+        self.terminal_input = None
+        self.terminal_format_valid = None
+        self.audit_complete = False
+        self.resolve_reservation = 0
         self.reader_question=q['question'] if reader_question is None else reader_question
         self.personal=reader_question is not None
-        self.baseline_ids=[];self.semantic_evidence={}
+        self.output_options = deepcopy(output_options)
+        self.output_identity = digest({'question': self.reader_question, 'options': self.output_options,
+                                       'contract': local_terminal.VERSION})
+        self.semantic_evidence={}
+        if not self.local_terminal:
+            self.baseline_ids=[]
         self.output=Path(calls.output) if hasattr(calls,'output') else None
+        if self.local_terminal and self.output:
+            self.output.mkdir(parents=True,exist_ok=True)
+            self.output.chmod(0o700)
         self.ledger=Ledger({'ann':self.s['ann_calls'],'set_score':self.s['set_score_calls'],
             'llm':self.s['llm_calls'],'reader':self.s['reader_calls'],'json_repairs':self.s['json_repairs']},self.event)
         self.calls=StubMeter(calls,self.ledger,self.config) if config.get('_test_transport') else Transport(
@@ -75,14 +90,22 @@ class Engine:
         if self.output:
             self.output.mkdir(parents=True,exist_ok=True)
             with (self.output/'fusion_events.jsonl').open('a') as out:
+                if self.local_terminal:
+                    (self.output/'fusion_events.jsonl').chmod(0o600)
                 out.write(json.dumps(event,ensure_ascii=False)+'\n');out.flush()
 
     def plan(self):
-        plan=self.reasoner.json('planner',prompts.plan_system(self.e.PLAN_SYSTEM,self.personal),self.q['question'],self.repair.validate_plan,self.e.PLAN_SCHEMA)
+        system = local_terminal.PLAN_SYSTEM if self.local_terminal else self.e.PLAN_SYSTEM
+        schema = local_terminal.planner_contract(self.e.PLAN_SCHEMA) if self.local_terminal else self.e.PLAN_SCHEMA
+        validate = (lambda value: local_terminal.validate_plan(value, self.repair.validate_plan)) if self.local_terminal else self.repair.validate_plan
+        plan=self.reasoner.json('planner',prompts.plan_system(system,self.personal),self.q['question'],validate,schema)
         if len(plan['steps'])>self.s['max_initial_nodes']:raise ProtocolError('Initial node cap exceeded')
         self.steps=deepcopy(plan['steps'])
         parents={p for st in self.steps for p in st['inputs']}
         sinks=[st['output_slot'] for st in self.steps if st['output_slot'] not in parents]
+        if self.local_terminal:
+            self.final_node_id = plan['final_node_id']
+            sinks = [self.final_node_id]
         self.requirements=[{'id':'answer','description':self.q['question'],'necessary':True,
                             'terminal_node_ids':sinks,'terminal_mode':'all','time_scope':None}]
         self.requirements_hash=digest(self.requirements)
@@ -135,7 +158,8 @@ class Engine:
 
     def recover(self,operation,system,view,validate,fields):
         result,diagnostic=recover_rows(self.reasoner,operation,system,view.data,validate,
-                                      fields,decode=view.decode)
+                                      fields,decode=view.decode,
+                                      extra_reserve=self.resolve_reservation if operation=='resolve' else 0)
         self.row_recoveries.append({'operation':operation,**diagnostic})
         if not diagnostic['complete']:
             error={'stage':operation,'type':diagnostic.get('error_type') or 'ProtocolError',
@@ -191,7 +215,14 @@ class Engine:
               'prior_state':old,'known_conflicts':self.conflicts,
               'refinement_available':self.s['refinement'] and self.refinements<self.s['max_refinement_nodes'],
               'condition_audit_enabled':self.s['condition_audit']}
-        view=self.evidence_view('resolve',prompts.RESOLVE,fixed)
+        terminal = self.local_terminal and node_id == self.final_node_id
+        system = prompts.RESOLVE
+        if terminal:
+            system += local_terminal.TERMINAL_INSTRUCTION
+            fixed['public_output_question'] = self.reader_question
+            if self.output_options is not None:
+                fixed['public_options'] = self.output_options
+        view=self.evidence_view('resolve',system,fixed)
         allowed_parents={n['id']:n for n in view.data['supported_parents'] if n['status']=='supported'}
         allowed_spans={sid for sid in view.visible_span_ids if node_id in self.spans[sid].get('node_ids',[])}
         def validate(value):
@@ -209,6 +240,22 @@ class Engine:
             result={**old,'answer':answer,'status':status,'version':version,'applicable_scope':new_scope,'declared_status':status,'alternatives':[],
                     'unresolved_inputs':missing,'unresolved_guards':guards,
                     'partial_span_ids':sorted(allowed_spans)}
+            if terminal:
+                prediction = value.get('final_prediction') if self.personal else value.get('final_prediction', answer if status=='supported' else None)
+                if status=='supported':
+                    if not isinstance(prediction, str) or not prediction.strip():
+                        self.terminal_format_valid = False
+                        raise ProtocolError('Supported terminal requires final_prediction', category='output_format')
+                    if self.output_options is not None:
+                        from .personamem import parse_choice
+                        if parse_choice(prediction, self.output_options) is None:
+                            self.terminal_format_valid = False
+                            raise ProtocolError('Invalid terminal choice', category='output_format')
+                elif prediction is not None:
+                    self.terminal_format_valid = False
+                    raise ProtocolError('Unsupported terminal prediction must be null', category='output_format')
+                self.terminal_format_valid = True
+                result.update(final_prediction=prediction, output_identity=self.output_identity)
             cap=self.s['max_alternatives'] if self.s['allow_alternatives'] else 1
             for i,a in enumerate(alternatives):
                 for f in ('source_span_ids','guard_span_ids','used_parent_ids'):_strings(a.get(f,[]),f)
@@ -242,7 +289,12 @@ class Engine:
                 max_nodes=self.s['max_initial_nodes']+self.s['max_refinement_nodes'],max_alternatives=cap)
             normalized=next(n for n in compiled['nodes'] if n['id']==node_id)
             return normalized,refinements,len(alternatives)-cap if len(alternatives)>cap else 0
-        resolved,refinements,dropped=self.recover('resolve',prompts.RESOLVE,view,validate,('alternatives','refinements'))
+        resolved,refinements,dropped=self.recover('resolve',system,view,validate,('alternatives','refinements'))
+        if terminal:
+            self.terminal_input = {'node_id': node_id, 'doc_ids': list(view.audit['visible_doc_ids']),
+                'span_ids': sorted(view.visible_span_ids), 'output_identity': self.output_identity,
+                'request': deepcopy(self.reasoner.last_response), 'view': deepcopy(view.audit),
+                'validation_complete':self.row_recoveries[-1]['complete']}
         self.nodes=[resolved if n['id']==node_id else n for n in self.nodes]
         self.compile()
         self.event({'event':'node_resolved','node':resolved,'grounded_query':query,'prior_state':old,
@@ -283,7 +335,12 @@ class Engine:
             self.node_map()[node_id]['unresolved_inputs']=missing
             return False
         parent_ids=self.parent_docs(step['inputs'])
-        if self.fixed_pool is not None:
+        if self.local_terminal and step.get('execution') == 'compose':
+            # Supported parents and already discovered raw evidence suffice for
+            # this generation. A compose gap returns to parents/refinement.
+            found={'candidate_ids':list(self.candidates),'new_candidate_ids':[],
+                   'stop_reason':'compose_no_retrieval','trace':[]}
+        elif self.fixed_pool is not None:
             found={'candidate_ids':self.fixed_pool,'new_candidate_ids':[d for d in self.fixed_pool if d not in self.candidates],
                    'stop_reason':'fixed_candidate_pool','trace':[]}
         else:
@@ -293,13 +350,23 @@ class Engine:
             if feedback:
                 for i,gap in enumerate(current.get('unresolved_inputs',[])+current.get('unresolved_guards',[])):
                     needs.append({'id':f'gap_{node_id}_{i}','description':gap,'time_scope':None})
+            options = {}
+            if self.local_terminal:
+                options['scoring_identity'] = {'parent_bindings': [
+                    {'id':p, 'answer':self.node_map()[p]['answer'], 'version':self.node_map()[p]['version'],
+                     'applicable_scope':self.node_map()[p].get('applicable_scope')}
+                    for p in step['inputs']]}
             found=self.bridge.discover(query,node_id,requirements=needs,
-                  premise_doc_ids=parent_ids,remaining_nodes=remaining_nodes,feedback=feedback,mode=self.s['retrieval'])
+                  premise_doc_ids=parent_ids,remaining_nodes=remaining_nodes,feedback=feedback,mode=self.s['retrieval'],**options)
         self.record_navigation(found)
         self.discoveries.append(deepcopy(found));self.add_candidates(found['candidate_ids'])
         self.event({'event':'node_discovery','node_id':node_id,'grounded_query':query,'parent_source_ids':parent_ids,'result':found})
         self.map_pending(remaining_nodes)
-        proposals=self.resolve_node(step,query)
+        self.resolve_reservation = max(0, remaining_nodes-1) if self.local_terminal else 0
+        try:
+            proposals=self.resolve_node(step,query)
+        finally:
+            self.resolve_reservation = 0
         if self.node_map()[node_id]['status']!='supported':
             added=self.refine(step,proposals)
             for new in added:self.discover_and_solve(new,max(1,remaining_nodes),feedback=False)
@@ -309,7 +376,10 @@ class Engine:
         return self.node_map()[node_id]['status']=='supported'
 
     def audit(self):
-        if not self.s['condition_audit']:self.event({'event':'condition_audit_disabled'});return []
+        if not self.s['condition_audit']:
+            self.audit_complete = True
+            self.event({'event':'condition_audit_disabled'});return []
+        self.audit_complete = False
         graph=self.compile()
         view=self.evidence_view('audit',prompts.AUDIT,
              {'original_question':self.q['question'],'mapping_complete':not self.mapper.diagnostics()['mapping_incomplete'],
@@ -357,6 +427,7 @@ class Engine:
         self.nodes=deepcopy(graph['nodes']);self.graph=graph;self.conflicts=deepcopy(graph['conflicts'])
         self.event({'event':'condition_audit','conflicts':conflicts,'unresolved_guards':guards,
                     'invalidation_enabled':self.s['invalidation'],'resolutions':resolutions,'affected_nodes':sorted(set(affected))})
+        self.audit_complete = self.row_recoveries[-1]['complete']
         return list(dict.fromkeys(affected))
 
     def reader_messages(self,ids,graph=None):
@@ -421,7 +492,7 @@ class Engine:
                 ids=value['selected_doc_ids'][:k]
                 selections[str(k)]={'selected_doc_ids':ids,'status':'flat_model_selection','token_count':self.feasible(ids,k)['token_count'],
                      'model_coverage':value.get('covered_requirement_ids',[]) if k==20 else [],'reason':value.get('reason','')}
-        if self.s['selection_review']:
+        if not self.local_terminal and self.s['selection_review']:
             from .final_selection import FinalSelector
             selections=FinalSelector(self,graph,selections['20']).run()
         self.event({'event':'final_selection','selection_mode':self.s['selection'],'selections':selections,
@@ -439,7 +510,7 @@ class Engine:
             if not set(self.fixed_pool)<=set(self.docs):raise ProtocolError('Fixed pool includes invisible documents')
             self.event({'event':'fixed_candidate_pool','pool_hash':digest(self.fixed_pool),'doc_ids':self.fixed_pool})
         self.bridge=BridgeSession(self.q['question'],self.docs,self.ids,self.vectors,self.tokenizer,self.calls,self.config,self.ledger)
-        if self.s['selection_review']:
+        if not self.local_terminal and self.s['selection_review']:
             if self.fixed_pool is not None:
                 baseline_candidates=list(self.fixed_pool)
                 policy='fixed_pool_order_reader_feasible'
@@ -458,7 +529,8 @@ class Engine:
             try:self.discover_and_solve(step,len(self.steps)-i)
             except (BudgetExceeded,InputOverflow,ProtocolError,SupportError) as exc:
                 if isinstance(exc,RefusalError):raise
-                self.errors.append({'node_id':step['output_slot'],'type':type(exc).__name__,'error':str(exc)})
+                self.errors.append({'node_id':step['output_slot'],'type':type(exc).__name__,'error':str(exc),
+                                    'category':getattr(exc,'category',None)})
                 self.event({'event':'node_incomplete',**self.errors[-1]})
         # Revisit unresolved executable nodes with reserved gap ANN calls; blocked descendants become executable
         # after the repaired predecessor, and reuse all discovered evidence even when ANN is exhausted.
@@ -472,7 +544,8 @@ class Engine:
                 try:self.discover_and_solve(step,len(unresolved),feedback=True)
                 except (BudgetExceeded,InputOverflow,ProtocolError,SupportError) as exc:
                     if isinstance(exc,RefusalError):raise
-                    self.errors.append({'node_id':step['output_slot'],'type':type(exc).__name__,'error':str(exc)})
+                    self.errors.append({'node_id':step['output_slot'],'type':type(exc).__name__,'error':str(exc),
+                                        'category':getattr(exc,'category',None)})
                     self.event({'event':'feedback_incomplete',**self.errors[-1]})
                 changed |= before!=digest(self.node_map()[step['output_slot']])
             self.event({'event':'feedback_round','round':round_index,'changed':changed})
@@ -494,6 +567,8 @@ class Engine:
             if isinstance(exc,RefusalError):raise
             self.errors.append({'stage':'audit','type':type(exc).__name__,'error':str(exc)})
             self.event({'event':'audit_incomplete',**self.errors[-1]})
+        if self.local_terminal:
+            return self.publish_terminal()
         selections=self.select()
         ids=selections['20']['selected_doc_ids'];feasible=self.feasible(ids)
         if not feasible['feasible']:raise InputOverflow('Final reader context exceeds actual token budget')
@@ -524,9 +599,63 @@ class Engine:
         if self.output:save(self.output/'fusion_snapshot.json',result)
         return result
 
+    def publish_terminal(self):
+        graph = self.compile()
+        node = self.node_map()[self.final_node_id]
+        sources = local_terminal.provenance(graph, self.final_node_id)
+        status = node['status']
+        if status != 'supported' and node.get('declared_status') in ('partial','ambiguous'):
+            status = node['declared_status']
+        if not self.audit_complete:
+            status = 'audit_incomplete'
+        elif status == 'supported' and not sources:
+            status = 'invalid_dependencies'
+        elif status == 'supported' and (not self.terminal_input or not self.terminal_input['validation_complete']):
+            status = 'protocol_incomplete'
+        elif status == 'supported' and node.get('output_identity') != self.output_identity:
+            status = 'invalid_output_format'
+        elif status == 'supported' and not node.get('final_prediction'):
+            status = 'invalid_output_format'
+        elif status == 'supported':
+            status = 'ok'
+        if status != 'ok' and self.audit_complete:
+            relevant = [e for e in self.errors if e.get('node_id') == self.final_node_id]
+            if self.terminal_format_valid is False or any(e.get('category') == 'output_format' for e in relevant):
+                status = 'invalid_output_format'
+            elif any(e['type'] == 'BudgetExceeded' for e in self.errors):
+                status = 'budget_exhausted'
+            elif status == 'unknown' and self.mapper.diagnostics()['mapping_incomplete']:
+                status = 'mapping_incomplete'
+        answer = {'status':status, 'prediction':node.get('final_prediction') if status=='ok' else None,
+            'semantic_answer':node.get('answer'), 'answer_source':'dag_terminal',
+            'final_node_id':self.final_node_id, 'output_identity':self.output_identity,
+            'dependency_versions':{} if sources is None else sources['node_versions'],
+            'sources':sources, 'terminal_input_doc_ids':[] if self.terminal_input is None else self.terminal_input['doc_ids']}
+        result = {'unit_id':self.q['id'], 'method':self.method, 'algorithm_version':local_terminal.VERSION,
+            'ranking':{'status':'partial' if self.errors or self.reliability()['cohort']!='normal' else 'ok',
+                       'nodes':graph['nodes'], 'trace':self.discoveries},
+            'budgets':{}, 'answer':answer, 'seconds':time.time()-self.started,
+            'diagnostics':{'settings':self.s,'requirements':self.requirements,'reliability':self.reliability(),
+                'support_graph':graph,'spans':list(self.spans.values()),'candidate_doc_ids':self.candidates,
+                'ledger':self.ledger.public_dict(),'errors':self.errors,'events':self.events,
+                'requirements_hash':self.requirements_hash,'reasoning_call_count':len(self.reasoner.requests),
+                'terminal_input':self.terminal_input, 'audit_complete':self.audit_complete,
+                'bridge_cost':self.bridge.public_dict() if hasattr(self.bridge,'public_dict') else None,
+                'cost':{'generation_calls':len(self.reasoner.requests),
+                    'node_resolve_calls':sum(r['operation']=='resolve' for r in self.reasoner.requests),
+                    'global_final_selector_calls':0,'independent_reader_calls':0,
+                    'ann_calls':self.ledger.used['ann'],'set_score_calls':self.ledger.used['set_score'],
+                    'llm_attempts':self.ledger.used['llm'],'rerank_http_attempts':self.ledger.used['rerank_http']},
+                'legacy_reader_metrics':'not_applicable'}}
+        self.event({'event':'terminal_published','answer':answer})
+        if self.output:
+            save(self.output/'fusion_snapshot.json',result)
+            (self.output/'fusion_snapshot.json').chmod(0o600)
+        return result
 
-def run_question(q,resources,calls,config,method='fusion',*,reader_question=None):
-    engine=Engine(q,resources,calls,config,method,reader_question=reader_question)
+
+def run_question(q,resources,calls,config,method='fusion',*,reader_question=None,output_options=None):
+    engine=Engine(q,resources,calls,config,method,reader_question=reader_question,output_options=output_options)
     try:return engine.run()
     except Exception as exc:
         if engine.semantic_evidence:

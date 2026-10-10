@@ -17,16 +17,22 @@ def call_reservation(settings, stage, reserve=None, extra_reserve=0):
     """Keep the existing audit/flat allowance and optionally protect more work."""
     stage_text='/'.join(map(str,stage)) if isinstance(stage,(tuple,list)) else str(stage)
     if reserve is None:
-        final=settings.get('final_selection_calls',int(settings.get('selection')=='flat'))
-        if isinstance(final,bool) or not isinstance(final,int) or final<0:
-            raise ValueError('final_selection_calls must be a nonnegative integer')
-        reserve=(0 if stage_text.split('/')[0].startswith(('select','reader')) else final
-                 if stage_text.split('/')[0].startswith('audit')
-                 else int(settings.get('reserved_audit_calls',1))+final)
+        if settings.get('algorithm_version') == 'dagbt_local_terminal_v1':
+            reserve = 0 if stage_text.split('/')[0].startswith('audit') else int(settings.get('reserved_audit_calls', 1))
+        else:
+            reserve = _legacy_reservation(settings, stage_text)
     for name,value in (('reserve',reserve),('extra_reserve',extra_reserve)):
         if isinstance(value,bool) or not isinstance(value,int) or value<0:
             raise ValueError(name+' must be a nonnegative integer')
     return reserve+extra_reserve
+
+def _legacy_reservation(settings, stage_text):
+    final=settings.get('final_selection_calls',int(settings.get('selection')=='flat'))
+    if isinstance(final,bool) or not isinstance(final,int) or final<0:
+        raise ValueError('final_selection_calls must be a nonnegative integer')
+    return (0 if stage_text.split('/')[0].startswith(('select','reader')) else final
+            if stage_text.split('/')[0].startswith('audit')
+            else int(settings.get('reserved_audit_calls',1))+final)
 
 def digest(value):
     return hashlib.sha256(json.dumps(value,sort_keys=True,ensure_ascii=False,separators=(',',':')).encode()).hexdigest()
@@ -35,13 +41,24 @@ def save(path, value):
     path=Path(path);path.parent.mkdir(parents=True,exist_ok=True)
     tmp=path.with_suffix(path.suffix+'.tmp');tmp.write_text(json.dumps(value,ensure_ascii=False,indent=2)+'\n');tmp.replace(path)
 
+def request_identity(unit, url, payload, config, scoring_context_id=None):
+    identity = {'unit_id':unit,'url':url,'payload':payload}
+    version = config.get('fusion',{}).get('algorithm_version')
+    if version == 'dagbt_local_terminal_v1':
+        identity['algorithm_version'] = version
+        if scoring_context_id is not None:
+            identity['scoring_context_id'] = scoring_context_id
+    return identity
+
 class Transport:
     """Native Calls return shape. No authorization headers ever written to disk."""
     def __init__(self, unit, output, config, ledger, tokenizer):
         self.unit,self.output,self.config,self.ledger,self.tokenizer=unit,Path(output),config,ledger,tokenizer
         self.events=[]
 
-    def get(self, stage, url, payload, *, reserve=None, extra_reserve=0):
+    supports_scoring_context = True
+
+    def get(self, stage, url, payload, *, reserve=None, extra_reserve=0, scoring_context_id=None):
         stage_text='/'.join(map(str,stage)) if isinstance(stage,(tuple,list)) else str(stage)
         embed=url.rstrip('/').endswith('/embeddings')
         rerank=url==self.config.get('reranker',{}).get('url') or url.rstrip('/').endswith(('/rerank','/reranks'))
@@ -65,7 +82,9 @@ class Transport:
                 raise ResponseError(f'BridgeTree estimated context budget at {stage_text}: '
                                     f'{count}+{payload["max_tokens"]}+8+{margin}>{context_limit}; '
                                     'regex estimate, not the deployed model tokenizer')
-        identity={'unit_id':self.unit,'url':url,'payload':payload}
+        if rerank and self.config.get('fusion',{}).get('algorithm_version') == 'dagbt_local_terminal_v1' and not scoring_context_id:
+            raise ResponseError('Local rerank requires scoring context identity')
+        identity=request_identity(self.unit,url,payload,self.config,scoring_context_id)
         key=digest(identity);path=self.output/'requests'/(key+'.json')
         record=json.loads(path.read_text()) if path.exists() else {**identity,'stage':stage,'attempts':[]}
         self.output.mkdir(parents=True,exist_ok=True)
@@ -132,7 +151,8 @@ class Transport:
 class StubMeter:
     """Explicit injection path for offline protocol tests, never a production fallback."""
     def __init__(self, base, ledger, config):self.base,self.ledger,self.config=base,ledger,config
-    def get(self,stage,url,payload,*,reserve=None,extra_reserve=0):
+    supports_scoring_context = True
+    def get(self,stage,url,payload,*,reserve=None,extra_reserve=0,scoring_context_id=None):
         txt='/'.join(map(str,stage)) if isinstance(stage,(tuple,list)) else str(stage)
         k='embedding_http' if url.endswith('/embeddings') else 'rerank_http' if 'rerank' in url else 'reader' if txt.startswith('reader/') else 'llm'
         reserved=call_reservation(self.config.get('fusion',{}),txt,reserve,extra_reserve)
