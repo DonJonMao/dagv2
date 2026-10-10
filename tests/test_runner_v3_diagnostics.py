@@ -224,7 +224,9 @@ def test_v3_wrapper_reuses_coordinator_with_new_default_output(tmp_path, action,
     args = json.loads(result.stdout)
     assert args[:3] == ["-m", "dagbt.runner", runner_command]
     if action != "preflight":
-        assert args[args.index("--output") + 1] == str(r.ROOT / "outputs/paired_full_reliability_v3")
+        assert args[args.index("--output") + 1] == str(r.ROOT / "outputs/paired_local_terminal_v1")
+    if action in ('start','resume'):
+        assert args[args.index('--arms')+1:args.index('--arms')+3] == ['original','dagbt_local_terminal_v1']
     assert "--retry-failed" not in args
     if action != "preflight":
         override = subprocess.run([str(r.ROOT / "scripts/run_v3.sh"), action,

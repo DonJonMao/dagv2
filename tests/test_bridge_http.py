@@ -65,6 +65,23 @@ def configure(s, endpoint, tmp_path):
     s.calls = Transport('fixture-question', tmp_path, s.config, s.ledger, None)
 
 
+def test_local_scoring_real_http_payload_and_cache_contexts(tmp_path):
+    from dagbt.bridge import LOCAL_TERMINAL_VERSION
+    with server() as (endpoint, requests):
+        s = session(ann=12,sets=64,algorithm_version=LOCAL_TERMINAL_VERSION)
+        configure(s,endpoint,tmp_path)
+        s.discover('Find the director','director',remaining_nodes=2)
+        s.discover('Find the university of the resolved director','university',remaining_nodes=1,
+                   scoring_identity={'parent_bindings':[{'answer':'Person','version':1,'applicable_scope':'2012'}]})
+        reranks=[r['payload'] for r in requests if r['path'].endswith('/rerank')]
+        assert {p['query'] for p in reranks} == {'Find the director','Find the university of the resolved director'}
+        records=[json.loads(p.read_text()) for p in (tmp_path/'requests').glob('*.json')]
+        scored=[r for r in records if r['url'].endswith('/rerank')]
+        assert len({r['scoring_context_id'] for r in scored}) == 2
+        assert all(r['algorithm_version']==LOCAL_TERMINAL_VERSION for r in scored)
+        assert sum(sc.scored_sets for sc in s.scorers.values()) == s.ledger.used['set_score'] <= 64
+
+
 def test_real_http_latest_search_provenance_and_physical_accounting(tmp_path):
     with server() as (endpoint, requests):
         s = session(ann=10, sets=32)
