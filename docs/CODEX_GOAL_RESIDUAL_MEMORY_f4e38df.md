@@ -90,7 +90,7 @@ scripts/smoke_local_terminal.py
 
 ### 3.1 在已有一次规划上扩展
 
-直接扩展local-terminal的一次规划，不新增元规划调用。复用 `final_node_id`、任务输入和retrieval/compose类型，增加最少的：
+直接扩展local-terminal的一次规划，不新增元规划调用。第一次检索之前必须明确完整初始子问题、输入依赖和终端节点；未知实体、规则及条件以待绑定输入保留，不省略可预先规划的下游任务。F 表达这张 DAG 的求解关系，F_t 表达当前证据下的剩余求解状态，二者不替代 DAG。复用 `final_node_id`、任务输入和retrieval/compose类型，增加最少的：
 
 - `output_contract`：语义结果类型、字段、数量词、实体/时间/情境、解释要求。
 - 任务变量：ID、类型、开放/有限域、参数依赖和来源要求。

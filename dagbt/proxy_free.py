@@ -40,68 +40,105 @@ class ProxyFreeSearch:
         self.archive['scheduler_events'].append(value)
         self.record(value)
 
-    def run(self, initial_pool):
+    def initialize(self, initial_pool):
+        if self.lanes:
+            raise ValueError('Search already initialized')
         self.archive.update(initial_target_ids=list(initial_pool.candidate_ids),
                             initial_ann_calls=self.retriever.ann_calls,
-                            initial_scored_sets=0,final_scored_sets=0)
-        # Initial dense hits and each expansion batch retain their actual ANN
-        # rank order. Across batches, stable discovery order is the tie-break.
+                            initial_scored_sets=0, final_scored_sets=0)
         roots = tuple(initial_pool.candidate_ids)
-        self.lanes = [{'requirement':r, 'roots':deque(roots), 'continuations':deque(),
-                       'turns':0, 'seen':set()} for r in self.requirements]
+        self.lanes = [{'requirement': r, 'roots': deque(roots), 'continuations': deque(),
+                       'turns': 0, 'seen': set()} for r in self.requirements]
+        self.cursor = 0
+        self.paused = False
+        self.archive['stop_reason'] = 'ready'
         self.emit('proxy_free_started', requirement_ids=[r['id'] for r in self.requirements],
                   initial_target_ids=list(roots), ann_cap=self.retriever.max_ann_calls,
                   proposal_order='necessary_requirement_round_robin_then_local_ANN_rank',
                   root_continuation_schedule='alternate_when_both_available')
-        while self.retriever.remaining_ann_calls is None or self.retriever.remaining_ann_calls > 0:
-            progressed = False
-            for lane in self.lanes:
-                if self.retriever.remaining_ann_calls == 0:
-                    break
-                state = self._next(lane)
-                if state is None:
+
+    def step(self, active_ids=None):
+        """At most one vendor proposal; never initializes/expands the pool."""
+        if not self.lanes:
+            raise ValueError('Initialize before stepping')
+        if self.paused:
+            return None
+        if self.retriever.remaining_ann_calls == 0:
+            self.archive['stop_reason'] = 'ann_budget_exhausted'
+            return None
+        active = set(active_ids) if active_ids is not None else {r['id'] for r in self.requirements}
+        for _ in self.lanes:
+            lane = self.lanes[self.cursor]
+            self.cursor = (self.cursor + 1) % len(self.lanes)
+            if lane['requirement']['id'] not in active:
+                continue
+            state = self._next(lane)
+            if state is None:
+                continue
+            target, premises, path, origin, rank = state
+            # The search belongs to one immutable grounded-query/binding identity.
+            lane['seen'].add((target, premises))
+            lane['turns'] += 1
+            self.retriever.set_information_needs([lane['requirement']])
+            self.emit('proxy_free_conditional_started', requirement_id=lane['requirement']['id'],
+                      target_id=target, premise_ids=list(premises), navigation_path=list(path),
+                      origin=origin, local_ANN_rank=rank, requirement_turn=lane['turns'])
+            before = self.retriever.ann_calls
+            proposal = self.retriever.propose(target, premises, fixed_pool=False)
+            self.archive['proposal_batches'].append(proposal.public_dict())
+            self.archive['states'].append({'requirement_id':lane['requirement']['id'],
+                'target_id':target, 'premise_ids':list(premises), 'navigation_path':list(path),
+                'probe_id':proposal.probe_id, 'candidate_ids':list(proposal.ids)})
+            descendants = []
+            for hit in proposal.hits:
+                if hit.memory_id in path:
                     continue
-                target, premises, path, origin, rank = state
-                lane['seen'].add((target,premises))
-                lane['turns'] += 1
-                self.retriever.set_information_needs([lane['requirement']])
-                self.emit('proxy_free_conditional_started', requirement_id=lane['requirement']['id'],
-                          target_id=target,premise_ids=list(premises),navigation_path=list(path),
-                          origin=origin,local_ANN_rank=rank,requirement_turn=lane['turns'])
-                before = self.retriever.ann_calls
-                proposal = self.retriever.propose(target, premises, fixed_pool=False)
-                public = proposal.public_dict()
-                self.archive['proposal_batches'].append(public)
-                self.archive['states'].append({'requirement_id':lane['requirement']['id'],
-                    'target_id':target,'premise_ids':list(premises),'navigation_path':list(path),
-                    'probe_id':proposal.probe_id,'candidate_ids':list(proposal.ids)})
-                descendants=[]
-                for hit in proposal.hits:  # Source response is already in actual ANN rank order.
-                    candidate=hit.memory_id
-                    if candidate in path:
-                        continue
-                    new_premises=tuple(dict.fromkeys((*premises,target)))
-                    key=(candidate,new_premises)
-                    if key not in lane['seen']:
-                        descendants.append((candidate,new_premises,(*path,candidate),'conditional_hit',hit.rank))
-                # Highest-ranked continuation runs before lower-ranked siblings;
-                # alternating fresh roots prevents a single chain taking every turn.
-                for descendant in reversed(descendants):
-                    lane['continuations'].appendleft(descendant)
-                progressed = True
-                self.emit('proxy_free_conditional_completed', requirement_id=lane['requirement']['id'],
-                          probe_id=proposal.probe_id,target_id=target,premise_ids=list(premises),
-                          candidate_ids=list(proposal.ids),new_navigation_states=len(descendants),
-                          completed_ann_calls=self.retriever.ann_calls-before,
-                          evidence_dependency_claim=False)
-            if not progressed:
-                break
-        self.archive['stop_reason'] = ('ann_budget_exhausted' if self.retriever.remaining_ann_calls == 0
-                                       else 'finite_frontier_exhausted')
-        self.archive['final_ann_calls']=self.retriever.ann_calls
-        self.archive['pending_states']=self._pending()
+                new_premises = tuple(dict.fromkeys((*premises, target)))
+                if (hit.memory_id, new_premises) not in lane['seen']:
+                    descendants.append((hit.memory_id, new_premises, (*path, hit.memory_id),
+                                        'conditional_hit', hit.rank))
+            for descendant in reversed(descendants):
+                lane['continuations'].appendleft(descendant)
+            self.emit('proxy_free_conditional_completed', requirement_id=lane['requirement']['id'],
+                      probe_id=proposal.probe_id, target_id=target, premise_ids=list(premises),
+                      candidate_ids=list(proposal.ids), new_navigation_states=len(descendants),
+                      completed_ann_calls=self.retriever.ann_calls-before, evidence_dependency_claim=False)
+            self.archive['stop_reason'] = 'ready'
+            return proposal
+        self.archive['stop_reason'] = 'finite_frontier_exhausted' if active else 'paused_demands'
+        return None
+
+    def pause(self):
+        self.paused = True
+        self.archive['stop_reason'] = 'paused'
+
+    def resume(self):
+        self.paused = False
+        self.archive['stop_reason'] = 'ready'
+
+    def snapshot(self):
+        return {'archive':deepcopy(self.archive), 'cursor':self.cursor, 'paused':self.paused,
+                'lanes':[{'requirement':deepcopy(l['requirement']), 'roots':list(l['roots']),
+                          'continuations':list(l['continuations']), 'turns':l['turns'],
+                          'seen':list(l['seen'])} for l in self.lanes]}
+
+    def restore(self, state):
+        self.archive = deepcopy(state['archive'])
+        self.cursor, self.paused = state['cursor'], state['paused']
+        self.lanes = [{'requirement':deepcopy(l['requirement']), 'roots':deque(l['roots']),
+                      'continuations':deque((s[0], tuple(s[1]), tuple(s[2]), s[3], s[4])
+                                            for s in l['continuations']),
+                      'turns':l['turns'], 'seen':{(s[0], tuple(s[1])) for s in l['seen']}}
+                     for l in state['lanes']]
+
+    def run(self, initial_pool):
+        self.initialize(initial_pool)
+        while self.step() is not None:
+            pass
+        self.archive['final_ann_calls'] = self.retriever.ann_calls
+        self.archive['pending_states'] = self._pending()
         self.emit('proxy_free_stopped', reason=self.archive['stop_reason'],
-                  final_ann_calls=self.retriever.ann_calls,pending_states=self.archive['pending_states'],
+                  final_ann_calls=self.retriever.ann_calls, pending_states=self.archive['pending_states'],
                   scored_sets=0)
         return deepcopy(self.archive)
 

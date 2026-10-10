@@ -25,6 +25,7 @@ from .evidence_mapping import EvidenceMapper
 from .evidence_views import build_view
 from .row_recovery import recover_rows
 from . import local_terminal
+from .methods import capabilities
 
 RELIABILITY_VERSION = "dagbt_fusion_reliability_v3"
 
@@ -55,7 +56,8 @@ class Engine:
         self.q,self.docs,self.ids,self.vectors,self.index,self.tokenizer=q,*resources
         self.config=deepcopy(config);self.s=resolve(config,method);self.config['fusion']=self.s
         self.method=method;self.started=time.time();self.events=[]
-        self.local_terminal = self.s['algorithm_version'] == local_terminal.VERSION
+        self.capabilities = capabilities(self.s['algorithm_version'])
+        self.local_terminal = self.capabilities.terminal
         self.final_node_id = None
         self.terminal_input = None
         self.terminal_format_valid = None
@@ -65,7 +67,7 @@ class Engine:
         self.personal=reader_question is not None
         self.output_options = deepcopy(output_options)
         self.output_identity = digest({'question': self.reader_question, 'options': self.output_options,
-                                       'contract': local_terminal.VERSION})
+                                       'contract': self.s['algorithm_version']})
         self.semantic_evidence={}
         if not self.local_terminal:
             self.baseline_ids=[]
@@ -98,6 +100,11 @@ class Engine:
         system = local_terminal.PLAN_SYSTEM if self.local_terminal else self.e.PLAN_SYSTEM
         schema = local_terminal.planner_contract(self.e.PLAN_SCHEMA) if self.local_terminal else self.e.PLAN_SCHEMA
         validate = (lambda value: local_terminal.validate_plan(value, self.repair.validate_plan)) if self.local_terminal else self.repair.validate_plan
+        if self.capabilities.joint_reading:
+            from . import residual_plan
+            system = residual_plan.PLAN_SYSTEM
+            schema = residual_plan.planner_contract(self.e.PLAN_SCHEMA)
+            validate = lambda value: residual_plan.validate_plan(value, self.repair.validate_plan)
         plan=self.reasoner.json('planner',prompts.plan_system(system,self.personal),self.q['question'],validate,schema)
         if len(plan['steps'])>self.s['max_initial_nodes']:raise ProtocolError('Initial node cap exceeded')
         self.steps=deepcopy(plan['steps'])
@@ -110,6 +117,11 @@ class Engine:
                             'terminal_node_ids':sinks,'terminal_mode':'all','time_scope':None}]
         self.requirements_hash=digest(self.requirements)
         self.nodes=[self.unknown(st) for st in self.steps]
+        if self.capabilities.joint_reading:
+            from .fact_state import FactState
+            self.fact_state = FactState(plan['program'], plan['output_contract'], self.steps, self.final_node_id)
+            self.output_identity = digest({'format_identity':self.output_identity,
+                'output_contract':plan['output_contract'],'initial_program':plan['program'],'initial_dag':self.steps})
         self.event({'event':'plan_frozen','plan':plan,'requirements':self.requirements,'requirements_hash':self.requirements_hash})
 
     def unknown(self,step):
@@ -121,7 +133,8 @@ class Engine:
         if digest(self.requirements)!=self.requirements_hash:raise ProtocolError('Frozen terminal requirements changed')
         graph=compile_graph(self.nodes,list(self.spans.values()),self.requirements,self.docs,
              max_nodes=self.s['max_initial_nodes']+self.s['max_refinement_nodes'],
-             max_alternatives=self.s['max_alternatives'] if self.s['allow_alternatives'] else 1)
+             max_alternatives=self.s['max_alternatives'] if self.s['allow_alternatives'] else 1,
+             derivation_verifier=getattr(self, 'derivation_verifier', None))
         graph['conflicts']=deepcopy(self.conflicts)
         graph['revision']=max([int(c['id'].split('_')[-1]) for c in self.conflicts if c.get('id','').startswith('conflict_')]+[0])
         self.graph=graph;self.nodes=deepcopy(graph['nodes'])
@@ -510,6 +523,10 @@ class Engine:
             if not set(self.fixed_pool)<=set(self.docs):raise ProtocolError('Fixed pool includes invisible documents')
             self.event({'event':'fixed_candidate_pool','pool_hash':digest(self.fixed_pool),'doc_ids':self.fixed_pool})
         self.bridge=BridgeSession(self.q['question'],self.docs,self.ids,self.vectors,self.tokenizer,self.calls,self.config,self.ledger)
+        if self.capabilities.joint_reading:
+            from .residual_control import ResidualControl
+            self.residual_control = ResidualControl(self)
+            return self.residual_control.run()
         if not self.local_terminal and self.s['selection_review']:
             if self.fixed_pool is not None:
                 baseline_candidates=list(self.fixed_pool)
@@ -631,7 +648,7 @@ class Engine:
             'final_node_id':self.final_node_id, 'output_identity':self.output_identity,
             'dependency_versions':{} if sources is None else sources['node_versions'],
             'sources':sources, 'terminal_input_doc_ids':[] if self.terminal_input is None else self.terminal_input['doc_ids']}
-        result = {'unit_id':self.q['id'], 'method':self.method, 'algorithm_version':local_terminal.VERSION,
+        result = {'unit_id':self.q['id'], 'method':self.method, 'algorithm_version':self.s['algorithm_version'],
             'ranking':{'status':'partial' if self.errors or self.reliability()['cohort']!='normal' else 'ok',
                        'nodes':graph['nodes'], 'trace':self.discoveries},
             'budgets':{}, 'answer':answer, 'seconds':time.time()-self.started,
@@ -652,6 +669,31 @@ class Engine:
             save(self.output/'fusion_snapshot.json',result)
             (self.output/'fusion_snapshot.json').chmod(0o600)
         return result
+
+    def resume(self, snapshot):
+        """Resume a residual checkpoint without paying for another planner."""
+        if not self.capabilities.joint_reading or self.nodes or self.ledger.used:
+            raise ProtocolError('Resume requires a fresh joint-reading Engine')
+        from .residual_plan import validate_plan
+        from .fact_state import FactState
+        from .bridge import BridgeSession
+        from .residual_control import ResidualControl
+        plan=validate_plan({'steps':snapshot['steps'],'final_node_id':snapshot['final_node_id'],
+            'output_contract':snapshot['fact_state']['contract'],
+            'program':snapshot['fact_state']['initial_program']},self.repair.validate_plan)
+        self.steps=plan['steps'];self.final_node_id=plan['final_node_id']
+        self.output_identity = digest({'format_identity':self.output_identity,
+            'output_contract':plan['output_contract'],'initial_program':plan['program'],'initial_dag':self.steps})
+        self.requirements=deepcopy(snapshot['requirements']);self.requirements_hash=snapshot['requirements_hash']
+        if digest(self.requirements)!=self.requirements_hash:
+            raise ProtocolError('Resume requirements identity changed')
+        self.nodes=[self.unknown(st) for st in self.steps]
+        self.fact_state=FactState(plan['program'],plan['output_contract'],self.steps,self.final_node_id)
+        self.fixed_pool=self.config.get('fixed_candidate_pools',{}).get(self.q['id'])
+        self.bridge=BridgeSession(self.q['question'],self.docs,self.ids,self.vectors,self.tokenizer,self.calls,self.config,self.ledger)
+        self.residual_control=ResidualControl(self)
+        self.residual_control.restore(snapshot)
+        return self.residual_control.run()
 
 
 def run_question(q,resources,calls,config,method='fusion',*,reader_question=None,output_options=None):

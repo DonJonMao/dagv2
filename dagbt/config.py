@@ -2,6 +2,7 @@
 from __future__ import annotations
 from collections.abc import Mapping
 from copy import deepcopy
+from .methods import capabilities, terminal_method, UNSCORED, JOINT, RESIDUAL
 
 DEFAULTS = {
     'algorithm_version': 'dagbt_fusion_reliability_v3',
@@ -46,6 +47,9 @@ METHODS = {
     'fusion_chain': {'reader_chain': True},
     'fusion_navigation_closure': {'navigation_closure': True},
 }
+for _method in (UNSCORED, JOINT, RESIDUAL):
+    METHODS[_method] = {**METHODS['dagbt_local_terminal_v1'],
+        'algorithm_version': _method, 'proxy_mode': 'none', 'set_score_calls': 0}
 
 def resolve(config, method='fusion'):
     if method not in METHODS:
@@ -57,17 +61,22 @@ def resolve(config, method='fusion'):
     if unknown:
         raise ValueError('Unknown fusion settings: ' + ', '.join(sorted(map(str, unknown))))
     result = {**deepcopy(DEFAULTS), **deepcopy(dict(supplied)), **METHODS[method]}
-    local = method == 'dagbt_local_terminal_v1'
-    if result['algorithm_version'] != ('dagbt_local_terminal_v1' if local else DEFAULTS['algorithm_version']):
+    local = terminal_method(method)
+    zero_score = local and not capabilities(method).scoring
+    if result['algorithm_version'] != (method if local else DEFAULTS['algorithm_version']):
         raise ValueError('Algorithm version must match the selected method')
     if local and any(type(result[k]) is int and result[k] > cap for k,cap in (('ann_calls',36),('set_score_calls',512),('llm_calls',24))):
         raise ValueError('Local method cannot expand the shared 36/512/24 budgets')
-    for name in ('ann_calls','set_score_calls','llm_calls','context_tokens',
+    if zero_score and result['set_score_calls'] != 0:
+        raise ValueError('Zero-score methods require set_score_calls=0')
+    for name in ('ann_calls','llm_calls','context_tokens',
                  'map_batch_tokens','reasoning_output_tokens','reader_output_tokens',
                  'max_initial_nodes','max_alternatives','max_enumeration_states',
                  'initial_width','proposal_width','max_quote_chars'):
         if not isinstance(result[name], int) or isinstance(result[name], bool) or result[name] < 1:
             raise ValueError(f'{name} must be positive integer')
+    if not zero_score and (type(result['set_score_calls']) is not int or result['set_score_calls'] < 1):
+        raise ValueError('set_score_calls must be positive for scored methods')
     if type(result['reader_calls']) is not int or (result['reader_calls'] != 0 if local else result['reader_calls'] < 1):
         raise ValueError('reader_calls must be zero for local terminal and positive for legacy methods')
     for name in ('reserved_gap_ann_calls','reserved_audit_calls','max_refinement_nodes',

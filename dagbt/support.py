@@ -122,7 +122,8 @@ def _scope_key(scope):
     return json.dumps(scope, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-def compile_graph(nodes, spans, requirements, documents, max_nodes=8, max_alternatives=2):
+def compile_graph(nodes, spans, requirements, documents, max_nodes=8, max_alternatives=2,
+                  derivation_verifier=None):
     """Compile a topologically ordered, bounded support graph.
 
     Required node fields: id, answer, status, version, alternatives. Each support
@@ -201,7 +202,11 @@ def compile_graph(nodes, spans, requirements, documents, max_nodes=8, max_altern
                 not normalized_answer(node.get("answer") or "")
                 or not (alternative["source_span_ids"] or alternative["guard_span_ids"] or parents)
             ):
-                raise SupportError("supported_without_answer_or_evidence: " + aid)
+                if not (normalized_answer(node.get('answer') or '') and derivation_verifier
+                        and derivation_verifier(node, alternative)):
+                    raise SupportError("supported_without_answer_or_evidence: " + aid)
+            if ('derivation' in alternative or 'binding_derivations' in alternative) and (not derivation_verifier or not derivation_verifier(node, alternative)):
+                raise SupportError('unvalidated_symbolic_derivation: ' + aid)
             alternative["structure_valid"] = True
         _ids(node.setdefault("partial_span_ids", []), "partial_span_ids")
         if any(sid not in span_map for sid in node["partial_span_ids"]):

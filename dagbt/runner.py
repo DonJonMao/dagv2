@@ -4,6 +4,7 @@ The coordinator uses only the standard library. Native model imports and global
 configuration live in persistent spawned workers, one per dataset and arm.
 """
 from __future__ import annotations
+from dagbt.methods import capabilities, terminal_method
 
 import argparse
 import contextlib
@@ -110,7 +111,8 @@ def frozen_sources():
     if (ROOT / "scripts" / "run_v3.sh").is_file():
         paths.append(ROOT / "scripts" / "run_v3.sh")
     paths.extend(ROOT / 'scripts' / name for name in ('smoke_local_terminal.py','demo_local_terminal.py',
-        'benchmark_bt_reranker_prefix_cache.py') if (ROOT / 'scripts' / name).is_file())
+        'benchmark_bt_reranker_prefix_cache.py','smoke_residual_memory.py','demo_residual_memory.py',
+        'ablate_residual_memory.py') if (ROOT / 'scripts' / name).is_file())
     paths.append(ROOT / 'serving' / 'bt_prefix_cache_probe.py')
     return {str(p.relative_to(ROOT)): file_hash(p) for p in sorted(set(paths))}
 
@@ -217,9 +219,14 @@ def probe_fusion_planner(config, output=None, method='fusion'):
     reasoner = Reasoner(transport, tokenizer, effective, settings, ledger, observe)
     e, repair, _ = legacy_modules()
     from dagbt import local_terminal
-    local = method == local_terminal.VERSION
+    local = terminal_method(method)
+    joint = capabilities(method).joint_reading
+    from dagbt import residual_plan
     schema = local_terminal.planner_contract(e.PLAN_SCHEMA) if local else e.PLAN_SCHEMA
     system = local_terminal.PLAN_SYSTEM if local else e.PLAN_SYSTEM
+    if joint:
+        schema = residual_plan.planner_contract(e.PLAN_SCHEMA)
+        system = residual_plan.PLAN_SYSTEM
     query = "Which city hosts the science museum visited by the fictional traveler Mira?"
     report = {"check": "fusion_planner_protocol", "version": settings['algorithm_version'], "status": "running",
               "trace_directory": str(trace), "configured_protocol": settings.get("response_format", "plain"),
@@ -231,7 +238,7 @@ def probe_fusion_planner(config, output=None, method='fusion'):
     started = time.monotonic()
     try:
         def validate_plan(value):
-            plan = local_terminal.validate_plan(value, repair.validate_plan) if local else repair.validate_plan(value)
+            plan = residual_plan.validate_plan(value, repair.validate_plan) if joint else local_terminal.validate_plan(value, repair.validate_plan) if local else repair.validate_plan(value)
             if len(plan["steps"]) > settings["max_initial_nodes"]:
                 raise ValueError("Initial node cap exceeded")
             return plan
@@ -252,7 +259,8 @@ def probe_fusion_planner(config, output=None, method='fusion'):
 
 def preflight(config, datasets, *, endpoints=True, output=None, arms=None):
     validate_config(config)
-    default_method = 'dagbt_local_terminal_v1' if config.get('fusion', {}).get('algorithm_version') == 'dagbt_local_terminal_v1' else 'fusion'
+    version = config.get('fusion', {}).get('algorithm_version')
+    default_method = version if terminal_method(version) else 'fusion'
     arms = list(arms or [default_method])
     from dagbt.config import resolve
     for arm in arms or ["fusion"]:
@@ -316,7 +324,7 @@ def preflight(config, datasets, *, endpoints=True, output=None, arms=None):
         for kind, env in (("llm", "DAG_LLM_API_KEY"), ("embedding", "DAG_EMBED_API_KEY")):
             report["endpoints"][kind] = probe_endpoint(config[kind + "_base_url"], config[kind + "_model"], env,
                                                       api_key=resolve_api_key(config, kind))
-        if config.get("reranker"):
+        if config.get("reranker") and any(arm != "original" and resolve(config, arm)["proxy_mode"] == "activation" for arm in arms):
             report["endpoints"]["reranker"] = probe_reranker(config, output)
         if is_bridgetree(config) and any(arm != "original" for arm in arms):
             method = next(arm for arm in arms if arm != 'original')
@@ -673,7 +681,7 @@ class Worker:
 def validate_result(row, unit):
     if row.get("unit_id") != unit or not isinstance(row.get("answer"), dict):
         raise ValueError("Malformed result identity/answer")
-    local = row.get('algorithm_version') == 'dagbt_local_terminal_v1'
+    local = terminal_method(row.get('algorithm_version'))
     prediction = row['answer'].get('prediction')
     if not isinstance(row["answer"].get("status"), str) or (not isinstance(prediction, str) and not (local and prediction is None and row['answer']['status'] != 'ok')):
         raise ValueError("Malformed answer fields")
@@ -694,7 +702,7 @@ def failure_row(q, exc, arm=None):
     row = {"unit_id": q["id"], "answer": {"status": "timeout" if isinstance(exc, TimeoutError) else "execution_failed", "prediction": "", **redacted_error(exc)},
             "ranking": {"status": "execution_failed"},
             "budgets": {str(k): {"selected_doc_ids": []} for k in (5, 10, 20)}}
-    if arm == 'dagbt_local_terminal_v1':
+    if terminal_method(arm):
         row.update(algorithm_version=arm, method=arm, budgets={})
         row['answer'].update(answer_source='dag_terminal', final_node_id=None, sources=None)
     return row
@@ -933,7 +941,7 @@ def module_metrics(row, label, dataset, output):
             "interpretation": ("PersonaMem has no gold document support labels; gold_* metrics are unavailable. "
                                "Model/structural statuses do not prove semantic correctness." if dataset == "personamem" else
                                "gold_* uses held-out title-group labels after generation; model/structural statuses and complete_required do not prove semantic entailment")}
-    if row.get('algorithm_version') == 'dagbt_local_terminal_v1':
+    if terminal_method(row.get('algorithm_version')):
         for key in ('gold_discovery_minus_selection_recall_at20','selected_doc_count_at20',
                     'structural_complete_required_at20','structural_necessary_covered_at20',
                     'reader_prompt_tokens_local','reader_context_tokens_with_output_reserve','reader_prompt_tokens_api'):
@@ -1129,7 +1137,7 @@ def score_all(output, scopes, arms, *, label_loader=None):
     summaries = {}
     for dataset, questions in scopes.items():
         is_personamem = dataset == "personamem"
-        metric_names = ("accuracy",) if is_personamem else ('f1','em') if 'dagbt_local_terminal_v1' in arms else METRICS
+        metric_names = ("accuracy",) if is_personamem else ('f1','em') if any(terminal_method(arm) for arm in arms) else METRICS
         answer_metric = "accuracy" if is_personamem else "em"
         labels = {r["id"]: r for r in label_loader(dataset)}
         all_scores, comparisons = {}, []
@@ -1164,7 +1172,7 @@ def score_all(output, scopes, arms, *, label_loader=None):
                 item["modules"] = module_metrics(row, label, dataset, output)
                 item["result_path"] = str(result_path(output, dataset, arm, q["id"]).relative_to(output))
                 item["attempt_directories"] = row.get("attempt_directories", [])
-                local = row.get('algorithm_version') == 'dagbt_local_terminal_v1'
+                local = terminal_method(row.get('algorithm_version'))
                 item["selected_doc_ids"] = {} if local else {k: row["budgets"][k]["selected_doc_ids"] for k in ("5", "10", "20")}
                 if local:
                     item['legacy_selection_metrics'] = 'not_applicable'

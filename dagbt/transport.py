@@ -10,6 +10,8 @@ from .model_runtime import (prepare_request, normalize_response, resolve_api_key
                             is_bridgetree, count_request_tokens, token_accounting,
                             REASONING_MARKER, evidence_wire_tokens, evidence_token_accounting)
 
+from .methods import terminal_method, capabilities
+
 class ServiceError(RuntimeError): pass
 class ResponseError(ValueError): pass
 
@@ -17,7 +19,7 @@ def call_reservation(settings, stage, reserve=None, extra_reserve=0):
     """Keep the existing audit/flat allowance and optionally protect more work."""
     stage_text='/'.join(map(str,stage)) if isinstance(stage,(tuple,list)) else str(stage)
     if reserve is None:
-        if settings.get('algorithm_version') == 'dagbt_local_terminal_v1':
+        if terminal_method(settings.get('algorithm_version')):
             reserve = 0 if stage_text.split('/')[0].startswith('audit') else int(settings.get('reserved_audit_calls', 1))
         else:
             reserve = _legacy_reservation(settings, stage_text)
@@ -44,7 +46,7 @@ def save(path, value):
 def request_identity(unit, url, payload, config, scoring_context_id=None):
     identity = {'unit_id':unit,'url':url,'payload':payload}
     version = config.get('fusion',{}).get('algorithm_version')
-    if version == 'dagbt_local_terminal_v1':
+    if terminal_method(version):
         identity['algorithm_version'] = version
         if scoring_context_id is not None:
             identity['scoring_context_id'] = scoring_context_id
@@ -62,6 +64,9 @@ class Transport:
         stage_text='/'.join(map(str,stage)) if isinstance(stage,(tuple,list)) else str(stage)
         embed=url.rstrip('/').endswith('/embeddings')
         rerank=url==self.config.get('reranker',{}).get('url') or url.rstrip('/').endswith(('/rerank','/reranks'))
+        version=self.config.get('fusion',{}).get('algorithm_version')
+        if rerank and terminal_method(version) and not capabilities(version).scoring:
+            raise ValueError('Zero-score method prohibits reranker requests')
         reader=stage_text.startswith('reader/')
         kind='embedding_http' if embed else 'rerank_http' if rerank else 'reader' if reader else 'llm'
         evidence_reasoning=bool(payload.get(REASONING_MARKER)) and not (embed or rerank or reader)
@@ -155,6 +160,9 @@ class StubMeter:
     def get(self,stage,url,payload,*,reserve=None,extra_reserve=0,scoring_context_id=None):
         txt='/'.join(map(str,stage)) if isinstance(stage,(tuple,list)) else str(stage)
         k='embedding_http' if url.endswith('/embeddings') else 'rerank_http' if 'rerank' in url else 'reader' if txt.startswith('reader/') else 'llm'
+        version=self.config.get('fusion',{}).get('algorithm_version')
+        if k=='rerank_http' and terminal_method(version) and not capabilities(version).scoring:
+            raise ValueError('Zero-score method prohibits reranker requests')
         reserved=call_reservation(self.config.get('fusion',{}),txt,reserve,extra_reserve)
         if k=='llm' and 'llm' in self.ledger.limits and self.ledger.remaining('llm')<=reserved:
             from .budget import BudgetExceeded

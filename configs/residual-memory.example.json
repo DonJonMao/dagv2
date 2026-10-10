@@ -1,0 +1,40 @@
+{
+  "llm_base_url": "http://111.19.156.30:8006/v1",
+  "embedding_base_url": "http://111.19.156.74:8001/v1",
+  "llm_model": "deepseek-v4-flash",
+  "embedding_model": "qwen3-embedding-8b",
+  "request_timeout_seconds": 600,
+  "max_identical_attempts": 3,
+  "fusion": {
+    "ann_calls": 36,
+    "set_score_calls": 0,
+    "llm_calls": 24,
+    "reader_calls": 0,
+    "context_tokens": 16384,
+    "json_repairs": 6,
+    "max_repairs_per_request": 2,
+    "response_format": "plain",
+    "input_margin": 256,
+    "algorithm_version": "dagbt_residual_memory_v1"
+  },
+  "experiment": {
+    "question_timeout_seconds": 3600,
+    "worker_startup_timeout_seconds": 300,
+    "max_question_attempts": 1
+  },
+  "model_profile": "bridgetree",
+  "llm_provider_request_params": {},
+  "credentials_file": "configs/credentials.local.json",
+  "embedding_batch_size": 32,
+  "deployment_identity": {
+    "source_profile": "bridgetree_preference_rag/configs/evidence_bridge.yaml",
+    "source_chain": [
+      "evidence_bridge.yaml",
+      "chain_service_fixed.yaml",
+      "chain_full.yaml",
+      "default.yaml"
+    ],
+    "identity_source": "configuration_snapshot_20260923",
+    "note": "Model names and deployment metadata are not independently verified weight hashes."
+  }
+}

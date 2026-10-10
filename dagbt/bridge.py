@@ -24,6 +24,9 @@ from vendor.bridgetree.index import ExactInnerProductIndex
 from vendor.bridgetree.types import Memory
 from .evidence_spans import document_source_metadata
 from .transport import digest
+from .methods import capabilities, terminal_method
+from copy import deepcopy
+from dataclasses import asdict
 
 
 QUERY_INSTRUCTION = "Instruct: Retrieve passages that answer the factual question.\nQuery: "
@@ -231,6 +234,12 @@ class _Retriever(DependencyRetriever):
         self.original_query, self.parent_sources = original_query, parent_sources
         super().__init__(*args, **kwargs)
 
+    def initialize_unexpanded(self):
+        # Vendor's expand=False does not assign _initial_pool; propose otherwise
+        # silently expands it. Keep this correction strictly in the adapter.
+        self._initial_pool = self.build_initial_pool(expand=False)
+        return self._initial_pool
+
     def _run_probe(self, **kwargs: Any):
         # Build only the wrappers; never run text replacement over raw evidence.
         # Navigation identifiers and the complete original passages remain intact.
@@ -298,7 +307,7 @@ class BridgeSession:
         self.memories = tuple(self.records.values())
         self.settings = dict(config.get("fusion", {}))
         self.local_scoring = self.settings.get("algorithm_version") == LOCAL_TERMINAL_VERSION
-        self.adapter_version = LOCAL_TERMINAL_VERSION if self.local_scoring else ADAPTER_VERSION
+        self.adapter_version = self.settings['algorithm_version'] if terminal_method(self.settings.get('algorithm_version')) else ADAPTER_VERSION
         self.proxy_mode = self.settings.get("proxy_mode", "activation")
         if self.proxy_mode not in {"activation", "none"}:
             raise ValueError("proxy_mode must be activation or none")
@@ -317,6 +326,7 @@ class BridgeSession:
         self.embedding_sequence = 0
         self.gap_calls = 0
         self._active = False
+        self.sessions = {}
 
     def _score_backend(self, query: str | None = None, scoring_identity: Mapping[str, Any] | None = None) -> _Scorer:
         if self.local_scoring and (not isinstance(query, str) or not query.strip()):
@@ -483,6 +493,154 @@ class BridgeSession:
             self._accumulate(local)
             self.ledger.record({"event": "bridge_discovery_completed", "trace": trace})
         return self._result(trace, local)
+
+    def _step_retriever(self, query, node_id, parents, ann_cap):
+        return _Retriever(query, self.memories, _Embedder(self, str(node_id)),
+            original_query=self.original_query,
+            parent_sources="\n\n".join(f"[{d}]\n{self.records[d].text}" for d in parents),
+            memory_vectors=self.vectors, index=self.index, initial_width=self.initial_width,
+            initial_expansion_width=self.proposal_width, proposal_width=self.proposal_width,
+            max_ann_calls=ann_cap, query_instruction=QUERY_INSTRUCTION,
+            proposal_instruction=BRIDGE_INSTRUCTION)
+
+    def step(self, query, node_id, requirements=(), premise_doc_ids=(), *, identity=None):
+        """Dense once, then one conditional batch per immutable task identity.
+
+        The full question ledger remains authoritative; paused sessions retain
+        frontiers and all spent requests. Binding changes create a new identity.
+        """
+        if self._active:
+            raise RuntimeError('Bridge steps must be sequential')
+        if capabilities(self.settings.get('algorithm_version')).scoring or self.proxy_mode != 'none':
+            raise ValueError('Stepping requires an explicit zero-score method')
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError('Stepping requires a grounded task query')
+        parents = tuple(dict.fromkeys(premise_doc_ids))
+        if set(parents) - set(self.records):
+            raise ValueError('Invisible parent source')
+        context = {'algorithm_version':self.adapter_version, 'query':query, 'node_id':node_id,
+                   'parents':list(parents), 'requirements':list(requirements), 'bindings':identity,
+                   'corpus':digest([asdict(m) for m in self.memories])}
+        key = digest(context)
+        trace = {'event':'bridge_step', 'adapter_version':self.adapter_version,
+                 'node_id':node_id, 'query':query, 'query_identity':key,
+                 'parent_source_doc_ids':list(parents), 'events':[], 'stop_reason':'started'}
+        self.traces.append(trace)
+        local = []
+        if self.ledger.remaining('ann') == 0:
+            trace['stop_reason'] = 'ann_budget_exhausted'
+            return self._result(trace, local)
+        self._active = True
+        try:
+            from .proxy_free import ProxyFreeSearch
+            if key not in self.sessions:
+                retriever = self._step_retriever(query, node_id, parents, self.ledger.remaining('ann'))
+                retriever.set_information_needs(requirements)
+                def record(event):
+                    self.ledger.record({**event, 'dag_node_id':node_id, 'query_identity':key})
+                search = ProxyFreeSearch(retriever, requirements, query, record)
+                # Save before the request: a failed request must never be replayed for free.
+                self.sessions[key] = {'context':context, 'retriever':retriever, 'search':search,
+                                      'dense_attempted':True, 'initialized':False, 'consumed':0}
+                pool = retriever.initialize_unexpanded()
+                search.initialize(pool)
+                self.sessions[key]['initialized'] = True
+                batch = pool.dense_batch
+            else:
+                state = self.sessions[key]
+                retriever, search = state['retriever'], state['search']
+                if not state['initialized']:
+                    trace['stop_reason'] = 'initial_request_failed'
+                    return self._result(trace, [])
+                search.resume()
+                retriever.max_ann_calls = retriever.ann_calls + self.ledger.remaining('ann')
+                batch = search.step()
+            state = self.sessions[key]
+            if batch is not None:
+                local = list(batch.ids)
+                state['consumed'] = len(retriever.proposal_batches)
+            trace['stop_reason'] = batch.stop_reason or 'batch_completed' if batch else search.archive['stop_reason']
+            trace['retrieval'] = retriever.public_dict()
+            trace['search_archive'] = search.partial_public_dict(stop_reason=trace['stop_reason'])
+            trace['ann_calls_completed'] = retriever.ann_calls
+            trace['local_candidate_ids'] = local
+            self._accumulate(local)
+            return self._result(trace, local)
+        except BaseException as exc:
+            trace.update(stop_reason='execution_error', error_type=type(exc).__name__, error=str(exc))
+            raise
+        finally:
+            self._active = False
+            self.ledger.record({'event':'bridge_step_completed', 'trace':deepcopy(trace)})
+
+    def pause_node(self, node_id):
+        for state in self.sessions.values():
+            if state['context']['node_id'] == node_id and state['initialized']:
+                state['search'].pause()
+
+    def snapshot(self):
+        states = {}
+        for key, state in self.sessions.items():
+            r = state['retriever']
+            states[key] = {'context':state['context'], 'initialized':state['initialized'],
+                'consumed':state['consumed'], 'ann_calls':r.ann_calls, 'attempts':r._attempts,
+                'max_ann_calls':r.max_ann_calls, 'information_needs':list(r.information_needs),
+                'batches':[asdict(b) for b in r._batches], 'edges':[asdict(e) for e in r._edges],
+                'dense_batch':asdict(r._dense_batch) if r._dense_batch else None,
+                'pool':asdict(r._initial_pool) if r._initial_pool else None,
+                'search':state['search'].snapshot() if state['initialized'] else None}
+        return deepcopy({'sessions':states, 'candidate_ids':self.candidate_ids,
+            'traces':self.traces, 'embedding_sequence':self.embedding_sequence,
+            'ledger':self.ledger.public_dict(),
+            'identity':digest([asdict(m) for m in self.memories])})
+
+    def restore(self, snapshot):
+        from vendor.bridgetree.dependency_retrieval import ProposalBatch, ProposalHit, ProposalEdge, InitialCandidatePool
+        from .proxy_free import ProxyFreeSearch
+        from collections import Counter
+        if snapshot['identity'] != digest([asdict(m) for m in self.memories]):
+            raise ValueError('Resume corpus changed')
+        if snapshot['ledger']['limits'] != self.ledger.limits:
+            raise ValueError('Resume budget changed')
+        if self.sessions or self.ledger.used:
+            raise ValueError('Restore requires a fresh session and ledger')
+        def batch(value):
+            if value is None:
+                return None
+            value = deepcopy(value)
+            value['hits'] = tuple(ProposalHit(**h) for h in value['hits'])
+            for f in ('premise_ids', 'source_memory_ids', 'excluded_ids'):
+                value[f] = tuple(value[f])
+            return ProposalBatch(**value)
+        def edge(value):
+            return ProposalEdge(**{k:tuple(v) if k in ('source_memory_ids','premise_ids') else v
+                                   for k,v in value.items()})
+        for key, state in snapshot['sessions'].items():
+            context = state['context']
+            if context['algorithm_version'] != self.adapter_version or digest(context) != key:
+                raise ValueError('Resume algorithm/query identity changed')
+            r = self._step_retriever(context['query'], context['node_id'], context['parents'], state['max_ann_calls'])
+            r.ann_calls, r._attempts = state['ann_calls'], state['attempts']
+            r.set_information_needs(state['information_needs'])
+            r._batches = [batch(b) for b in state['batches']]
+            r._edges = [edge(e) for e in state['edges']]
+            r._dense_batch = batch(state['dense_batch'])
+            if state['pool']:
+                v = state['pool']
+                r._initial_pool = InitialCandidatePool(candidate_ids=tuple(v['candidate_ids']),
+                    dense_batch=batch(v['dense_batch']), expansion_batches=tuple(batch(b) for b in v['expansion_batches']),
+                    provenance=tuple(edge(e) for e in v['provenance']), ann_calls=v['ann_calls'], stop_reason=v['stop_reason'])
+            def record(event, ctx=context, session_key=key):
+                self.ledger.record({**event,'dag_node_id':ctx['node_id'],'query_identity':session_key})
+            search = ProxyFreeSearch(r, context['requirements'], context['query'], record)
+            if state['search']:
+                search.restore(state['search'])
+            self.sessions[key] = {'context':context, 'retriever':r, 'search':search,
+                'initialized':state['initialized'], 'dense_attempted':True, 'consumed':state['consumed']}
+        self.candidate_ids, self.traces = deepcopy(snapshot['candidate_ids']), deepcopy(snapshot['traces'])
+        self.embedding_sequence = snapshot['embedding_sequence']
+        self.ledger.used = Counter(snapshot['ledger']['used'])
+        self.ledger.events = deepcopy(snapshot['ledger']['events'])
 
     def _accumulate(self, local: Sequence[str]) -> list[str]:
         known = set(self.candidate_ids)
