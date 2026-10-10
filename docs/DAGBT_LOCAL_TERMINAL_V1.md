@@ -31,7 +31,13 @@ M  = r3 - r2
 A  = (r3 - r2) - (r1 - r0)
 ```
 
-M 表示补充候选之后锚点对当前子问题的边际贡献；A 表示这个贡献比补充之前提高了多少。四项共享相同的查询、上下文、模型和可见语料。空集合照常评分。阈值和搜索动作沿用 frozen vendor：正激活且正锚点边际时保留；正激活但尚未满足保留条件时允许有限推测；符合原反向边际规则时允许 pivot。不是用证据数量或最终答案标签代替评分。
+M 表示补充候选之后锚点对当前子问题的边际贡献；A 表示这个贡献比补充之前提高了多少。四项共享相同的查询、上下文、模型和可见语料。空集合照常评分。阈值和搜索动作沿用 frozen vendor，令 ε 为已有 marginal_epsilon（默认 0）：
+
+- A > ε 且 M > ε 时 retain，保留锚点，并将 H 加入前提后继续展开。
+- A > ε 但尚未满足 retain 条件时 speculate，在已有深度和状态数限制内探索这个补充后的状态。
+- M < −ε 时允许 pivot：从 H 中选一个未出现于锚点路径的原文作为新锚点，以 P ∪ H 的其余原文为前提，移除旧锚点。此动作仍受原有次数和深度限制。
+
+其余测量不因证据数量多或最终答案标签吻合而被接受；搜索中未继续展开的原文仍留在共享候选池中供核查。
 
 本地评分上下文包含完整查询、语义父绑定与版本/范围、可见原文内容、序列化版本、模型和评分协议。相同上下文、相同规范集合复用分数；跨子问题或绑定版本不复用。模型客户端共享，请求序号全题唯一。服务侧精确前缀缓存和原文集合分数缓存仍是不同机制。
 
@@ -61,7 +67,7 @@ M 表示补充候选之后锚点对当前子问题的边际贡献；A 表示这�
 
 新结果的 `budgets` 为空，未伪造 k=5/10/20 文档选择，也未伪造 Reader response。旧 Reader / FinalSelector 指标为 `not_applicable` 或数值 null；终端来源召回以独立名称报告。旧格式仍可读取和评分。
 
-成本分别记录逻辑生成、节点求解、ANN、逻辑集合评分、rerank HTTP 请求，以及 runner 的物理请求与可用上游用量。各 scorer 的累计成本按上下文汇总一次，不重复累加历史快照。上游前向次数未由服务提供时保持不可观测，不能拿集合数推测。合成示例的完整计数见验证报告，不代表真实任务的成本或准确率。
+成本分别记录逻辑生成、节点求解、ANN、逻辑集合评分、rerank HTTP 请求，以及 runner 的物理请求日志和服务响应中可用的上游用量。各 scorer 的累计成本按上下文汇总一次，不重复累加历史快照。上游前向次数未由服务提供时保持不可观测，不能拿集合数推测。合成示例的完整计数见验证报告，不代表真实任务的成本或准确率。
 
 不再执行的 legacy 步骤是：额外 `__baseline__` dense、全局 raw memory review、FinalSelector、独立 Reader，以及终端形成后的 read-all 重答。真实单节点问题恰好等于 Q 时，其自身取证正常允许。
 
@@ -83,8 +89,8 @@ start / resume 使用同一协调器和 manifest 校验，原始对照仍是 ori
 ```bash
 .venv/bin/python scripts/smoke_local_terminal.py \
   --config configs/local-terminal.example.json \
-  --output outputs/local_terminal_v1/smoke_3plus3
-.venv/bin/python -m dagbt.runner status --output outputs/local_terminal_v1/smoke_3plus3
+  --output outputs/local_terminal_v1/smoke_3plus3_v2
+.venv/bin/python -m dagbt.runner status --output outputs/local_terminal_v1/smoke_3plus3_v2
 ```
 
 离线回归和差异检查：
