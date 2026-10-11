@@ -1,7 +1,7 @@
 """Local fact-and-source reading, bounded by the actual reasoning wire input."""
 from copy import deepcopy
 import json
-from .residual import validate_value, ProgramError
+from .residual import validate_value, ProgramError, UNITS
 from .reasoning import ProtocolError, InputOverflow, RefusalError, OutputTruncated
 from .budget import BudgetExceeded
 from .support import make_span, validate_span
@@ -18,6 +18,8 @@ Return one slot per requested variable, with observations
 and unresolved descriptions. Each observation has id, stance(support/contradiction/
 partial/unknown/irrelevant), value (typed JSON or null if not supported), source_ids
 (visible aliases), entity_scope, time_scope, parent_versions, retract_ids and reason.
+value must match the response schema's JSON shape for its slot.variable and stance.
+A set is one array whose members may themselves be objects, never a lone object.
 source_ids must contain the exact source_spans[].id aliases (for example "s3").
 Never construct source IDs from numbers, document IDs or hashes. Fact route IDs
 belong only in retract_ids; they are not source aliases.
@@ -43,6 +45,10 @@ temporal scope needs cited explicit text or authoritative time metadata, never a
 date guessed from message order. List sources for every object/time qualifier.
 Contradiction challenges existing fact route IDs in retract_ids, with cited raw text;
 it never itself creates a false binding. Emit contrary supported values separately.
+Only same-variable known_observations[].id values are legal retraction targets.
+If no such route exists, no retraction is available; preserve contrary evidence as
+an independently supported value, a partial/unknown observation, or slot.unresolved
+descriptions. Never invent a target or discard evidence. Other stances require retract_ids=[].
 Unknown, absence, unexamined text, anomalies without a concrete observation are not false.
 Include every relevant counter-observation in this batch before declaring support.
 Slots include the local variables and already-bound related parents. Check new text
@@ -219,10 +225,54 @@ class JointReader:
         return data
 
     @staticmethod
+    def _value_schema(declaration):
+        """Wire shapes only; finite values, domains and semantics stay local."""
+        kind=declaration['type']
+        if kind=='number':
+            unit={'enum':[None,*UNITS]}
+            return {'oneOf':[
+                {'type':'number'},
+                {'type':'object','properties':{'number':{'type':'number'},'unit':unit},
+                 'required':['number','unit'],'additionalProperties':False},
+                {'type':'object','properties':{
+                    'lower':{'type':['number','null']},'upper':{'type':['number','null']},
+                    'lower_closed':{'type':'boolean'},'upper_closed':{'type':'boolean'},'unit':unit},
+                 'required':['lower','upper'],'additionalProperties':False}]}
+        shape={'type':{'bool':'boolean','entity':'string','text':'string',
+                       'set':'array','record':'object','rule':'object'}[kind]}
+        if kind in ('entity','text'):
+            shape['minLength']=1
+        return shape
+
+    @staticmethod
     def _schema(data):
         schema=deepcopy(SCHEMA)
         requested=list(data.get('requested_slots',data['variables']))
-        schema['properties']['slots']['items']['properties']['variable']['enum']=requested
+        item=schema['properties']['slots']['items']
+        if requested:
+            item['properties']['variable']['enum']=requested
+            targets_by_variable={v:[r['id'] for r in data.get('known_observations',[]) if r['variable']==v]
+                                 for v in requested}
+            if any(targets_by_variable.values()):
+                # Retraction cardinality is shared; only legal IDs vary by slot.
+                item['properties']['observations']['items']['allOf']=[{
+                    'if':{'properties':{'stance':{'const':'contradiction'}}},
+                    'then':{'properties':{'retract_ids':{'minItems':1}}},
+                    'else':{'properties':{'retract_ids':{'maxItems':0}}}}]
+            branches=[]
+            for variable in requested:
+                targets=targets_by_variable[variable]
+                observation={'if':{'properties':{'stance':{'const':'support'}}},
+                    'then':{'properties':{'value':JointReader._value_schema(data['variables'][variable])}},
+                    'else':{'properties':{'value':{'type':'null'}}}}
+                if targets:
+                    observation['properties']={'retract_ids':{'items':{'enum':targets}}}
+                else:
+                    observation['properties']={'stance':{'enum':['support','partial','unknown','irrelevant']},
+                                               'retract_ids':{'maxItems':0}}
+                branches.append({'properties':{'variable':{'const':variable},
+                    'observations':{'items':observation}}})
+            item['oneOf']=branches
         schema['properties']['slots'].update(minItems=len(requested),maxItems=len(requested))
         options=data.get('public_options')
         if isinstance(options,(list,tuple)) and len(options)==4:
@@ -345,9 +395,14 @@ class JointReader:
             raise ProtocolError('Non-support observation must not bind a value')
         if row['stance']!='contradiction' and row['retract_ids']:
             raise ProtocolError('Only sourced contradiction can retract facts')
-        if row['stance']=='contradiction' and (not row['retract_ids'] or any(
-                rid not in self.state.routes or self.state.routes[rid]['variable']!=variable for rid in row['retract_ids'])):
-            raise ProtocolError('Contradiction targets unavailable or unrelated fact routes')
+        if row['stance']=='contradiction':
+            targets=[rid for rid,r in self.state.routes.items() if r['variable']==variable]
+            if not targets:
+                raise ProtocolError('Contradiction for '+variable+' has no existing fact route to retract; '
+                                    'preserve its cited evidence and correct the stance without inventing a target')
+            if not row['retract_ids'] or any(rid not in targets for rid in row['retract_ids']):
+                raise ProtocolError('Contradiction for '+variable+' requires nonempty retract_ids naming only '
+                                    'same-variable known_observations[].id values')
         values, _, _ = self.state.valid()
         parents = row['parent_versions']
         if not isinstance(parents,dict) or any(p==variable or p not in values or type(ver) is not int or ver!=self.state.versions[p]
