@@ -196,7 +196,7 @@ def probe_reranker(config, output=None):
 
 
 def probe_fusion_planner(config, output=None, method='fusion'):
-    """One real, label-free planner request; never repair or change protocols."""
+    """Label-free protocol gate; typed planners use their bounded runtime repair."""
     from copy import deepcopy
     from dagbt.budget import Ledger
     from dagbt.config import resolve
@@ -211,7 +211,12 @@ def probe_fusion_planner(config, output=None, method='fusion'):
     settings = resolve(config, method)
     effective = deepcopy(config)
     effective["fusion"] = settings
-    ledger = Ledger({}, sink=lambda event: append_jsonl(trace / "ledger_events.jsonl", event))
+    joint = capabilities(method).joint_reading
+    repair_limit = min(settings['max_repairs_per_request'], settings['json_repairs']) if joint else 0
+    # Transport charges llm per physical HTTP attempt, including retry attempts.
+    physical_limit = (1 + repair_limit) * max(1, int(config.get('max_identical_attempts', 3)))
+    limits = {'llm':physical_limit, 'http_attempts':physical_limit, 'json_repairs':repair_limit} if joint else {}
+    ledger = Ledger(limits, sink=lambda event: append_jsonl(trace / "ledger_events.jsonl", event))
     tokenizer = load_tokenizer(effective)
     transport = Transport("preflight_fusion_planner_protocol", trace, effective, ledger, tokenizer)
     events = []
@@ -222,7 +227,6 @@ def probe_fusion_planner(config, output=None, method='fusion'):
     e, repair, _ = legacy_modules()
     from dagbt import local_terminal
     local = terminal_method(method)
-    joint = capabilities(method).joint_reading
     from dagbt import residual_plan
     schema = local_terminal.planner_contract(e.PLAN_SCHEMA) if local else e.PLAN_SCHEMA
     system = local_terminal.PLAN_SYSTEM if local else e.PLAN_SYSTEM
@@ -233,9 +237,11 @@ def probe_fusion_planner(config, output=None, method='fusion'):
     report = {"check": "fusion_planner_protocol", "version": settings['algorithm_version'], "status": "running",
               "trace_directory": str(trace), "configured_protocol": settings.get("response_format", "plain"),
               "schema_sha256": digest(schema), "synthetic_query": query,
-              "logical_call_limit": 1, "repair_calls": 0, "protocol_fallback": False,
+              "logical_call_limit": 1 + repair_limit, "repair_calls": 0, "protocol_fallback": False,
+              "planner_policy": "runtime_bounded_repair" if joint else "single_request",
+              "initial_response_valid": None, "repair_reservations": 0,
               "experiment_task": False,
-              "scope": "one synthetic planner request using the actual fusion schema/validator; no labels or question budget; does not establish map/select/reader compatibility or answer quality"}
+              "scope": "synthetic planner protocol check using the actual schema/validator; typed planners permit bounded runtime-format repair; no labels or question budget; does not establish downstream compatibility or answer quality"}
     save(trace / "report.json", report)
     started = time.monotonic()
     try:
@@ -244,8 +250,12 @@ def probe_fusion_planner(config, output=None, method='fusion'):
             if len(plan["steps"]) > settings["max_initial_nodes"]:
                 raise ValueError("Initial node cap exceeded")
             return plan
-        plan = reasoner.request("planner", prompts.plan_system(system, personal=False), query,
-                                validate_plan, schema, reserve=0)
+        if joint:
+            plan = reasoner.json("planner", prompts.plan_system(system, personal=False), query,
+                                 validate_plan, schema, reserve=0, reserve_repairs=0)
+        else:
+            plan = reasoner.request("planner", prompts.plan_system(system, personal=False), query,
+                                    validate_plan, schema, reserve=0)
     except Exception as exc:
         report.update(status="failed", **redacted_error(exc))
         raise
@@ -253,6 +263,9 @@ def probe_fusion_planner(config, output=None, method='fusion'):
         report.update(status="passed", validated_plan=plan)
         return report
     finally:
+        first_status = reasoner.requests[0].get('validation_status') if reasoner.requests else None
+        report.update(initial_response_valid=None if first_status is None else first_status == 'valid',
+                      repair_calls=max(0, reasoner.sequence - 1), repair_reservations=ledger.used['json_repairs'])
         report.update(elapsed_seconds=time.monotonic() - started, ledger=ledger.public_dict(),
                       cost=request_cost(trace), logical_calls=reasoner.sequence,
                       reasoning_requests=reasoner.requests, response_events=events)
@@ -338,7 +351,7 @@ def preflight(config, datasets, *, endpoints=True, output=None, arms=None):
         report["endpoints"] = {"status": "not_checked_offline_preflight"}
     report["protocol_note"] = ("BT profile uses its declared deterministic token estimator and chat adapter; missing derived indices will be built before question generation. "
                                if is_bridgetree(config) else "Bundled local chat template is rendered. ") + \
-                              "/models checks advertised IDs, not weights. Online BT fusion preflight also requires one real planner request; it does not verify map/select/reader compatibility or accuracy."
+                              "/models checks advertised IDs, not weights. Online BT fusion preflight checks the real planner protocol; typed joint/residual planners permit bounded runtime-format repair and report first-response validity. It does not verify downstream compatibility or accuracy."
     return report
 
 

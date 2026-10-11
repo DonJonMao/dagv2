@@ -149,14 +149,16 @@ def validate_program(program):
     variables = program['variables']
     if not isinstance(variables, dict) or any(not isinstance(k, str) or not k for k in variables):
         raise ProgramError('Variables must have stable string identities')
-    for declaration in variables.values():
+    for variable, declaration in variables.items():
         if not isinstance(declaration, dict) or declaration.get('type') not in {
                 'bool', 'entity', 'number', 'text', 'set', 'record', 'rule'}:
             raise ProgramError('Unsupported variable type')
         if 'domain' in declaration:
             domain = declaration['domain']
             if not isinstance(domain, (dict, list)):
-                raise ProgramError('Domain must be finite values or an interval')
+                kind = 'null' if domain is None else type(domain).__name__
+                raise ProgramError(f'program.variables[{variable!r}].domain: Domain must be finite values or an interval; '
+                                   f'got {kind}. Omit domain when unrestricted; do not replace it with an empty array.')
             if isinstance(domain, dict):
                 if declaration['type'] != 'number':
                     raise ProgramError('Only numeric variables have interval domains')

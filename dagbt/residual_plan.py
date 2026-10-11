@@ -1,7 +1,7 @@
 """One initial DAG plan, with typed bindings and a fixed output contract."""
 from copy import deepcopy
 from . import local_terminal
-from .residual import validate_program, validate_output_contract, ProgramError, references
+from .residual import validate_program, validate_output_contract, ProgramError, references, UNITS
 from .reasoning import ProtocolError
 
 PLAN_SYSTEM = local_terminal.PLAN_SYSTEM.replace('Do not include extra fields.', '') + '''
@@ -15,6 +15,18 @@ output_contract has mode(value/one_reason/all_failures/semantic), result_type
 program has variables (ID -> declaration), expression, optional constraints,
 rules_complete and rule_binding. Declaration has type, demand (a planned task ID),
 optional domain, open, unit. Variables may share a task for bounded multi-field reading.
+Omit optional fields that do not apply; optional does not mean fill with null.
+An unknown/unrestricted domain is represented by OMITTING domain, not null, a string,
+a scalar, or an empty array. For an open entity/text variable use, for example,
+{"type":"entity","demand":"place","open":true} with no domain field.
+A known finite domain is an array of correctly typed possible values; only use
+values explicitly constrained by the question, never guessed answers or candidates.
+Only number variables may use an interval domain: {"lower":0,"upper":null}.
+Interval endpoints are numbers or null (unbounded); lower_closed/upper_closed are
+optional booleans. Null endpoints are legal; a null domain itself is not.
+A numeric domain states legal possible values, NOT an acceptance threshold. Keep
+thresholds in comparison expressions, never exclude a possible failing observation.
+Unknown numeric bounds and memory-derived rules must remain unknown until sourced.
 Expressions ONLY use {op:const,value:...}, {op:var,id:...}, {op:and/or/not/eq/ne/lt/le/gt/ge/if/tuple,args:[...]},
 or {op:record/failures/one_reason,fields:{name:expression}}. No code.
 Use symbolic value mode for ordinary sourced facts/entity chains and comparisons.
@@ -35,7 +47,37 @@ invent sourced facts or create paid tasks. Unsupported compose remains semantic 
 
 def planner_contract(legacy_schema):
     schema = local_terminal.planner_contract(legacy_schema)
-    schema['properties'].update(output_contract={'type':'object'}, program={'type':'object'})
+    unit = {'enum': [None, *sorted(UNITS)]}
+    interval_schema = {'type':'object', 'properties': {
+        'lower': {'type':['number','null']}, 'upper': {'type':['number','null']},
+        'lower_closed': {'type':'boolean'}, 'upper_closed': {'type':'boolean'}, 'unit': unit},
+        'required':['lower','upper'], 'additionalProperties':False}
+    declaration = {'type':'object', 'properties': {
+        'type': {'enum':['bool','entity','number','text','set','record','rule']},
+        'demand': {'type':'string','minLength':1},
+        'domain': {'description':'Optional legal domain; omit if unrestricted. Arrays list finite values; interval objects apply only to number variables.',
+                   'anyOf':[{'type':'array','items':{},'uniqueItems':True}, interval_schema]},
+        'open': {'type':'boolean'}, 'unit': unit},
+        'required':['type','demand'], 'additionalProperties':False}
+    program = {'type':'object', 'properties': {
+        'variables': {'type':'object','additionalProperties':declaration},
+        'expression': {'type':'object'},
+        'constraints': {'type':'array','items':{'type':'object'}},
+        'rules_complete': {'type':'boolean'},
+        'rule_binding': {'type':'object','properties': {
+            'variable': {'type':'string'},
+            'condition_demands': {'type':'array','items':{'type':'string'},'minItems':1,'uniqueItems':True}},
+            'required':['variable','condition_demands'],'additionalProperties':False},
+        'task_expressions': {'type':'object','additionalProperties':{'type':'object'}}},
+        'required':['variables','expression'],'additionalProperties':False}
+    contract = {'type':'object','properties': {
+        'mode': {'enum':['value','one_reason','all_failures','semantic']},
+        'result_type': {'enum':['bool','entity','number','record','set','text']},
+        'entity_scope': {'type':'string'}, 'time_scope': {'type':'string'},
+        'explanation': {'enum':['none','one','all','semantic']},
+        'fields': {'type':'array','items':{'type':'string','minLength':1},'minItems':1,'uniqueItems':True}},
+        'required':['mode','result_type','entity_scope','time_scope','explanation'],'additionalProperties':False}
+    schema['properties'].update(output_contract=contract, program=program)
     schema['required'] += ['output_contract','program']
     return schema
 
