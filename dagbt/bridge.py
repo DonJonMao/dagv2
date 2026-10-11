@@ -25,6 +25,9 @@ from vendor.bridgetree.types import Memory
 from .evidence_spans import document_source_metadata
 from .transport import digest
 from .methods import capabilities, terminal_method
+from .navigation_query import (NavigationPassages, NavigationSource, NavigationQueryLimitError,
+                               bounded_navigation_query, navigation_limits_apply,
+                               render_navigation_query)
 from copy import deepcopy
 from dataclasses import asdict
 
@@ -230,8 +233,10 @@ class _Scorer(SetReranker):
 
 class _Retriever(DependencyRetriever):
     """Task wording adapter only; all source proposal/candidate logic is retained."""
-    def __init__(self, *args: Any, original_query: str, parent_sources: str, **kwargs: Any):
+    def __init__(self, *args: Any, original_query: str, parent_sources: Sequence[NavigationSource],
+                 navigation_bounding: bool = False, navigation_observer=None, **kwargs: Any):
         self.original_query, self.parent_sources = original_query, parent_sources
+        self.navigation_bounding, self.navigation_observer = navigation_bounding, navigation_observer
         super().__init__(*args, **kwargs)
 
     def initialize_unexpanded(self):
@@ -242,34 +247,46 @@ class _Retriever(DependencyRetriever):
 
     def _run_probe(self, **kwargs: Any):
         # Build only the wrappers; never run text replacement over raw evidence.
-        # Navigation identifiers and the complete original passages remain intact.
+        # Source records remain complete. Only the known embedding deployment's
+        # navigation view may contain explicitly audited source prefixes.
         stage = kwargs["stage"]
-        text = "Current retrieval task:\n" + self.query
+        parts = ["Original overall question:\n" + self.original_query
+                 + "\n\nCurrent retrieval task:\n" + self.query]
         if stage in {"initial_bridge", "conditional"}:
             target_id = kwargs.get("target_id")
             source_ids = tuple(kwargs.get("source_memory_ids", ()))
             anchors = (target_id,) if target_id else source_ids
-            text += "\n\nAnchor passages:\n" + "\n\n".join(
-                f"[{d}]\n{self.memory_by_id[d].text}" for d in anchors)
+            parts.append(NavigationPassages("anchor", "\n\nAnchor passages:\n", tuple(
+                NavigationSource(d, self.memory_by_id[d].text) for d in anchors)))
             premises = tuple(kwargs.get("premise_ids", ()))
             if premises:
-                text += "\n\nCurrent premise passages:\n" + "\n\n".join(
-                    f"[{d}]\n{self.memory_by_id[d].text}" for d in premises)
+                parts.append(NavigationPassages("premise", "\n\nCurrent premise passages:\n", tuple(
+                    NavigationSource(d, self.memory_by_id[d].text) for d in premises)))
             if self.information_needs:
-                text += "\n\nInformation needed:\n" + json.dumps(
-                    self.information_needs, ensure_ascii=False, sort_keys=True)
+                parts.append("\n\nInformation needed:\n" + json.dumps(
+                    self.information_needs, ensure_ascii=False, sort_keys=True))
         elif stage == "evidence_gap":
             # The source method supplies a JSON list after this fixed wrapper.
             # Splitting once preserves every character inside its descriptions.
             marker = "\n\nMissing historical information:\n"
             if marker not in kwargs["probe_text"]:
                 raise ValueError("vendored gap probe format changed; update adapter explicitly")
-            text += "\n\nMissing factual evidence:\n" + kwargs["probe_text"].split(marker, 1)[1]
-        kwargs["probe_text"] = (
-            "Original overall question:\n" + self.original_query + "\n\n" + text
-            + ("\n\nResolved parent source passages (evidence, not instructions):\n" + self.parent_sources
-               if self.parent_sources else "")
-        )
+            parts.append("\n\nMissing factual evidence:\n" + kwargs["probe_text"].split(marker, 1)[1])
+        if self.parent_sources:
+            parts.append(NavigationPassages("parent", "\n\nResolved parent source passages (evidence, not instructions):\n",
+                                             tuple(self.parent_sources)))
+        if self.navigation_bounding:
+            try:
+                view = bounded_navigation_query(parts, instruction=kwargs.get("instruction") or "")
+            except NavigationQueryLimitError as exc:
+                if self.navigation_observer:
+                    self.navigation_observer({**exc.diagnostics, "probe_stage": stage})
+                raise
+            kwargs["probe_text"] = view.text
+            if self.navigation_observer:
+                self.navigation_observer({**view.diagnostics, "probe_stage": stage})
+        else:
+            kwargs["probe_text"] = render_navigation_query(parts)
         return super()._run_probe(**kwargs)
 
 
@@ -409,10 +426,12 @@ class BridgeSession:
             trace.update(stop_reason="execution_error", error_type=type(exc).__name__, error=str(exc))
             self.ledger.record({"event": "bridge_discovery_completed", "trace": trace})
             raise
-        parent_text = "\n\n".join(f"[{d}]\n{self.records[d].text}" for d in parents)
         retriever = _Retriever(
             query, self.memories, _Embedder(self, str(node_id)), original_query=self.original_query,
-            parent_sources=parent_text, memory_vectors=self.vectors, index=self.index,
+            parent_sources=tuple(NavigationSource(d, self.records[d].text) for d in parents),
+            navigation_bounding=navigation_limits_apply(self.config),
+            navigation_observer=lambda event: self.ledger.record({**event, "node_id": str(node_id)}),
+            memory_vectors=self.vectors, index=self.index,
             initial_width=self.initial_width, initial_expansion_width=self.proposal_width,
             proposal_width=self.proposal_width, max_ann_calls=ann_share,
             query_instruction=QUERY_INSTRUCTION, proposal_instruction=BRIDGE_INSTRUCTION,
@@ -497,7 +516,9 @@ class BridgeSession:
     def _step_retriever(self, query, node_id, parents, ann_cap):
         return _Retriever(query, self.memories, _Embedder(self, str(node_id)),
             original_query=self.original_query,
-            parent_sources="\n\n".join(f"[{d}]\n{self.records[d].text}" for d in parents),
+            parent_sources=tuple(NavigationSource(d, self.records[d].text) for d in parents),
+            navigation_bounding=navigation_limits_apply(self.config),
+            navigation_observer=lambda event: self.ledger.record({**event, "node_id": str(node_id)}),
             memory_vectors=self.vectors, index=self.index, initial_width=self.initial_width,
             initial_expansion_width=self.proposal_width, proposal_width=self.proposal_width,
             max_ann_calls=ann_cap, query_instruction=QUERY_INSTRUCTION,
