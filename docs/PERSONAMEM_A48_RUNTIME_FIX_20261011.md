@@ -69,6 +69,14 @@ export DAGBT_PYTHON="$HOME/dagbt_runs/20260930_v3/dagv2/.venv/bin/python"
 "$DAGBT_PYTHON" -m dagbt.runner status --output outputs/personamem_a48_v3_smoke
 ```
 
+两题运行结束且状态为 `complete` 后，启动完整 PersonaMem 实验：
+
+```bash
+cd ~/dagbt_runs/20261011_personamem_a48/dagv2
+export DAGBT_PYTHON="$HOME/dagbt_runs/20260930_v3/dagv2/.venv/bin/python"
+"$DAGBT_PYTHON" -m dagbt.runner launch --config configs/residual-memory.example.json --datasets personamem --arms original dagbt_residual_memory_v1 --output outputs/personamem_a48_v3_full
+```
+
 代码改变后必须使用新输出目录，不将旧运行的成功/失败行混入新版。
 当前每题最多尝试一次，不能承诺对已耗尽尝试的旧任务使用 `--retry-failed`
 即可重跑。这里的运行是推理评测，不是更新模型权重的参数训练。
