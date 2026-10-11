@@ -1,5 +1,6 @@
 """Local fact-and-source reading, bounded by the actual reasoning wire input."""
 from copy import deepcopy
+import json
 from .residual import validate_value, ProgramError
 from .reasoning import ProtocolError, InputOverflow, RefusalError, OutputTruncated
 from .budget import BudgetExceeded
@@ -20,6 +21,10 @@ partial/unknown/irrelevant), value (typed JSON or null if not supported), source
 source_ids must contain the exact source_spans[].id aliases (for example "s3").
 Never construct source IDs from numbers, document IDs or hashes. Fact route IDs
 belong only in retract_ids; they are not source aliases.
+When source_documents is present, each source_spans[].doc_id is a document alias:
+expand source_documents[doc_id] for that span's original doc_id and time_metadata.
+Its text, offsets, source_role and source_message_indices remain on the span.
+Document aliases (such as d1) are metadata references, NEVER source_ids.
 Support requires explicit applicable original text, not retrieval count or guesswork.
 Each support value asserts the WHOLE value of that variable, including set/record
 variables. Multiple support observations are alternative proofs of the SAME complete
@@ -210,9 +215,35 @@ class JointReader:
             schema['properties']['final_prediction']['enum']=['a','b','c','d',None]
         return schema
 
+    @staticmethod
+    def _wire_data(data):
+        """Share identical document metadata without changing canonical sources.
+
+        The internal payload/visible map retains complete original coordinates
+        and metadata. Only the actual model input uses document references, and
+        only when the reversible representation is shorter. No route or text is
+        selected, merged, trimmed, or removed.
+        """
+        packed=deepcopy(data)
+        documents={}
+        aliases={}
+        for source in packed['source_spans']:
+            metadata={'doc_id':source['doc_id'],'time_metadata':source['time_metadata']}
+            identity=json.dumps(metadata,ensure_ascii=False,sort_keys=True,allow_nan=False)
+            if identity not in aliases:
+                alias='d'+str(len(aliases)+1)
+                aliases[identity]=alias
+                documents[alias]=metadata
+            source['doc_id']=aliases[identity]
+            del source['time_metadata']
+        packed['source_documents']=documents
+        def size(value):
+            return len(json.dumps(value,ensure_ascii=False,allow_nan=False).encode('utf-8'))
+        return packed if documents and size(packed)<size(data) else deepcopy(data)
+
     def _fits(self, operation, data):
         system = self._system(data)
-        count = self.e.reasoner.estimate(operation, system, data, self._schema(data))
+        count = self.e.reasoner.estimate(operation, system, self._wire_data(data), self._schema(data))
         # Reserve the structured repair envelope for each requested slot. Actual
         # failed drafts are unknown before generation and are checked separately,
         # without trimming originals or claiming this reserve guarantees a repair.
@@ -220,11 +251,11 @@ class JointReader:
             'failed':[{'variable':v,'id':'*','feedback':'x'*240,'observation':None}
                       for v in data['variables']],
             'attempt':1,'previous_response_identity':'0'*64}}
-        repair_count = self.e.reasoner.estimate(operation+'_repair', system, repair_data, self._schema(repair_data))
+        repair_count = self.e.reasoner.estimate(operation+'_repair', system, self._wire_data(repair_data), self._schema(repair_data))
         return max(count,repair_count) + self.e.s['reasoning_output_tokens'] + self.e.s['input_margin'] + 8 <= self.e.s['context_tokens']
 
     def _repair_fits(self, operation, data, step, identity, attempt):
-        count=self.e.reasoner.estimate(operation,self._system(data),data,self._schema(data))
+        count=self.e.reasoner.estimate(operation,self._system(data),self._wire_data(data),self._schema(data))
         total=count+self.e.s['reasoning_output_tokens']+self.e.s['input_margin']+8
         if total<=self.e.s['context_tokens']:
             return True
@@ -368,7 +399,7 @@ class JointReader:
                 visible={s['id']:s for s in current['source_spans']}
                 try:
                     response=self.e.reasoner.request(operation if attempt==0 else operation+'_repair',
-                        self._system(current),current,schema=self._schema(current),reserve=0 if audit else None)
+                        self._system(current),self._wire_data(current),schema=self._schema(current),reserve=0 if audit else None)
                     # Capture identifiable drafts before any envelope/slot error.
                     # A later generic protocol failure must not erase an already
                     # observed counter, even if its containing slot is duplicated.

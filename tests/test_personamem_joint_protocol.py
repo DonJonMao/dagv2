@@ -164,6 +164,115 @@ def test_typed_values_and_outputs_with_source_ids_fields_are_not_provenance():
     assert state.valid()[0]["history"] == value
 
 
+def expand_document_table(data):
+    """Test-side inverse: source metadata sharing must be exactly reversible."""
+    restored = deepcopy(data)
+    documents = restored.pop("source_documents")
+    for source in restored["source_spans"]:
+        metadata = documents[source["doc_id"]]
+        source["doc_id"] = metadata["doc_id"]
+        source["time_metadata"] = deepcopy(metadata["time_metadata"])
+    return restored
+
+
+def test_document_wire_table_roundtrips_all_source_fields_without_mutation():
+    reader, engine, _, _ = fixture()
+    data = reader._payload(engine.steps[0], "Read past creative activities", ["history"], ["s1", "s2", "s3"])
+    data["source_spans"][0]["text"] = '  原文 "source_ids": ["d1"]\nnext line  '
+    data["source_spans"][0]["source_role"] = "unknown"
+    data["source_spans"][0]["source_message_indices"] = []
+    for source in data["source_spans"]:
+        source["doc_id"] = "personamem:memory:" + digest(source["doc_id"])
+        source["time_metadata"] = {"validity": "unknown", "event_start": None, "event_end": None,
+                                   "observed_start": 30, "observed_end": 32, "time_source": "message_index"}
+    copies = [{**deepcopy(source), "id": "s" + str(index + 4), "start": 31, "end": 50,
+               "text": "More unchanged text."} for index, source in enumerate(data["source_spans"])]
+    different_time = {**deepcopy(copies[0]), "id": "s7", "time_metadata": {"validity": "known", "event_start": 42}}
+    data["source_spans"].extend([*copies, different_time])
+    before = deepcopy(data)
+    wire = reader._wire_data(data)
+    assert data == before and wire is not data
+    assert expand_document_table(wire) == before
+    assert all(set(document) == {"doc_id", "time_metadata"} for document in wire["source_documents"].values())
+    assert all("time_metadata" not in source for source in wire["source_spans"])
+    assert all(source["doc_id"].startswith("d") and source["doc_id"][1:].isdigit()
+               for source in wire["source_spans"])
+    assert wire["source_spans"][0]["doc_id"] == wire["source_spans"][3]["doc_id"]
+    assert wire["source_spans"][0]["doc_id"] != wire["source_spans"][6]["doc_id"]
+    assert len(wire["source_documents"]) == 4
+    for original, encoded in zip(before["source_spans"], wire["source_spans"]):
+        assert {key: value for key, value in encoded.items() if key != "doc_id"} == {
+            key: value for key, value in original.items() if key not in {"doc_id", "time_metadata"}
+        }
+    first_document = wire["source_spans"][0]["doc_id"]
+    wire["source_documents"][first_document]["time_metadata"]["event_start"] = 99
+    wire["source_spans"][0]["source_message_indices"].append(99)
+    wire["variables"]["history"]["type"] = "changed"
+    assert data == before
+
+
+def test_small_source_payload_keeps_original_representation_as_an_independent_copy():
+    reader, engine, _, _ = fixture()
+    data = reader._payload(engine.steps[0], "Read past creative activities", ["history"], ["s1"])
+    wire = reader._wire_data(data)
+    assert "source_documents" not in wire
+    assert wire == data and wire is not data
+    assert wire["source_spans"] is not data["source_spans"]
+    wire["source_spans"][0]["time_metadata"]["event_start"] = 17
+    assert data["source_spans"][0]["time_metadata"] == {}
+
+
+def test_read_and_repair_estimate_the_same_document_table_sent_to_the_model(monkeypatch):
+    outputs = [response(observation("repair-me", ["missing"])), response(observation("repair-me", ["s1"]))]
+    reader, engine, state, calls = fixture(lambda index, data: deepcopy(outputs[index - 1]))
+    document_id = "personamem:memory:" + "9" * 64
+    passage = "I played the piano last year. " * 30
+    time_metadata = {"validity": "unknown", "event_start": None, "event_end": None,
+                     "observed_start": 30, "observed_end": 32, "time_source": "message_index"}
+    document = SimpleNamespace(doc_id=document_id, passage=passage, metadata={
+        "source_segments": [{"role": "user", "start": 0, "end": len(passage), "source_message_indices": [30]}],
+        "time": time_metadata,
+    })
+    engine.docs = {document_id: document}
+    engine.mapper.sources = {}
+    engine.mapper.source_aliases = {}
+    for index, span in enumerate(build_source_spans(document_id, document, 400), 1):
+        alias = "s" + str(index)
+        engine.mapper.sources[alias] = {**span, "id": alias, "source_id": span["id"]}
+        engine.mapper.source_aliases[span["id"]] = alias
+    canonical_sources = deepcopy(engine.mapper.sources)
+    estimates = []
+    estimate = engine.reasoner.estimate
+
+    def inspect_estimate(operation, system, data, schema=None):
+        assert data["source_documents"]
+        assert all(source["doc_id"] in data["source_documents"] and "time_metadata" not in source
+                   for source in data["source_spans"])
+        count = estimate(operation, system, data, schema)
+        estimates.append((digest(data), count))
+        return count
+
+    monkeypatch.setattr(engine.reasoner, "estimate", inspect_estimate)
+    assert reader.read(engine.steps[0], "Read past creative activities", ["history"], [document_id], "history-query")
+    assert len(calls.requests) == 2
+    for sent, recorded in zip(calls.requests, engine.reasoner.requests):
+        data = sent["data"]
+        assert data["source_documents"] == {"d1": {"doc_id": document_id, "time_metadata": time_metadata}}
+        assert data["source_spans"][0]["doc_id"] == "d1"
+        assert data["source_spans"][0]["id"] == "s1"
+        assert expand_document_table(data)["source_spans"][0]["text"] == canonical_sources["s1"]["text"]
+        assert (digest(data), recorded["input_tokens_local"]) in estimates
+        assert recorded["input_tokens_local"] == estimate(
+            sent["stage"][0], reader._system(data), data, reader._schema(data))
+    assert calls.requests[1]["data"]["repair_scope"]["failed"][0]["observation"]["source_ids"] == ["missing"]
+    assert engine.mapper.sources == canonical_sources
+    assert state.valid()[1]["history"] == [canonical_sources["s1"]["source_id"]]
+    system = calls.requests[0]["payload"]["messages"][0]["content"]
+    assert "source_documents" in system and "source_ids" in system
+    with pytest.raises(ProtocolError):
+        reader._observation(observation(sources=["d1"]), "history", visible(reader), engine.steps[0])
+
+
 @pytest.mark.parametrize("namespace", ["alias", "stable"])
 def test_visible_exact_source_identity_is_grounded_to_unchanged_original(namespace):
     reader, engine, _, _ = fixture()
@@ -455,7 +564,7 @@ def test_four_option_terminal_schema_constrains_only_prediction_labels(options):
     engine.output_options = options
     data = reader._payload(engine.steps[0], "Read past creative activities", ["history"], ["s1"], semantic=True)
     system = reader._system(data)
-    wire = engine.reasoner._payload("semantic_compose", system, data, reader._schema(data))
+    wire = engine.reasoner._payload("semantic_compose", system, reader._wire_data(data), reader._schema(data))
     schema = json.loads(wire["messages"][0]["content"].rsplit(
         "Return one complete JSON object matching this schema:\n", 1)[1])
     prediction = schema["properties"]["final_prediction"]
@@ -475,7 +584,7 @@ def test_repair_input_overflow_is_diagnosed_before_consuming_repair_budget():
     reader, engine, state, calls = fixture(lambda index, data: response(deepcopy(bad)))
     reader.current_identity = "history-query"
     payload = reader._payload(engine.steps[0], "Read past creative activities", ["history"], ["s1"])
-    base = engine.reasoner.estimate("joint_read", reader._system(payload), payload, reader._schema(payload))
+    base = engine.reasoner.estimate("joint_read", reader._system(payload), reader._wire_data(payload), reader._schema(payload))
     engine.s["context_tokens"] = base + engine.s["reasoning_output_tokens"] + engine.s["input_margin"] + 8 + 500
     assert read(reader)
     assert len(calls.requests) == 1 and engine.ledger.used["json_repairs"] == 0
