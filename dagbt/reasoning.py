@@ -13,6 +13,7 @@ from .budget import BudgetExceeded
 from .evidence_protocol import EvidenceJSONError, parse_evidence_object
 from .model_runtime import (REASONING_MARKER, count_evidence_request_tokens,
                             evidence_token_accounting, estimate_evidence_tokens)
+from .methods import capabilities
 from .transport import call_reservation
 
 
@@ -64,12 +65,21 @@ class Reasoner:
             raise ValueError("Reasoning response schema must describe an object")
         # In plain/object mode the schema remains a prompt instruction, never
         # an invented provider-side constrained decoding guarantee.
-        schema_text = json.dumps(schema, ensure_ascii=False, sort_keys=True, allow_nan=False)
+        # Remove only JSON separator whitespace in joint reading's real prompt.
+        # Raw source strings/typed values are unchanged, and estimate/request
+        # both consume this same payload. Legacy and other operations retain
+        # their existing wire representation and request identities.
+        joint_operations = {"joint_read", "semantic_compose", "audit_joint",
+                            "joint_read_repair", "semantic_compose_repair", "audit_joint_repair"}
+        json_options = ({"separators": (",", ":")}
+                        if capabilities(self.settings.get("algorithm_version")).joint_reading
+                        and operation in joint_operations else {})
+        schema_text = json.dumps(schema, ensure_ascii=False, sort_keys=True, allow_nan=False, **json_options)
         if mode != "json_schema":
             system += "\n\nReturn one complete JSON object matching this schema:\n" + schema_text
         payload = {
             "messages": [{"role": "system", "content": system},
-                         {"role": "user", "content": json.dumps(data, ensure_ascii=False, allow_nan=False)}],
+                         {"role": "user", "content": json.dumps(data, ensure_ascii=False, allow_nan=False, **json_options)}],
             "max_tokens": self.settings["reasoning_output_tokens"],
             REASONING_MARKER: True,
         }

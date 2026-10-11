@@ -75,6 +75,18 @@ its validation feedback. Correct those drafts in place, preserving each requeste
 Already validated observations are frozen and must not be restated or changed.
 '''
 
+COLUMNAR_INSTRUCTION = '''
+When source_span_columns is present, source_spans contains row arrays. Match each
+row position to source_span_columns to reconstruct every span object before
+reading. References to source_spans[].id or other fields mean those objects.
+The id column holds source aliases (sN); doc_id holds the original document ID or,
+when source_documents is present, its metadata reference (dN), never source_ids.
+'''
+
+AUDIT_INSTRUCTION = ('Check actual facts and ALL known scoped counters against original sources. '
+    'Return audit_verdict=supported only if checked with no unresolved relevant issue; unknown otherwise. '
+    'Include sourced corrections/retractions before verdict. This is paid semantic verification, not output selection.')
+
 OBSERVATION_SCHEMA = {'type':'object','properties':{
     'id':{'type':'string'},
     'stance':{'type':'string','enum':['support','contradiction','partial','unknown','irrelevant']},
@@ -138,7 +150,7 @@ class JointReader:
             source_segments=source['source_segments'], evidence_kind='joint_original_source')
         return span
 
-    def _payload(self, step, query, variables, aliases, semantic=False):
+    def _payload(self, step, query, variables, aliases, semantic=False, *, audit=False):
         variables=[v for v in self.state.program['variables'] if v in variables]
         values, sources, ids = self.state.valid()
         related={v for v,d in self.state.program['variables'].items() if v in values and d['demand'] in step['inputs']}
@@ -202,6 +214,8 @@ class JointReader:
             if self.e.output_options is not None:
                 data['public_options'] = deepcopy(self.e.output_options)
                 data['terminal_expression']=deepcopy(self.state.program['expression'])
+        if audit:
+            data['audit_instruction']=AUDIT_INSTRUCTION
         return data
 
     @staticmethod
@@ -217,7 +231,7 @@ class JointReader:
 
     @staticmethod
     def _wire_data(data):
-        """Share identical document metadata without changing canonical sources.
+        """Share metadata and column names without changing canonical sources.
 
         The internal payload/visible map retains complete original coordinates
         and metadata. Only the actual model input uses document references, and
@@ -239,11 +253,26 @@ class JointReader:
         packed['source_documents']=documents
         def size(value):
             return len(json.dumps(value,ensure_ascii=False,allow_nan=False).encode('utf-8'))
-        return packed if documents and size(packed)<size(data) else deepcopy(data)
+        packed=packed if documents and size(packed)<size(data) else deepcopy(data)
+        spans=packed['source_spans']
+        if spans:
+            columns=list(spans[0])
+            # Canonical spans have one fixed shape. Do not invent placeholders
+            # for absent fields if another caller supplies heterogeneous rows.
+            if all(list(span)==columns for span in spans):
+                rows={**packed,'source_span_columns':columns,
+                      'source_spans':[[span[column] for column in columns] for span in spans]}
+                # Include the extra decoding instruction in the benefit check.
+                if size(rows)+len(COLUMNAR_INSTRUCTION.encode('utf-8'))<size(packed):
+                    return rows
+        return packed
+
+    def _estimate(self, operation, data):
+        wire=self._wire_data(data)
+        return self.e.reasoner.estimate(operation,self._system(wire),wire,self._schema(data))
 
     def _fits(self, operation, data):
-        system = self._system(data)
-        count = self.e.reasoner.estimate(operation, system, self._wire_data(data), self._schema(data))
+        count = self._estimate(operation,data)
         # Reserve the structured repair envelope for each requested slot. Actual
         # failed drafts are unknown before generation and are checked separately,
         # without trimming originals or claiming this reserve guarantees a repair.
@@ -251,11 +280,11 @@ class JointReader:
             'failed':[{'variable':v,'id':'*','feedback':'x'*240,'observation':None}
                       for v in data['variables']],
             'attempt':1,'previous_response_identity':'0'*64}}
-        repair_count = self.e.reasoner.estimate(operation+'_repair', system, self._wire_data(repair_data), self._schema(repair_data))
+        repair_count = self._estimate(operation+'_repair',repair_data)
         return max(count,repair_count) + self.e.s['reasoning_output_tokens'] + self.e.s['input_margin'] + 8 <= self.e.s['context_tokens']
 
     def _repair_fits(self, operation, data, step, identity, attempt):
-        count=self.e.reasoner.estimate(operation,self._system(data),self._wire_data(data),self._schema(data))
+        count=self._estimate(operation,data)
         total=count+self.e.s['reasoning_output_tokens']+self.e.s['input_margin']+8
         if total<=self.e.s['context_tokens']:
             return True
@@ -268,10 +297,11 @@ class JointReader:
 
     @staticmethod
     def _system(data):
+        system=SYSTEM+(COLUMNAR_INSTRUCTION if 'source_span_columns' in data else '')
         if data.get('public_options') is not None:
             from .personamem import TERMINAL_CHOICE_INSTRUCTION
-            return SYSTEM + TERMINAL_CHOICE_INSTRUCTION
-        return SYSTEM
+            return system + TERMINAL_CHOICE_INSTRUCTION
+        return system
 
     def _observation(self, row, variable, visible, step, *, require_grounding=True):
         step=next(s for s in self.e.steps if s['output_slot']==self.state.program['variables'][variable]['demand'])
@@ -372,7 +402,7 @@ class JointReader:
             batch=[]
             while pending:
                 trial=list(dict.fromkeys(batch+pending[0]))
-                if not self._fits(operation,self._payload(step,query,variables,trial,semantic)):
+                if not self._fits(operation,self._payload(step,query,variables,trial,semantic,audit=audit)):
                     break
                 batch=trial;pending.pop(0)
             if not batch and pending:
@@ -380,9 +410,7 @@ class JointReader:
                                      'unread_source_aliases':pending})
                 self.state.integrate([],external_pending|self.pending_variables())
                 raise InputOverflow('Local sources/parents/counters exceed real wire capacity')
-            data=self._payload(step,query,variables,batch,semantic)
-            if audit:
-                data['audit_instruction']='Check actual facts and ALL known scoped counters against original sources. Return audit_verdict=supported only if checked with no unresolved relevant issue; unknown otherwise. Include sourced corrections/retractions before verdict. This is paid semantic verification, not output selection.'
+            data=self._payload(step,query,variables,batch,semantic,audit=audit)
             visible={s['id']:s for s in data['source_spans']}
             valid, failures, completed, frozen = [], {}, set(), set()
             observed_rows, observed_slots, duplicate_rows, repair_inputs = {}, {}, {}, set()
@@ -398,8 +426,9 @@ class JointReader:
                 next_failures={}
                 visible={s['id']:s for s in current['source_spans']}
                 try:
+                    wire=self._wire_data(current)
                     response=self.e.reasoner.request(operation if attempt==0 else operation+'_repair',
-                        self._system(current),self._wire_data(current),schema=self._schema(current),reserve=0 if audit else None)
+                        self._system(wire),wire,schema=self._schema(current),reserve=0 if audit else None)
                     # Capture identifiable drafts before any envelope/slot error.
                     # A later generic protocol failure must not erase an already
                     # observed counter, even if its containing slot is duplicated.

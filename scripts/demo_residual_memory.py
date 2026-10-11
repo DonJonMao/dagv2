@@ -71,6 +71,13 @@ class SourcesOnly:
   elif operation=='semantic_compose' and 'certificate' in data:
    value={'semantic_answer':data['semantic_result'],'final_prediction':'A'}
   elif operation.startswith(('joint_read','semantic_compose','audit_joint')):
+   # The offline fixture reads canonical spans after lossless wire expansion.
+   if 'source_span_columns' in data:
+    columns=data.pop('source_span_columns')
+    data['source_spans']=[dict(zip(columns,row)) for row in data['source_spans']]
+   documents=data.pop('source_documents',{})
+   if documents:
+    for source in data['source_spans']:source.update(deepcopy(documents[source['doc_id']]))
    slots=[];docs={s['doc_id']:s for s in data['source_spans']};text='\n'.join(s['text'] for s in data['source_spans'])
    for v,decl in data['variables'].items():
     val=None;used=[]

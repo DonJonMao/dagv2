@@ -13,7 +13,7 @@ from dagbt.budget import Ledger
 from dagbt.evidence_spans import build_source_spans
 from dagbt.fact_state import FactState
 from dagbt.joint_reading import JointReader
-from dagbt.reasoning import ProtocolError, Reasoner
+from dagbt.reasoning import InputOverflow, ProtocolError, Reasoner
 from dagbt.transport import digest
 
 
@@ -44,8 +44,9 @@ class ScriptedCalls:
         self.requests = []
 
     def get(self, stage, url, payload, **kwargs):
-        data = json.loads(payload["messages"][1]["content"])
-        self.requests.append({"stage": stage, "payload": deepcopy(payload), "data": data})
+        wire_data = json.loads(payload["messages"][1]["content"])
+        data = expand_wire_data(wire_data)
+        self.requests.append({"stage": stage, "payload": deepcopy(payload), "data": data, "wire_data": wire_data})
         self.ledger.reserve("llm", "/".join(stage))
         raw = self.respond(len(self.requests), data)
         return {
@@ -164,14 +165,24 @@ def test_typed_values_and_outputs_with_source_ids_fields_are_not_provenance():
     assert state.valid()[0]["history"] == value
 
 
-def expand_document_table(data):
-    """Test-side inverse: source metadata sharing must be exactly reversible."""
+def wire_source_rows(data):
+    """Expose named row fields for assertions without losing the actual wire."""
+    columns = data.get("source_span_columns")
+    return [dict(zip(columns, row)) for row in data["source_spans"]] if columns else data["source_spans"]
+
+
+def expand_wire_data(data):
+    """Test-side inverse: both sharing representations are exactly reversible."""
     restored = deepcopy(data)
-    documents = restored.pop("source_documents")
-    for source in restored["source_spans"]:
-        metadata = documents[source["doc_id"]]
-        source["doc_id"] = metadata["doc_id"]
-        source["time_metadata"] = deepcopy(metadata["time_metadata"])
+    if "source_span_columns" in restored:
+        restored["source_spans"] = wire_source_rows(restored)
+        del restored["source_span_columns"]
+    documents = restored.pop("source_documents", None)
+    if documents is not None:
+        for source in restored["source_spans"]:
+            metadata = documents[source["doc_id"]]
+            source["doc_id"] = metadata["doc_id"]
+            source["time_metadata"] = deepcopy(metadata["time_metadata"])
     return restored
 
 
@@ -192,21 +203,26 @@ def test_document_wire_table_roundtrips_all_source_fields_without_mutation():
     before = deepcopy(data)
     wire = reader._wire_data(data)
     assert data == before and wire is not data
-    assert expand_document_table(wire) == before
+    assert expand_wire_data(wire) == before
+    assert wire["source_span_columns"] == ["id", "doc_id", "start", "end", "text", "source_role", "source_message_indices"]
+    assert all(isinstance(row, list) and len(row) == len(wire["source_span_columns"]) for row in wire["source_spans"])
+    encoded_rows = wire_source_rows(wire)
     assert all(set(document) == {"doc_id", "time_metadata"} for document in wire["source_documents"].values())
-    assert all("time_metadata" not in source for source in wire["source_spans"])
+    assert all("time_metadata" not in source for source in encoded_rows)
     assert all(source["doc_id"].startswith("d") and source["doc_id"][1:].isdigit()
-               for source in wire["source_spans"])
-    assert wire["source_spans"][0]["doc_id"] == wire["source_spans"][3]["doc_id"]
-    assert wire["source_spans"][0]["doc_id"] != wire["source_spans"][6]["doc_id"]
+               for source in encoded_rows)
+    assert encoded_rows[0]["doc_id"] == encoded_rows[3]["doc_id"]
+    assert encoded_rows[0]["doc_id"] != encoded_rows[6]["doc_id"]
     assert len(wire["source_documents"]) == 4
-    for original, encoded in zip(before["source_spans"], wire["source_spans"]):
+    for original, encoded in zip(before["source_spans"], encoded_rows):
         assert {key: value for key, value in encoded.items() if key != "doc_id"} == {
             key: value for key, value in original.items() if key not in {"doc_id", "time_metadata"}
         }
-    first_document = wire["source_spans"][0]["doc_id"]
+    assert "source_span_columns" in reader._system(wire)
+    assert "source_span_columns" not in reader._system(data)
+    first_document = encoded_rows[0]["doc_id"]
     wire["source_documents"][first_document]["time_metadata"]["event_start"] = 99
-    wire["source_spans"][0]["source_message_indices"].append(99)
+    encoded_rows[0]["source_message_indices"].append(99)
     wire["variables"]["history"]["type"] = "changed"
     assert data == before
 
@@ -216,6 +232,7 @@ def test_small_source_payload_keeps_original_representation_as_an_independent_co
     data = reader._payload(engine.steps[0], "Read past creative activities", ["history"], ["s1"])
     wire = reader._wire_data(data)
     assert "source_documents" not in wire
+    assert "source_span_columns" not in wire
     assert wire == data and wire is not data
     assert wire["source_spans"] is not data["source_spans"]
     wire["source_spans"][0]["time_metadata"]["event_start"] = 17
@@ -226,7 +243,7 @@ def test_read_and_repair_estimate_the_same_document_table_sent_to_the_model(monk
     outputs = [response(observation("repair-me", ["missing"])), response(observation("repair-me", ["s1"]))]
     reader, engine, state, calls = fixture(lambda index, data: deepcopy(outputs[index - 1]))
     document_id = "personamem:memory:" + "9" * 64
-    passage = "I played the piano last year. " * 30
+    passage = "I played the piano last year. " * 100
     time_metadata = {"validity": "unknown", "event_start": None, "event_end": None,
                      "observed_start": 30, "observed_end": 32, "time_source": "message_index"}
     document = SimpleNamespace(doc_id=document_id, passage=passage, metadata={
@@ -247,7 +264,8 @@ def test_read_and_repair_estimate_the_same_document_table_sent_to_the_model(monk
     def inspect_estimate(operation, system, data, schema=None):
         assert data["source_documents"]
         assert all(source["doc_id"] in data["source_documents"] and "time_metadata" not in source
-                   for source in data["source_spans"])
+                   for source in wire_source_rows(data))
+        assert system == reader._system(data)
         count = estimate(operation, system, data, schema)
         estimates.append((digest(data), count))
         return count
@@ -256,11 +274,13 @@ def test_read_and_repair_estimate_the_same_document_table_sent_to_the_model(monk
     assert reader.read(engine.steps[0], "Read past creative activities", ["history"], [document_id], "history-query")
     assert len(calls.requests) == 2
     for sent, recorded in zip(calls.requests, engine.reasoner.requests):
-        data = sent["data"]
+        data = sent["wire_data"]
+        assert data["source_span_columns"]
+        named_rows = wire_source_rows(data)
         assert data["source_documents"] == {"d1": {"doc_id": document_id, "time_metadata": time_metadata}}
-        assert data["source_spans"][0]["doc_id"] == "d1"
-        assert data["source_spans"][0]["id"] == "s1"
-        assert expand_document_table(data)["source_spans"][0]["text"] == canonical_sources["s1"]["text"]
+        assert named_rows[0]["doc_id"] == "d1"
+        assert named_rows[0]["id"] == "s1"
+        assert expand_wire_data(data)["source_spans"][0]["text"] == canonical_sources["s1"]["text"]
         assert (digest(data), recorded["input_tokens_local"]) in estimates
         assert recorded["input_tokens_local"] == estimate(
             sent["stage"][0], reader._system(data), data, reader._schema(data))
@@ -395,6 +415,48 @@ def test_audit_repair_keeps_original_instruction_and_requires_explicit_verdict(r
     if repair_verdict is None:
         assert any("Audit must return an explicit verdict" in failure["error"]
                    for failure in reader.batches[-1]["failed_slots"])
+
+
+def test_audit_capacity_trial_includes_instruction_before_any_model_request(monkeypatch):
+    from dagbt.joint_reading import AUDIT_INSTRUCTION
+
+    reader, engine, state, calls = fixture()
+    reader.current_identity = "capacity-audit"
+    plain = reader._payload(engine.steps[0], "Read past creative activities", ["history"], ["s1"])
+    audit = reader._payload(engine.steps[0], "Read past creative activities", ["history"], ["s1"], audit=True)
+    assert audit["audit_instruction"] == AUDIT_INSTRUCTION
+    assert {key: value for key, value in audit.items() if key != "audit_instruction"} == plain
+
+    # Find the exact boundary using production serialization and its real
+    # repair reserve, so neither tokenizer assumptions nor metadata sizes are
+    # duplicated in the regression.
+    low, high = 0, engine.s["context_tokens"]
+    while low < high:
+        middle = (low + high) // 2
+        engine.s["context_tokens"] = middle
+        if reader._fits("audit_joint", audit):
+            high = middle
+        else:
+            low = middle + 1
+    engine.s["context_tokens"] = low - 1
+    assert reader._fits("audit_joint", plain)
+    assert not reader._fits("audit_joint", audit)
+    fits = reader._fits
+    trials = []
+
+    def require_audit_instruction(operation, data):
+        trials.append(deepcopy(data))
+        assert data["audit_instruction"] == AUDIT_INSTRUCTION
+        return fits(operation, data)
+
+    monkeypatch.setattr(reader, "_fits", require_audit_instruction)
+    with pytest.raises(InputOverflow, match="real wire capacity"):
+        reader.read(engine.steps[0], "Read past creative activities", ["history"],
+                    ["piano"], "capacity-audit", audit=True)
+    assert trials and not calls.requests
+    assert engine.ledger.used["llm"] == engine.ledger.used["json_repairs"] == 0
+    assert state.pending == {"history"}
+    assert reader.batches[-1]["status"] == "capacity_unavailable"
 
 
 @pytest.mark.parametrize("intermediate_failure", ["missing_slot", "malformed_slots", "missing_audit_verdict"])
@@ -563,8 +625,9 @@ def test_four_option_terminal_schema_constrains_only_prediction_labels(options):
     reader, engine, _, calls = fixture()
     engine.output_options = options
     data = reader._payload(engine.steps[0], "Read past creative activities", ["history"], ["s1"], semantic=True)
-    system = reader._system(data)
-    wire = engine.reasoner._payload("semantic_compose", system, reader._wire_data(data), reader._schema(data))
+    wire_data = reader._wire_data(data)
+    system = reader._system(wire_data)
+    wire = engine.reasoner._payload("semantic_compose", system, wire_data, reader._schema(data))
     schema = json.loads(wire["messages"][0]["content"].rsplit(
         "Return one complete JSON object matching this schema:\n", 1)[1])
     prediction = schema["properties"]["final_prediction"]
@@ -584,7 +647,8 @@ def test_repair_input_overflow_is_diagnosed_before_consuming_repair_budget():
     reader, engine, state, calls = fixture(lambda index, data: response(deepcopy(bad)))
     reader.current_identity = "history-query"
     payload = reader._payload(engine.steps[0], "Read past creative activities", ["history"], ["s1"])
-    base = engine.reasoner.estimate("joint_read", reader._system(payload), reader._wire_data(payload), reader._schema(payload))
+    wire_data = reader._wire_data(payload)
+    base = engine.reasoner.estimate("joint_read", reader._system(wire_data), wire_data, reader._schema(payload))
     engine.s["context_tokens"] = base + engine.s["reasoning_output_tokens"] + engine.s["input_margin"] + 8 + 500
     assert read(reader)
     assert len(calls.requests) == 1 and engine.ledger.used["json_repairs"] == 0
