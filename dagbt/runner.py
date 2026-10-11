@@ -25,12 +25,14 @@ import time
 import urllib.parse
 import urllib.request
 from collections import Counter
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 DATASETS = ("hotpotqa", "2wikimultihopqa", "musique", "personamem")
 METRICS = ("f1", "em", "r@5", "r@10", "r@20", "all@5", "all@10", "all@20")
+_PERSONAMEM_READER_QUESTION = ContextVar("dagbt_personamem_reader_question", default=None)
 
 
 def load(path):
@@ -457,12 +459,17 @@ def _finite_number(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
-def original_question(q, resources, calls, e):
+def original_question(q, resources, calls, e, *, reader_question=None):
     """Exact e.work computation/catches, with Calls supplied for accounting.
 
     e.work's filesystem resume wrapper is handled by our attempt coordinator.
     All planner/archive/controller/reader algorithms remain native functions.
+    PersonaMem supplies a separate full MCQ only to the Reader; retrieval and
+    intermediate JSON protocols receive the user's request without its final
+    option-only response instruction.
     """
+    if reader_question is not None and (not isinstance(reader_question, str) or not reader_question.strip()):
+        raise ValueError("Reader question override must be nonempty text")
     try:
         docs, ids, vectors, index, tokenizer = resources
         plan = e.make_plan(q["question"], calls)
@@ -473,7 +480,13 @@ def original_question(q, resources, calls, e):
             pool, trace = e.archive(q["question"], plan, ids, vectors, calls)
         row = dict(unit_id=q["id"], question=q["question"], plan=plan, candidate_doc_ids=pool, archive_trace=trace)
         save(calls.output / "input.json", row)
-        result = e.native.solve(row, docs, tokenizer, index, calls)
+        token = _PERSONAMEM_READER_QUESTION.set(reader_question)
+        try:
+            result = e.native.solve(row, docs, tokenizer, index, calls)
+        finally:
+            # Workers persist across questions. A failure must not leave the
+            # previous task's options attached to a later Reader request.
+            _PERSONAMEM_READER_QUESTION.reset(token)
         # controller mutates this pool with corpus-wide node hits. Capture it only
         # after solve, without modifying any native selection or reader behavior.
         result["diagnostics"] = {**result.get("diagnostics", {}), "candidate_doc_ids": list(row["candidate_doc_ids"]),
@@ -497,6 +510,9 @@ def configure_personamem_reader():
         return
 
     def messages(**kwargs):
+        reader_question = _PERSONAMEM_READER_QUESTION.get()
+        if reader_question is not None:
+            kwargs = {**kwargs, "question": reader_question}
         result = original(**kwargs)
         marker = "Answer with the shortest exact phrase supported by the context passages."
         if marker not in result[-1]["content"]:
@@ -566,16 +582,20 @@ def native_worker(connection, dataset, arm, config):
                     raise ValueError("PersonaMem task differs from its frozen public question/scope")
                 question_resources = scope_resources(resources, memory_scopes[q["scope_id"]])
             calls = AuditedCalls(q["id"], output, e.CONFIG, e)
-            generation_question = {"id": q["id"], "question": q["question"]}
+            # Final MCQ output instructions must never enter Planner, archive
+            # queries, or node JSON prompts. Both arms reason about the same
+            # user request and receive the public options only at the Reader.
+            generation_question = {"id": q["id"], "question":
+                                   q["user_question"] if memory_scopes is not None else q["question"]}
             if arm == "original":
-                row = original_question(generation_question, question_resources, calls, e)
+                row = original_question(generation_question, question_resources, calls, e,
+                                        reader_question=q["question"] if memory_scopes is not None else None)
             else:
                 from dagbt.engine import run_question
                 if dataset == "personamem":
                     # Only the current request reaches fusion planning/evidence;
                     # the final MCQ reader receives the original public options.
-                    fusion_question = {"id": q["id"], "question": q["user_question"]}
-                    row = run_question(fusion_question, question_resources, calls, e.CONFIG,
+                    row = run_question(generation_question, question_resources, calls, e.CONFIG,
                                        method=arm, reader_question=q["question"])
                 else:
                     row = run_question(generation_question, question_resources, calls, e.CONFIG, method=arm)
@@ -583,7 +603,8 @@ def native_worker(connection, dataset, arm, config):
                 from dagbt.personamem import parse_choice
                 row.setdefault("diagnostics", {})["memory_scope"] = {
                     "scope_id": q["scope_id"], "shared_context_id": q["shared_context_id"],
-                    "end_index_exclusive": q["end_index"], "visible_doc_ids": question_resources[1]}
+                    "end_index_exclusive": q["end_index"], "visible_doc_ids": question_resources[1],
+                    "question_protocol": "user_request_reasoning_mcq_reader_v2"}
                 if row["answer"]["status"] == "ok" and parse_choice(row["answer"]["prediction"], q["options"]) is None:
                     row["answer"]["status"] = "invalid_choice"
                     row["answer"]["error"] = "Reader must return one unambiguous option label"

@@ -1,6 +1,8 @@
 # 融合 v4：复核支持证明，再由程序选择来源闭包
 
-这是一项从冻结 v3 提交 `774d285ffe91a23a99ee9afb006e85103be335b5` 分出的实验修改，工作分支为 `feat/support-proof-review-v4`。默认 dependency 方法的融合可靠性版本为 `dagbt_fusion_support_review_v4`，语义诊断版本为 `dagbt_semantic_evidence_v4`。原 DAG v2、模型配置和数据协议不因这次支持复核变更而改变。
+这是一项从冻结 v3 提交 `774d285ffe91a23a99ee9afb006e85103be335b5` 分出的实验修改，工作分支为 `feat/support-proof-review-v4`。默认 dependency 方法的融合可靠性版本为 `dagbt_fusion_support_review_v4`，语义诊断版本为 `dagbt_semantic_evidence_v4`。支持复核本身不改冻结 DAG v2、模型配置或数据协议。
+
+2026-10-11 的 PersonaMem 部署另含输入协议修复：两臂的规划、检索和节点推理均接收 `user_question`，仅最终 reader 接收完整单选题，避免 original planner 被“只返回选项标签”的题目指令干扰。该变化记为 `diagnostics.memory_scope.question_protocol=user_request_reasoning_mcq_reader_v2`，不能与旧输入协议的结果混写。[上传 tar、复用索引及重新运行说明](PERSONAMEM_RESTART_20261011.md) 提供服务器命令；这一适配修复不修改冻结源码或 vendor，也不代表真实服务实验已通过。
 
 **新版本必须使用新输出目录。** 代码身份和方法协议已改变，不能恢复或混写 v3 的结果。`scripts/run_v3.sh` 是历史包装脚本名，名称不决定当前加载的选择协议，其默认输出目录仍需特别留意。建议直接指定 runner 和新目录：
 

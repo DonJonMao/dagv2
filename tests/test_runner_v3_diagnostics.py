@@ -257,7 +257,7 @@ def test_score_all_exposes_independent_semantic_and_coverage_cohorts(tmp_path, d
 
 
 @pytest.mark.parametrize("arm", ["original", "fusion"])
-def test_personamem_worker_keeps_options_only_in_fusion_reader(tmp_path, monkeypatch, arm):
+def test_personamem_worker_keeps_options_only_in_both_readers(tmp_path, monkeypatch, arm):
     from dagbt import engine, personamem, resources
     question = {"id": "q", "question": "Pick a drink\nOptions:\n(a) Tea\n(b) Coffee",
                 "user_question": "Pick a drink", "scope_id": "p:1", "shared_context_id": "p",
@@ -287,8 +287,5 @@ def test_personamem_worker_keeps_options_only_in_fusion_reader(tmp_path, monkeyp
     assert [message["type"] for message in messages] == ["ready", "result"]
     q, kw = captured[0]
     assert set(q) == {"id", "question"}
-    if arm == "fusion":
-        assert q["question"] == question["user_question"] and "Options:" not in q["question"]
-        assert kw["reader_question"] == question["question"]
-    else:
-        assert q["question"] == question["question"] and "reader_question" not in kw
+    assert q["question"] == question["user_question"] and "Options:" not in q["question"]
+    assert kw["reader_question"] == question["question"]

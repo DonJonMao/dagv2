@@ -24,7 +24,7 @@ import test_bt_profile_system as scripted
 
 
 @contextmanager
-def _rank_future_first_models(passages, future_passages):
+def _rank_future_first_models(passages, future_passages, *, obey_leaked_answer_instruction=False):
     """Make a stale native search matrix expose invisible future memories.
 
     All query vectors rank the later cutoff's exclusive memories first. A
@@ -60,10 +60,22 @@ def _rank_future_first_models(passages, future_passages):
 
             def do_POST(self):
                 raw = self.rfile.read(int(self.headers["Content-Length"]))
+                payload = json.loads(raw)
+                if obey_leaked_answer_instruction and self.path.endswith("/chat/completions"):
+                    from dagbt.personamem import ANSWER_INSTRUCTION
+                    messages = payload["messages"]
+                    if (messages[0]["content"].startswith("Decompose a multi-hop question")
+                            and ANSWER_INSTRUCTION in messages[1]["content"]):
+                        # Reproduce the observed service behavior: the MCQ
+                        # instruction wins over the planner's JSON instruction.
+                        requests.append({"path": self.path, "payload": payload})
+                        self.respond(json.dumps({"choices": [{"message": {"content": "(a)"},
+                                                              "finish_reason": "stop"}],
+                                                 "usage": usage}).encode())
+                        return
                 if not self.path.endswith("/embeddings"):
                     self.forward(raw)
                     return
-                payload = json.loads(raw)
                 requests.append({"path": self.path, "payload": payload})
                 try:
                     assert payload["model"] == "qwen3-embedding-8b"
@@ -246,7 +258,8 @@ def test_personamem_spawned_pair_shares_index_and_cannot_retrieve_future_memorie
     runner.save(credentials, {})
     output = tmp_path / "scripted_personamem_pair"
 
-    with _rank_future_first_models(passages, future_passages) as (endpoint, requests, errors):
+    with _rank_future_first_models(passages, future_passages,
+                                  obey_leaked_answer_instruction=True) as (endpoint, requests, errors):
         config = runner.load(runner.ROOT / "configs/paired.example.json")
         config.update(llm_base_url=endpoint + "/v1", embedding_base_url=endpoint + "/v1",
                       credentials_file=str(credentials), derived_index_dir=str(tmp_path / "derived_indices"),
@@ -280,6 +293,39 @@ def test_personamem_spawned_pair_shares_index_and_cannot_retrieve_future_memorie
                 for node in row.get("ranking", {}).get("nodes", []):
                     assert set(node.get("source_doc_ids", [])) <= visible
                 assert row["runner"]["cost"]["http_attempts"] > 0
+                attempt = output / row["attempt_directories"][-1]
+                records = [runner.load(path) for path in (attempt / "requests").glob("*.json")]
+                chats = [record["payload"] for record in records if record["url"].endswith("/chat/completions")]
+                planners = [payload for payload in chats
+                            if payload["messages"][0]["content"].startswith("Decompose a multi-hop question")]
+                assert len(planners) == 1
+                planner_input = planners[0]["messages"][1]["content"]
+                if arm == "fusion":
+                    planner_input = json.loads(planner_input)
+                assert planner_input == q["user_question"]
+                node_prefix = ("Solve the current evidence-grounded task" if arm == "original"
+                               else "Resolve ONE executable subquestion")
+                node_requests = [payload for payload in chats
+                                 if payload["messages"][0]["content"].startswith(node_prefix)]
+                assert node_requests, (arm, q["id"])
+                for payload in [*planners, *node_requests]:
+                    question_wire = payload["messages"][1]["content"]
+                    assert personamem.ANSWER_INSTRUCTION not in question_wire
+                    assert "Candidate answers:\n" not in question_wire
+                for payload in node_requests:
+                    node_input = payload["messages"][1]["content"]
+                    if arm == "original":
+                        assert node_input.startswith("Original question:\n" + q["user_question"] + "\n\nCurrent task:")
+                    else:
+                        assert json.loads(node_input)["original_question"] == q["user_question"]
+                task_readers = [payload for payload in chats
+                                if payload["messages"][0]["content"].startswith("You are a long-document QA reader")]
+                assert len(task_readers) == 1
+                reader_input = task_readers[0]["messages"][1]["content"]
+                assert q["question"] in reader_input
+                for other_question in qs:
+                    if other_question["id"] != q["id"]:
+                        assert other_question["question"] not in reader_input
         assert runner.load(output / "progress.json")["state"] == "complete"
         index = inspect_index(config, "personamem")
         assert index["status"] == "ready" and index["dimensions"] == 8
