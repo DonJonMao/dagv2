@@ -146,11 +146,19 @@ class JointReader:
         return data
 
     def _fits(self, operation, data):
-        count = self.e.reasoner.estimate(operation, SYSTEM, data, SCHEMA)
+        system = self._system(data)
+        count = self.e.reasoner.estimate(operation, system, data, SCHEMA)
         # Leave real room for a short scoped repair plus protocol diagnostics.
         repair_data = {**data,'repair_scope':{'failed':[], 'feedback':'x'*240}}
-        repair_count = self.e.reasoner.estimate(operation+'_repair', SYSTEM, repair_data, SCHEMA)
+        repair_count = self.e.reasoner.estimate(operation+'_repair', system, repair_data, SCHEMA)
         return max(count,repair_count) + self.e.s['reasoning_output_tokens'] + self.e.s['input_margin'] + 8 <= self.e.s['context_tokens']
+
+    @staticmethod
+    def _system(data):
+        if data.get('public_options') is not None:
+            from .personamem import TERMINAL_CHOICE_INSTRUCTION
+            return SYSTEM + TERMINAL_CHOICE_INSTRUCTION
+        return SYSTEM
 
     def _observation(self, row, variable, visible, step, *, require_grounding=True):
         step=next(s for s in self.e.steps if s['output_slot']==self.state.program['variables'][variable]['demand'])
@@ -257,7 +265,7 @@ class JointReader:
             for attempt in range(max_repairs+1):
                 try:
                     response=self.e.reasoner.request(operation if attempt==0 else operation+'_repair',
-                        SYSTEM,current,schema=SCHEMA,reserve=0 if audit else None)
+                        self._system(current),current,schema=SCHEMA,reserve=0 if audit else None)
                     if set(response)-{'slots','final_prediction','audit_verdict','semantic_answer'}:
                         raise ProtocolError('Joint response contains undeclared fields')
                     if not isinstance(response.get('slots'),list):

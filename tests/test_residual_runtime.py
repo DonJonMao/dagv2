@@ -134,6 +134,84 @@ def test_semantic_terminal_has_real_response_and_option_isolation():
  for r in requests:
   if r['stage'][0]!='semantic_compose':assert 'public_options' not in str(r['payload'])
 
+@pytest.mark.parametrize('method',[JOINT,RESIDUAL])
+@pytest.mark.parametrize('repair',[False,True])
+def test_personamem_semantic_terminal_uses_structured_options_without_reader_instruction(method,repair):
+ from types import SimpleNamespace
+ from dagbt.engine import Engine
+ from dagbt.personamem import ANSWER_INSTRUCTION,TERMINAL_CHOICE_INSTRUCTION,format_question,parse_choice
+ question='Please recommend a visit that suits my preferences.'
+ options=['Quiet visit','Busy visit','Noisy concert','Crowded festival']
+ full_question=format_question(question,options)
+ plan={'steps':[demo.step('preference','Find x preference quantity'),
+                demo.step('advice','Recommend from {preference}',['preference'],'compose')],
+  'final_node_id':'advice','output_contract':demo.contract('semantic','text','visitor'),
+  'program':{'variables':{'x':{'type':'number','demand':'preference'},
+                          'advice':{'type':'text','demand':'advice'}},'expression':demo.var('advice')}}
+ class ChoiceServices(demo.SourcesOnly):
+  injected=False
+  def get(self,stage,url,payload):
+   result=super().get(stage,url,payload)
+   if repair and stage[0]=='semantic_compose' and not self.injected:
+    self.injected=True
+    result['response']['choices'][0]['message']['content']='{"slots": []}'
+   return result
+ services=ChoiceServices(plan,scenario='advice')
+ docs={'x':SimpleNamespace(doc_id='x',title='x',text='Preference 0: quiet places.',
+                           passage='Preference 0: quiet places.')}
+ config={'_test_transport':True,'llm_base_url':'http://synthetic/v1','llm_model':'source-script',
+  'embedding_base_url':'http://synthetic/v1','embedding_model':'source-script',
+  'fusion':{'initial_width':1,'proposal_width':1,'max_feedback_rounds':0}}
+ engine=Engine({'id':'personamem-synthetic-advice','question':question},
+  (docs,['x'],np.array([[1,0,0]],np.float32),None,demo.Tokenizer()),services,config,method,
+  reader_question=question,output_options=options)
+ estimates=[]
+ estimate=engine.reasoner.estimate
+ def capture_estimate(operation,system,data,schema=None):
+  count=estimate(operation,system,data,schema)
+  estimates.append((operation,engine.reasoner._payload(operation,system,data,schema)['messages'],count))
+  return count
+ engine.reasoner.estimate=capture_estimate
+ row=engine.run()
+ assert row['answer']['status']=='ok' and parse_choice(row['answer']['prediction'],options)=='a'
+ assert engine.output_options==options and row['answer']['completion_kind']=='semantic_assessment'
+ terminal=[]
+ for request in services.requests:
+  wire=json.dumps(request['payload'],ensure_ascii=False)
+  if request['stage'][0].startswith('semantic_compose'):
+   data=json.loads(request['payload']['messages'][1]['content'])
+   assert data['public_options']==options and data['public_output_question']==question
+   assert data['original_question']==question
+   assert TERMINAL_CHOICE_INSTRUCTION in request['payload']['messages'][0]['content']
+   terminal.append(request)
+  else:
+   assert 'public_options' not in wire
+  assert ANSWER_INSTRUCTION not in wire and 'Candidate answers:' not in wire
+  assert full_question not in wire
+ assert terminal
+ assert any(r['stage'][0]=='semantic_compose_repair' for r in terminal)==repair
+ for record in engine.reasoner.requests:
+  if record['operation'].startswith('semantic_compose'):
+   assert (record['operation'],record['messages'],record['input_tokens_local']) in estimates
+ assert json.loads(services.requests[0]['payload']['messages'][1]['content'])==question
+ assert not any(r['stage'][0] in ('reader','select') for r in services.requests)
+
+def test_personamem_deterministic_terminal_explains_option_mapping_in_json_contract():
+ from dagbt.personamem import ANSWER_INSTRUCTION,TERMINAL_CHOICE_INSTRUCTION,parse_choice
+ options=['The first quantity is smaller','The second is smaller','They are equal','Unknown']
+ row,requests,engine=demo.run_compare(options=options)
+ assert row['answer']['status']=='ok' and row['answer']['certificate'] is not None
+ assert parse_choice(row['answer']['prediction'],options)=='a'
+ terminal=[r for r in requests if r['stage'][0]=='semantic_compose']
+ assert len(terminal)==1
+ payload=terminal[0]['payload']
+ data=json.loads(payload['messages'][1]['content'])
+ assert data['public_options']==options and data['semantic_result'] is True
+ assert TERMINAL_CHOICE_INSTRUCTION in payload['messages'][0]['content']
+ assert '(a), (b), (c), (d)' in payload['messages'][0]['content']
+ assert 'Never return a bare label.' in payload['messages'][0]['content']
+ assert ANSWER_INSTRUCTION not in str(payload)
+
 def test_last_read_and_reserved_audit_can_exhaust_llm_then_free_publish():
  row,_,_=demo.run_demo(llm_calls=7)
  assert row['answer']['status']=='ok' and row['diagnostics']['ledger']['remaining']['llm']==0

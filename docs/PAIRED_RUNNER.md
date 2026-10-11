@@ -1,6 +1,6 @@
 # 成对实验启动、恢复和结果解释
 
-这是 RAG **推理与评测实验**，不会更新模型参数。默认对包内 HotpotQA、2WikiMultihopQA、MuSiQue 各 1,000 个问题，以及 PersonaMem-v1 官方 32k 文件全部 589 题，分别执行原 DAG v2 和融合版，共 **3,589 题、7,178 个方法任务**。同一道题的两方法共享当前问题、最终 reader 的公共选项、可见语料范围和向量；融合 v3 的规划/检索/证据阶段仅接收用户当前问题，original 仍保留问题加公开选项的既有协议。原三套数据仍是包内子集；PersonaMem 的 589 题是所固定官方 32k 文件的全部题目，不代表所有上下文长度设置，也不声称复现 BT 的 train/validation/test 划分。
+这是 RAG **推理与评测实验**，不会更新模型参数。默认对包内 HotpotQA、2WikiMultihopQA、MuSiQue 各 1,000 个问题，以及 PersonaMem-v1 官方 32k 文件全部 589 题，分别执行原 DAG v2 和融合版，共 **3,589 题、7,178 个方法任务**。同一道题的两方法共享当前问题、公开选项、可见语料范围和向量；2026-10-11 的 PersonaMem 适配修复后，original 的规划与非终端推理也只使用 `user_question`，完整 MCQ 仅交给其最终 reader。基于 a48dc8d 的 residual 新方法应使用[专用部署命令](PERSONAMEM_A48_RESTART_20261011.md)，显式选择 `original dagbt_residual_memory_v1`，不能照用下文历史 `fusion` 命令。原三套数据仍是包内子集；PersonaMem 的 589 题是所固定官方 32k 文件的全部题目，不代表所有上下文长度设置，也不声称复现 BT 的 train/validation/test 划分。
 
 PersonaMem 的来源、按题可见记忆和单选评测详见 [PERSONAMEM.md](PERSONAMEM.md)。默认省略 `--datasets` 即运行四套数据；仅运行新数据可指定 `--datasets personamem`。
 
@@ -61,7 +61,7 @@ bash scripts/run_v3.sh resume --config configs/paired.local.json --retry-failed
 
 `original` 保留原 planner、dense 查询、节点检索、闭包选择和 reader chain 算法，`experiment_v6` 仍装载原 controller/reader。历史配置继续直接调用原 `e.archive`；BT 配置的等价 archive 适配仅将固定 4096 维校验改为当前索引维度。两方法共同使用新的向量、chat 适配和 BT 模型部署；原版继续使用此前 token 估算与 JSON schema 格式指令。融合 v3 的证据请求使用独立的保守估算和固定 `response_format`，默认 plain，亦可显式 json_object/json_schema；最终 reader 不继承该证据格式约束。原始文件未修改，但不能把新模型运行称为旧 Qwen/NV 实验的直接复现。
 
-PersonaMem 接入当前成对入口的 `original` 臂，保留其原求解流程，同时增加按题语料隔离和单选 reader 协议；没有修改历史 `original-dagv2` 分支、原始 57 个文件或 BT vendor 快照。两臂的最终 reader 接收同样的公开选项，并要求只输出一个选项标签；融合臂通过独立 `reader_question` 传选项，规划、检索、mapping、节点求解、选集复核只看 `user_question`，不含选项。original 仍将完整公共题目交给既有求解流程。这项输入协议差异必须与 reader chain 的差异一并披露。`configs/paired.legacy.json` 不支持 PersonaMem，使用历史配置时须显式加 `--datasets hotpotqa 2wikimultihopqa musique`。
+PersonaMem 接入当前成对入口的 `original` 臂，保留其原求解流程，同时增加按题语料隔离和单选 reader 协议；没有修改历史 `original-dagv2` 分支、原始 57 个文件或 BT vendor 快照。2026-10-11 修复后，original 的规划与非终端推理使用 `user_question`，通过独立 `reader_question` 仅在最终 Reader 提供完整问题和公开选项；旧 fusion 保留其已有的 query-only 推理/独立 reader 协议。a48dc8d 的 `dagbt_residual_memory_v1` 将 `reader_question` 保持为纯 `user_question`，仅在真正终端通过 `output_options` 提供选项，避免完整 MCQ 的裸标签指令与终端结构化 JSON 冲突；同次 `semantic_answer`/`final_prediction` 协议不变，无独立 Reader 或 FinalSelector。新运行需换输出目录并披露输入适配差异，original chain reader 与 residual 终端直出的差异仍须保留。`configs/paired.legacy.json` 不支持 PersonaMem，使用历史配置时须显式加 `--datasets hotpotqa 2wikimultihopqa musique`。
 
 融合版默认 raw-memory reader，与原版 chain reader 不完全匹配。因此 **original vs fusion 是系统级对比，不能单独证明 BT 或依赖选择的因果贡献**。原始目录 `dagv2/`、`package/`、`data/` 中的原文件和原有脚本用 `original_manifest.json` 核验；新增 PersonaMem 文件用 `data/personamem/manifest.json` 核验。标签文件哈希检查延迟到评分阶段，生成阶段不打开标签。
 

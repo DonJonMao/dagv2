@@ -344,7 +344,7 @@ class ResidualControl:
         """The designated terminal's output phase, no upstream option exposure."""
         if self.e.output_options is None:
             return True
-        from .personamem import parse_choice
+        from .personamem import parse_choice, TERMINAL_CHOICE_INSTRUCTION
         value=certificate['output']
         matches=[chr(97+i) for i,text in enumerate(self.e.output_options) if str(text).strip()==str(value).strip()]
         if len(matches)==1:
@@ -382,7 +382,7 @@ class ResidualControl:
                 raise ProtocolError('Invalid terminal option label')
             return prediction
         self.formatted_prediction=self.e.reasoner.json('semantic_compose',
-            'This is the first and only generation at the designated deterministic DAG terminal. Return semantic_answer (the exact typed result) and its corresponding final_prediction together. Use the computed result and its original sources. Return null label if ambiguous. Never guess or change the semantic result. No subsequent Reader or option matcher will run.',
+            'This is the first and only generation at the designated deterministic DAG terminal. Return semantic_answer (the exact typed result) and its corresponding final_prediction together. Use the computed result and its original sources. Return null label if ambiguous. Never guess or change the semantic result. No subsequent Reader or option matcher will run.' + TERMINAL_CHOICE_INSTRUCTION,
             data,validate,schema,reserve_repairs=0)
         self.format_input={'doc_ids':list(dict.fromkeys(s['doc_id'] for s in sources)),
             'validation_complete':self.formatted_prediction is not None,

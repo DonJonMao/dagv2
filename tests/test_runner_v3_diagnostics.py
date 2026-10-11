@@ -258,9 +258,12 @@ def test_score_all_exposes_independent_semantic_and_coverage_cohorts(tmp_path, d
     assert summarize()[dataset]["arms"]["fusion"]["semantic_evidence"] == semantic
 
 
-@pytest.mark.parametrize("arm", ["original", "fusion"])
-def test_personamem_worker_keeps_options_only_in_fusion_reader(tmp_path, monkeypatch, arm):
+@pytest.mark.parametrize("arm", ["original", "fusion", "dagbt_local_terminal_v1",
+                                  "dagbt_local_terminal_proxy_free_v1", "dagbt_joint_memory_v1",
+                                  "dagbt_residual_memory_v1"])
+def test_personamem_worker_separates_reasoning_from_output_options(tmp_path, monkeypatch, arm):
     from dagbt import engine, personamem, resources
+    from dagbt.methods import terminal_method
     question = {"id": "q", "question": "Pick a drink\nOptions:\n(a) Tea\n(b) Coffee",
                 "user_question": "Pick a drink", "scope_id": "p:1", "shared_context_id": "p",
                 "end_index": 1, "options": ["(a) Tea", "(b) Coffee"]}
@@ -289,8 +292,10 @@ def test_personamem_worker_keeps_options_only_in_fusion_reader(tmp_path, monkeyp
     assert [message["type"] for message in messages] == ["ready", "result"]
     q, kw = captured[0]
     assert set(q) == {"id", "question"}
-    if arm == "fusion":
-        assert q["question"] == question["user_question"] and "Options:" not in q["question"]
-        assert kw["reader_question"] == question["question"]
+    assert q["question"] == question["user_question"] and "Options:" not in q["question"]
+    assert kw["reader_question"] == (question["user_question"] if terminal_method(arm) else question["question"])
+    if arm != "original":
+        assert kw["output_options"] == question["options"]
+        assert kw["method"] == arm
     else:
-        assert q["question"] == question["question"] and "reader_question" not in kw
+        assert "output_options" not in kw

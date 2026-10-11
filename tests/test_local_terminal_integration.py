@@ -2,7 +2,9 @@
 import json
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts'))
@@ -10,6 +12,7 @@ import demo_local_terminal as demo
 import benchmark_bt_reranker_prefix_cache as apc
 from dagbt import runner
 from dagbt.local_terminal import VERSION
+from dagbt.methods import LOCAL, UNSCORED
 
 
 def test_source_driven_director_university_city_executes_real_BT():
@@ -34,6 +37,64 @@ def test_source_driven_director_university_city_executes_real_BT():
     assert cost['node_resolve_calls'] == 3
     assert cost['independent_reader_calls'] == cost['global_final_selector_calls'] == 0
     assert cost['ann_calls'] <= 36 and cost['set_score_calls'] <= 512
+
+
+@pytest.mark.parametrize('method', [LOCAL, UNSCORED])
+def test_personamem_options_are_only_at_terminal_without_reader_instruction(method):
+    from dagbt.engine import Engine
+    from dagbt.personamem import ANSWER_INSTRUCTION, TERMINAL_CHOICE_INSTRUCTION, format_question, parse_choice
+    question = 'Which city contains the university from which the director of Ash Wind (2012) graduated?'
+    options = ['River City', 'Lake City', 'Hill City', 'Forest City']
+    full_question = format_question(question, options)
+
+    class ChoiceServices(demo.SourcesOnlyServices):
+        def get(self, stage, url, payload):
+            result = super().get(stage, url, payload)
+            if stage[0] == 'resolve':
+                data = json.loads(payload['messages'][1]['content'])
+                if data['node_id'] == 'city':
+                    assert data['public_options'] == options
+                    assert data['public_output_question'] == question
+                    value = json.loads(result['response']['choices'][0]['message']['content'])
+                    if value['status'] == 'supported':
+                        assert value['answer'] == options[0]
+                        value['final_prediction'] = '(a)'
+                        result['response']['choices'][0]['message']['content'] = json.dumps(value)
+            return result
+
+    docs = {d: SimpleNamespace(doc_id=d, title=d, text=text, passage=d+'\n'+text)
+            for d, text in demo.PASSAGES.items()}
+    vectors = np.array([[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,.99,.01],[0,0,0,1]], dtype=np.float32)
+    services = ChoiceServices()
+    config = {'_test_transport': True, 'llm_base_url': 'http://synthetic/v1', 'llm_model': 'source-script',
+              'embedding_base_url': 'http://synthetic/v1', 'embedding_model': 'source-script',
+              'fusion': {'initial_width': 1, 'proposal_width': 2, 'pair_rescue_width': 2,
+                         'max_feedback_rounds': 0, 'refinement': False}}
+    if method == LOCAL:
+        config['reranker'] = {'url': 'http://synthetic/rerank', 'model': 'source-script', 'batch_size': 4}
+    engine = Engine({'id': 'personamem-synthetic-city', 'question': question},
+                    (docs, list(docs), vectors, SimpleNamespace(), demo.Tokenizer()), services, config, method,
+                    reader_question=question, output_options=options)
+    row = engine.run()
+    assert row['answer']['status'] == 'ok' and parse_choice(row['answer']['prediction'], options) == 'a'
+    terminal = []
+    for request in services.requests:
+        payload = request['payload']
+        data = json.loads(payload['messages'][1]['content']) if 'messages' in payload else None
+        if request['stage'][0] == 'resolve' and data['node_id'] == engine.final_node_id:
+            assert data['public_output_question'] == question and data['public_options'] == options
+            assert data['original_question'] == question
+            assert TERMINAL_CHOICE_INSTRUCTION in payload['messages'][0]['content']
+            terminal.append(request)
+        else:
+            wire = json.dumps(payload, ensure_ascii=False)
+            assert 'public_options' not in wire
+        wire = json.dumps(payload, ensure_ascii=False)
+        assert ANSWER_INSTRUCTION not in wire and 'Candidate answers:' not in wire
+        assert full_question not in wire
+    assert terminal and engine.output_options == options
+    assert json.loads(services.requests[0]['payload']['messages'][1]['content']) == question
+    assert not any(r['stage'][0] in ('reader', 'select') for r in services.requests)
 
 
 def test_new_results_score_without_fabricating_reader_or_k_metrics(tmp_path):

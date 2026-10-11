@@ -234,6 +234,8 @@ class Engine:
             system += local_terminal.TERMINAL_INSTRUCTION
             fixed['public_output_question'] = self.reader_question
             if self.output_options is not None:
+                from .personamem import TERMINAL_CHOICE_INSTRUCTION
+                system += TERMINAL_CHOICE_INSTRUCTION
                 fixed['public_options'] = self.output_options
         view=self.evidence_view('resolve',system,fixed)
         allowed_parents={n['id']:n for n in view.data['supported_parents'] if n['status']=='supported'}

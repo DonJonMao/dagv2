@@ -36,6 +36,12 @@ QUESTION_FIELDS = (
     "shared_context_id", "end_index", "scope_id", "question_type", "topic",
 )
 ANSWER_INSTRUCTION = "Return exactly one option label, (a), (b), (c), or (d), and no explanation."
+TERMINAL_CHOICE_INSTRUCTION = (
+    "\nThe four public_options correspond in list order to (a), (b), (c), (d). "
+    "They are candidate answers, not evidence. Put the selected label only in "
+    "final_prediction; keep the entire response as the required JSON object "
+    "with all other fields required by its schema. Never return a bare label.\n"
+)
 MEMORY_TITLE_PROTOCOL = "zero_based_message_index_range_v1;observation_order_not_calendar_time"
 
 
