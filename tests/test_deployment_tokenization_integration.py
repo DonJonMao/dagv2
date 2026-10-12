@@ -35,6 +35,7 @@ def deny_real_network_and_credentials(monkeypatch):
     monkeypatch.setattr(token_counting.urllib.request, "build_opener", forbidden)
     monkeypatch.setattr(transport, "resolve_api_key", lambda *args: "")
     monkeypatch.setattr(token_counting, "resolve_api_key", lambda *args: "")
+    monkeypatch.setattr(token_counting.time, "sleep", lambda seconds: None)
 
 
 class SyntheticHTTP:
@@ -245,15 +246,56 @@ def test_new_counter_cannot_erase_an_earlier_usage_failure(tmp_path, monkeypatch
 
 
 def test_tokenization_outage_fails_closed_without_generation_or_budget_charge(tmp_path, monkeypatch):
-    server = SyntheticHTTP(monkeypatch, failure=urllib.error.URLError("synthetic outage"))
+    server = SyntheticHTTP(monkeypatch, failure=urllib.error.URLError(TimeoutError("synthetic outage")))
     reasoner, _, ledger = components(tmp_path)
     with pytest.raises(token_counting.TokenizationError, match="connection_or_timeout"):
         reasoner.request("joint_read", "Read.", DATA, schema=SCHEMA)
-    assert len(server.tokenized) == 1 and not server.generated
+    assert len(server.tokenized) == 3 and not server.generated
     assert ledger.used["llm"] == ledger.used["ann"] == ledger.used["http_attempts"] == 0
     cost = runner.request_cost(tmp_path)
     assert cost["http_attempts"] == cost["logical_calls"] == 0
-    assert cost["tokenization"]["http_attempts"] == cost["tokenization"]["failed_counts"] == 1
+    assert cost["tokenization"]["http_attempts"] == cost["tokenization"]["failed_http_attempts"] == 3
+    assert cost["tokenization"]["http_retries"] == 2 and cost["tokenization"]["failed_counts"] == 1
+
+
+def test_tokenization_retry_recovery_preserves_auxiliary_costs_and_generates_once(tmp_path, monkeypatch):
+    server = SyntheticHTTP(monkeypatch)
+    tokenize = server.tokenize
+    def once_unavailable(request, timeout):
+        server.failure = TimeoutError("private-test-error") if not server.tokenized else None
+        return tokenize(request, timeout)
+    monkeypatch.setattr(token_counting.urllib.request, "build_opener",
+                        lambda *handlers: SimpleNamespace(open=once_unavailable))
+    reasoner, _, ledger = components(tmp_path)
+    assert reasoner.request("joint_read", "Read.", DATA, schema=SCHEMA) == {"ok": True}
+    assert len(server.tokenized) == 2 and server.tokenized[0] == server.tokenized[1]
+    assert len(server.generated) == 1
+    assert ledger.used["llm"] == ledger.used["http_attempts"] == 1
+    assert ledger.used["ann"] == ledger.used["json_repairs"] == 0
+    cost = runner.request_cost(tmp_path)
+    assert cost["http_attempts"] == cost["physical_llm_attempts"] == 1 and cost["http_retries"] == 0
+    auxiliary = cost["tokenization"]
+    assert auxiliary["http_attempts"] == 2 and auxiliary["successful_http_requests"] == 1
+    assert auxiliary["failed_http_attempts"] == auxiliary["http_retries"] == 1
+    assert auxiliary["failed_counts"] == 0 and auxiliary["cache_hits"] == 1
+    events = tokenization_events(tmp_path)
+    assert len(events) == 2 and len(events[0]["attempts"]) == 2
+    assert events[1]["cache_hit"] and events[1]["http_attempts"] == events[1]["http_retries"] == 0
+    assert "private-test-error" not in json.dumps(events)
+
+
+def test_auxiliary_costs_still_read_older_single_attempt_tokenization_events(tmp_path):
+    for status, attempts, successful in (("ok", 1, 1), ("error", 1, 0), ("error", 1, 1), ("ok", 0, 0)):
+        runner.append_jsonl(tmp_path / "tokenization_events.jsonl", {
+            "event": "tokenization_count", "status": status, "http_attempts": attempts,
+            "successful_http_requests": successful, "cache_hit": not attempts, "seconds": 1.0})
+    cost = runner.request_cost(tmp_path)
+    assert cost["http_attempts"] == cost["prompt_tokens"] == 0
+    auxiliary = cost["tokenization"]
+    assert auxiliary["logical_calls"] == 4 and auxiliary["http_attempts"] == 3
+    assert auxiliary["http_retries"] == 0 and auxiliary["failed_http_attempts"] == 1
+    assert auxiliary["successful_http_requests"] == auxiliary["failed_counts"] == 2
+    assert auxiliary["observed_seconds"] == 4.0
 
 
 @pytest.mark.parametrize("profile", ["bridgetree", "native"])

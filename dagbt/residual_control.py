@@ -95,7 +95,7 @@ class ResidualControl:
         values.pop(variable,None)
         program={**self.state.program,'expression':expression,'rules_complete':True}
         contract={'mode':'value','result_type':self.state.program['variables'][variable]['type'],
-            'entity_scope':self.state.contract['entity_scope'],'time_scope':self.state.contract['time_scope'],'explanation':'none'}
+            **self.state.scope(variable),'explanation':'none'}
         return certify_output(program,values,contract,program_revision=self.state.revision,
             versions=self.state.versions,sources=sources,pending_variables=self.state.pending,
             max_states=self.e.s['max_enumeration_states'])
@@ -109,8 +109,7 @@ class ResidualControl:
                 if cert is None:
                     continue
                 row={'variable':variable,'stance':'support','value':cert['output'],
-                    'source_ids':cert['source_ids'],'entity_scope':self.state.contract['entity_scope'],
-                    'time_scope':self.state.contract['time_scope'],'parent_versions':cert['fact_versions'],
+                    'source_ids':cert['source_ids'],**self.state.scope(variable),'parent_versions':cert['fact_versions'],
                     'retract_ids':[],'reason':'Whitelist program derivation','binding_derivation':cert}
                 self.state.integrate([row],self.state.pending)
 
@@ -136,8 +135,13 @@ class ResidualControl:
         if any(self.state.program['variables'][v]['demand'] not in allowed for v in references(field)):
             return None
         values,sources,_=self.state.valid()
-        contract={'mode':'value','result_type':'bool','entity_scope':self.state.contract['entity_scope'],
-            'time_scope':self.state.contract['time_scope'],'explanation':'none'}
+        scopes=[self.state.scope(v) for v in self.demand_variables(task)]
+        if scopes and any(scope!=scopes[0] for scope in scopes):
+            # A single projected bool cannot claim one scope for mixed local
+            # declarations. Their ordinary typed bindings remain available.
+            return None
+        scope=scopes[0] if scopes else {k:self.state.contract[k] for k in ('entity_scope','time_scope')}
+        contract={'mode':'value','result_type':'bool',**scope,'explanation':'none'}
         cert=certify_output({**self.state.program,'expression':field,'rules_complete':True},values,contract,
             program_revision=self.state.revision,versions=self.state.versions,sources=sources,
             pending_variables=self.state.pending,max_states=self.e.s['max_enumeration_states'])
@@ -151,7 +155,7 @@ class ResidualControl:
             cert['rule_assumptions']={'variable':v,'version':self.state.versions[v],
                 'identity':digest(values[v]),'route_ids':self.state.rule_route_ids}
             cert['source_ids']=sorted(set(cert['source_ids'])|set(sources[v]))
-        cert['scope']={'task_projection':task}
+        cert['scope']={'task_projection':task,**scope}
         return cert
 
     def local_complete(self,task):
@@ -236,8 +240,10 @@ class ResidualControl:
             nid=step['output_slot'];old=self.e.node_map()[nid]
             variables=self.demand_variables(nid)
             bound={v:values[v] for v in variables if v in values}
+            bound_scopes={v:self.state.scope(v) for v in bound}
             node={**deepcopy(old),'answer':None,'status':'unknown','declared_status':'unknown','alternatives':[],
-                  'typed_values':bound,'version':max([self.state.versions.get(v,0) for v in variables]+[0])}
+                  'typed_values':bound,'variable_scopes':bound_scopes,
+                  'version':max([self.state.versions.get(v,0) for v in variables]+[0])}
             if bound and len(bound)==len(variables):
                 answer=display(next(iter(bound.values()))) if len(bound)==1 else display(bound)
                 # The fact store retains all OR routes; the bounded legacy graph
@@ -245,7 +251,8 @@ class ResidualControl:
                 source_ids=sorted({sid for v in bound for sid in sources[v]})
                 node.update(answer=answer,status='supported',declared_status='supported',alternatives=[{
                     'id':nid+'.typed.'+digest([bound,source_ids])[:16],'answer':answer,
-                    'semantic_status':'supported','applicable_scope':self.state.contract['entity_scope'],
+                    'semantic_status':'supported','applicable_scope':(
+                        next(iter(bound_scopes.values())) if len(bound_scopes)==1 else {'variables':bound_scopes}),
                     'source_span_ids':source_ids,'guard_span_ids':[], 'used_parent_ids':[], 'used_parent_versions':{},
                     'fact_route_ids':{v:ids[v] for v in bound},'support_kind':'joint_semantic_routes'}])
                 derivations={v:self.state.routes[ids[v][0]]['binding_derivation'] for v in bound
@@ -258,6 +265,10 @@ class ResidualControl:
                     for route in self.state.routes.values():
                         if route['variable']!=variable or route['revoked'] or digest(route['value'])!=digest(bound[variable]):
                             continue
+                        if any(route.get(k)!=v for k,v in self.state.scope(variable).items()):
+                            continue
+                        if 'binding_derivation' in route and route['binding_derivation']['program_revision']!=self.state.revision:
+                            continue
                         if any(p not in values or self.state.versions[p]!=ver for p,ver in route['parent_versions'].items()):
                             continue
                         refs=sorted(set(route['source_ids'])|{s for p in route['parent_versions'] for s in sources[p]})
@@ -269,7 +280,8 @@ class ResidualControl:
                 node.update(answer=answer,status='supported',declared_status='supported',
                     version=self.state.revision+sum(certificate['fact_versions'].values()),alternatives=[{
                         'id':nid+'.derivation.'+digest(certificate)[:16],'answer':answer,
-                        'semantic_status':'supported','applicable_scope':self.state.contract['entity_scope'],
+                        'semantic_status':'supported','applicable_scope':{
+                            k:self.state.contract[k] for k in ('entity_scope','time_scope')},
                         'source_span_ids':list(certificate['source_ids']),'guard_span_ids':[],
                         'used_parent_ids':[],'used_parent_versions':{},'support_kind':'symbolic_derivation',
                         'derivation':deepcopy(certificate)}])
@@ -278,7 +290,8 @@ class ResidualControl:
                 answer=display(projection['output'])
                 node.update(answer=answer,status='supported',declared_status='supported',
                     alternatives=[{'id':nid+'.projection.'+digest(projection)[:16], 'answer':answer,
-                        'semantic_status':'supported','applicable_scope':self.state.contract['entity_scope'],
+                        'semantic_status':'supported','applicable_scope':{
+                            k:projection['scope'][k] for k in ('entity_scope','time_scope')},
                         'source_span_ids':projection['source_ids'],'guard_span_ids':[],
                         'used_parent_ids':[],'used_parent_versions':{},
                         'support_kind':'scoped_task_projection','derivation':projection}])

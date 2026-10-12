@@ -1,6 +1,10 @@
 from copy import deepcopy
+import errno
+import http.client
 import io
 import json
+import socket
+import ssl
 import urllib.error
 
 import pytest
@@ -40,6 +44,8 @@ class Opener:
         item = self.bodies.pop(0)
         if isinstance(item, BaseException):
             raise item
+        if isinstance(item, Response):
+            return item
         return Response(item if isinstance(item, bytes) else json.dumps(item).encode())
 
 
@@ -47,6 +53,7 @@ def counter(monkeypatch, bodies=None, config=None):
     opener = Opener(bodies)
     monkeypatch.setattr(counting.urllib.request, "build_opener", lambda *args: opener)
     monkeypatch.setattr(counting, "resolve_api_key", lambda config, kind: "private-test-key")
+    monkeypatch.setattr(counting.time, "sleep", lambda seconds: None)
     events = []
     return DeploymentTokenCounter(config or configuration(), events.append), opener, events
 
@@ -56,6 +63,13 @@ def test_opt_in_and_config_validation_are_offline():
     assert validate_tokenization_config(configuration())["timeout_seconds"] == 15
     with pytest.raises(TokenizationError, match="not_enabled"):
         DeploymentTokenCounter({}, lambda event: None)
+
+
+@pytest.mark.parametrize("limit", [True, False, 0, -1, 1.5, "3", 11, None])
+def test_retry_limit_must_be_an_integer_in_one_through_ten(limit):
+    with pytest.raises(TokenizationError, match="invalid_max_identical_attempts"):
+        validate_tokenization_config(configuration(max_identical_attempts=limit))
+    assert validate_tokenization_config({"max_identical_attempts": limit}) is None
 
 
 @pytest.mark.parametrize("patch", [
@@ -125,6 +139,8 @@ def test_cache_shares_preflight_request_transport_counts_but_not_changed_message
     assert len(opener.requests) == 2
     assert [event["http_attempts"] for event in events] == [1, 0, 0, 1]
     assert [event["cache_hit"] for event in events] == [False, True, True, False]
+    assert all(event["http_retries"] == event["failed_http_attempts"] == 0 for event in events)
+    assert all(event["attempts"] == [] for event in events if event["cache_hit"])
 
 
 def test_lru_is_bounded_and_no_cache_crosses_instances(monkeypatch):
@@ -191,11 +207,15 @@ def test_malformed_or_insufficient_deployment_responses_never_enter_cache(monkey
 
 
 @pytest.mark.parametrize("error", [
-    urllib.error.HTTPError("private-test-key", 503, "private-test-key", {}, io.BytesIO(b"secret body")),
-    urllib.error.URLError("private-test-key"), TimeoutError("private-test-key"),
+    urllib.error.HTTPError("private-test-key", 403, "private-test-key", {}, io.BytesIO(b"secret body")),
+    urllib.error.URLError("private-test-key"),
     RuntimeError("private-test-key"), TokenizationError("redirect_not_allowed"),
+    ssl.SSLCertVerificationError("private-test-key"),
+    urllib.error.URLError(ssl.SSLCertVerificationError("private-test-key")),
+    socket.gaierror(socket.EAI_NONAME, "private-test-key"),
+    PermissionError(errno.EACCES, "private-test-key"),
 ])
-def test_network_failures_have_no_retry_fallback_or_sensitive_exception(monkeypatch, error):
+def test_nontransient_failures_have_no_retry_fallback_or_sensitive_exception(monkeypatch, error):
     count, opener, events = counter(monkeypatch, [error])
     with pytest.raises(TokenizationError) as failure:
         count.count(wire())
@@ -203,6 +223,118 @@ def test_network_failures_have_no_retry_fallback_or_sensitive_exception(monkeypa
     assert len(events) == 1 and events[0]["status"] == "error"
     assert events[0]["http_attempts"] == 1 and events[0]["successful_http_requests"] == 0
     assert "private-test-key" not in str(failure.value) + json.dumps(events)
+
+
+@pytest.mark.parametrize("error", [
+    TimeoutError("private-test-key"), ConnectionResetError("private-test-key"),
+    urllib.error.URLError(TimeoutError("private-test-key")),
+    urllib.error.URLError(ConnectionRefusedError(errno.ECONNREFUSED, "private-test-key")),
+    OSError(errno.ENETUNREACH, "private-test-key"),
+    socket.gaierror(socket.EAI_AGAIN, "private-test-key"),
+    http.client.IncompleteRead(b"private-test-key", 100),
+    *[urllib.error.HTTPError("private-test-key", code, "private-test-key", {}, io.BytesIO(b"secret body"))
+      for code in (500, 502, 503, 504)],
+])
+def test_transient_recovery_retries_identical_wire_and_keeps_failed_attempt(monkeypatch, error):
+    count, opener, events = counter(monkeypatch, [error, {"count": 73, "max_model_len": 120000}])
+    before = deepcopy(wire())
+    assert count.count(before)["count"] == 73
+    assert before == wire() and len(opener.requests) == 2 and len(events) == 1
+    first, second = (request for request, timeout in opener.requests)
+    assert first is second and first.data == second.data
+    assert first.full_url == second.full_url and first.header_items() == second.header_items()
+    event = events[0]
+    assert event["status"] == "ok" and "error_category" not in event
+    assert event["http_attempts"] == 2
+    assert event["http_retries"] == event["failed_http_attempts"] == event["successful_http_requests"] == 1
+    assert event["attempts"][0]["status"] == "error" and event["attempts"][0]["will_retry"] is True
+    assert event["attempts"][1]["status"] == "ok" and event["attempts"][1]["will_retry"] is False
+    assert all(attempt["seconds"] >= 0 for attempt in event["attempts"])
+    assert "private-test-key" not in json.dumps(event) and "secret body" not in json.dumps(event)
+    count.count(wire())
+    assert events[-1]["cache_hit"] and events[-1]["attempts"] == []
+    assert events[-1]["http_attempts"] == events[-1]["http_retries"] == events[-1]["failed_http_attempts"] == 0
+
+
+@pytest.mark.parametrize("status", [301, 302, 307, 308, 400, 401, 403, 404, 408, 429, 501, 505])
+def test_http_status_retry_allowlist_excludes_redirects_all_4xx_and_other_5xx(monkeypatch, status):
+    error = urllib.error.HTTPError("private-test-key", status, "private-test-key", {}, io.BytesIO(b"secret"))
+    count, opener, events = counter(monkeypatch, [error, {"count": 1, "max_model_len": 16384}])
+    with pytest.raises(TokenizationError, match="http_error") as failure:
+        count.count(wire())
+    assert failure.value.http_status == status
+    assert len(opener.requests) == 1 and not count._cache
+    assert events[0]["attempts"][0]["retryable"] is False
+    assert events[0]["failed_http_attempts"] == 1 and events[0]["http_retries"] == 0
+
+
+@pytest.mark.parametrize("limit", [1, 2, 3, 10])
+def test_transient_exhaustion_uses_configured_total_limit_and_original_error(monkeypatch, limit):
+    count, opener, events = counter(monkeypatch, [TimeoutError("private-test-key")] * limit,
+                                    configuration(max_identical_attempts=limit))
+    with pytest.raises(TokenizationError, match="connection_or_timeout"):
+        count.count(wire())
+    assert len(opener.requests) == limit and len(events) == 1 and not count._cache
+    event = events[0]
+    assert event["http_attempts"] == event["failed_http_attempts"] == limit
+    assert event["http_retries"] == limit - 1 and event["successful_http_requests"] == 0
+    assert [a["will_retry"] for a in event["attempts"]] == [True] * (limit - 1) + [False]
+    assert event["error_category"] == "connection_or_timeout"
+
+
+def test_read_timeout_after_200_is_failed_transport_and_elapsed_includes_backoff(monkeypatch):
+    class ReadTimeout(Response):
+        def read(self, size=-1):
+            raise TimeoutError("private-test-key")
+    count, opener, events = counter(monkeypatch, [ReadTimeout(), {"count": 73, "max_model_len": 16384}])
+    clock = [0.0]
+    delays = []
+    def monotonic():
+        clock[0] += 1
+        return clock[0]
+    def sleep(seconds):
+        delays.append(seconds)
+        clock[0] += seconds
+    monkeypatch.setattr(counting.time, "monotonic", monotonic)
+    monkeypatch.setattr(counting.time, "sleep", sleep)
+    assert count.count(wire())["count"] == 73
+    event = events[0]
+    assert len(opener.requests) == 2 and delays == [0.25]
+    assert event["http_status"] == event["attempts"][0]["http_status"] == 200
+    assert event["attempts"][0]["error_category"] == "connection_or_timeout"
+    assert event["successful_http_requests"] == event["failed_http_attempts"] == 1
+    assert event["seconds"] >= sum(a["seconds"] for a in event["attempts"]) + sum(delays)
+
+
+def test_recovery_does_not_retry_invalid_complete_response_or_cache_failed_count(monkeypatch):
+    count, opener, events = counter(monkeypatch, [TimeoutError(), {"count": "bad", "max_model_len": 16384},
+                                                {"count": 73, "max_model_len": 16384}])
+    with pytest.raises(TokenizationError, match="invalid_response_counts"):
+        count.count(wire())
+    assert len(opener.requests) == 2 and not count._cache
+    assert events[0]["successful_http_requests"] == events[0]["failed_http_attempts"] == 1
+    assert events[0]["status"] == "error" and events[0]["attempts"][-1]["status"] == "ok"
+    assert count.count(wire())["count"] == 73 and len(opener.requests) == 3
+
+
+def test_last_allowed_attempt_can_recover_without_hiding_two_failures(monkeypatch):
+    count, opener, events = counter(monkeypatch, [TimeoutError(), ConnectionResetError(),
+                                                {"count": 73, "max_model_len": 16384}])
+    delays = []
+    monkeypatch.setattr(counting.time, "sleep", delays.append)
+    assert count.count(wire())["count"] == 73 and len(opener.requests) == 3
+    assert delays == [0.25, 0.5]
+    assert events[0]["http_retries"] == events[0]["failed_http_attempts"] == 2
+    assert events[0]["successful_http_requests"] == 1 and events[0]["status"] == "ok"
+
+
+def test_oversized_response_is_not_retried(monkeypatch):
+    count, opener, events = counter(monkeypatch, [b"x" * 11, {"count": 1, "max_model_len": 16384}])
+    monkeypatch.setattr(counting, "MAX_RESPONSE_BYTES", 10)
+    with pytest.raises(TokenizationError, match="response_too_large"):
+        count.count(wire())
+    assert len(opener.requests) == 1 and not count._cache
+    assert events[0]["http_retries"] == events[0]["failed_http_attempts"] == 0
 
 
 def test_redirect_and_environment_proxy_are_disabled(monkeypatch):

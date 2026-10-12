@@ -8,9 +8,13 @@ from __future__ import annotations
 from collections import OrderedDict
 from collections.abc import Mapping
 from copy import deepcopy
+import errno
 import hashlib
+import http.client
 import json
 import math
+import socket
+import ssl
 import time
 import urllib.error
 import urllib.parse
@@ -22,6 +26,10 @@ from .model_runtime import is_bridgetree, resolve_api_key
 ESTIMATOR_ID = "deployment_vllm_chat_v1"
 MAX_CACHE_ENTRIES = 512
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+MAX_IDENTICAL_ATTEMPTS = 10
+RETRYABLE_HTTP_STATUSES = frozenset({500, 502, 503, 504})
+RETRYABLE_ERRNOS = frozenset({errno.ETIMEDOUT, errno.ECONNRESET, errno.ECONNREFUSED,
+    errno.ECONNABORTED, errno.EPIPE, errno.ENETRESET, errno.ENETUNREACH, errno.EHOSTUNREACH})
 # These affect generation only, not the input chat template. Keep this list
 # deliberately small: unfamiliar provider options require separate validation.
 SAMPLING_FIELDS = frozenset({"temperature", "max_tokens", "top_p", "seed",
@@ -82,6 +90,9 @@ def validate_tokenization_config(config):
     if (isinstance(timeout, bool) or not isinstance(timeout, (float, int))
             or not math.isfinite(timeout) or timeout <= 0):
         raise TokenizationError("invalid_timeout")
+    attempts = config.get("max_identical_attempts", 3)
+    if type(attempts) is not int or not 1 <= attempts <= MAX_IDENTICAL_ATTEMPTS:
+        raise TokenizationError("invalid_max_identical_attempts")
     fusion = config.get("fusion", {})
     if not isinstance(fusion, Mapping) or fusion.get("response_format", "plain") != "plain":
         raise TokenizationError("unsupported_response_protocol")
@@ -96,7 +107,19 @@ def validate_tokenization_config(config):
     except (TypeError, ValueError, OverflowError):
         raise TokenizationError("invalid_provider_parameters") from None
     return {"mode": "vllm_chat", "endpoint": endpoint.geturl(),
-            "timeout_seconds": float(timeout)}
+            "timeout_seconds": float(timeout), "max_identical_attempts": attempts}
+
+
+def _transient_connection_error(error):
+    """Only transport failures known to be transient; no text matching."""
+    if isinstance(error, urllib.error.URLError):
+        error = error.reason
+    if isinstance(error, ssl.SSLError):
+        return False
+    if isinstance(error, socket.gaierror):
+        return error.errno == socket.EAI_AGAIN
+    return (isinstance(error, (TimeoutError, ConnectionError, http.client.IncompleteRead))
+            or isinstance(error, OSError) and error.errno in RETRYABLE_ERRNOS)
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -150,10 +173,61 @@ class DeploymentTokenCounter:
         return {"model": self.model, "messages": deepcopy(messages),
                 "add_generation_prompt": True}
 
+    def _fetch(self, request, event):
+        """Retry the same read-only count wire, never a generation request."""
+        limit = self.options["max_identical_attempts"]
+        for index in range(1, limit + 1):
+            started = time.monotonic()
+            attempt = {"attempt": index, "status": "error", "retryable": False,
+                       "will_retry": False}
+            event["attempts"].append(attempt)
+            event["http_attempts"] = index
+            event["http_retries"] = index - 1
+            # The last attempt's status must not inherit a previous HTTP status.
+            event.pop("http_status", None)
+            failure = None
+            try:
+                with self._opener.open(request, timeout=self.options["timeout_seconds"]) as response:
+                    status = response.getcode()
+                    attempt["http_status"] = event["http_status"] = status
+                    if status != 200:
+                        raise TokenizationError("unexpected_http_status", http_status=status)
+                    raw = response.read(MAX_RESPONSE_BYTES + 1)
+                event["successful_http_requests"] += 1
+                attempt["status"] = "ok"
+                return raw
+            except urllib.error.HTTPError as exc:
+                attempt["http_status"] = event["http_status"] = exc.code
+                attempt["retryable"] = exc.code in RETRYABLE_HTTP_STATUSES
+                failure = TokenizationError("http_error", http_status=exc.code)
+                exc.close()
+            except TokenizationError as exc:
+                failure = exc
+                if exc.http_status is not None:
+                    attempt["http_status"] = event["http_status"] = exc.http_status
+                attempt["retryable"] = (exc.category == "unexpected_http_status"
+                    and exc.http_status in RETRYABLE_HTTP_STATUSES)
+            except (urllib.error.URLError, OSError, http.client.IncompleteRead) as exc:
+                failure = TokenizationError("connection_or_timeout")
+                attempt["retryable"] = _transient_connection_error(exc)
+            except Exception:
+                failure = TokenizationError("unexpected_transport_error")
+            finally:
+                attempt["seconds"] = max(0.0, time.monotonic() - started)
+            event["failed_http_attempts"] += 1
+            attempt["error_category"] = failure.category
+            attempt["will_retry"] = attempt["retryable"] and index < limit
+            if not attempt["will_retry"]:
+                raise failure from None
+            delay = min(0.25 * index, 1.0)
+            attempt["retry_delay_seconds"] = delay
+            time.sleep(delay)
+
     def count(self, wire):
         started = time.monotonic()
         event = {"event": "tokenization_count", "kind": "tokenization_http",
                  "cache_hit": False, "http_attempts": 0,
+                 "http_retries": 0, "failed_http_attempts": 0, "attempts": [],
                  "successful_http_requests": 0, "status": "error",
                  "token_estimator_id": ESTIMATOR_ID}
         try:
@@ -177,14 +251,7 @@ class DeploymentTokenCounter:
                     headers["Authorization"] = "Bearer " + secret
                 request = urllib.request.Request(self.options["endpoint"],
                     data=_canonical(payload).encode("utf-8"), headers=headers, method="POST")
-                event["http_attempts"] = 1
-                with self._opener.open(request, timeout=self.options["timeout_seconds"]) as response:
-                    status = response.getcode()
-                    event["http_status"] = status
-                    if status != 200:
-                        raise TokenizationError("unexpected_http_status")
-                    event["successful_http_requests"] = 1
-                    raw = response.read(MAX_RESPONSE_BYTES + 1)
+                raw = self._fetch(request, event)
                 if len(raw) > MAX_RESPONSE_BYTES:
                     raise TokenizationError("response_too_large")
                 try:

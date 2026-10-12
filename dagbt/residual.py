@@ -141,6 +141,21 @@ def references(expression):
     return set().union(*(references(c) for c in children)) if children else set()
 
 
+def validate_scope(scope):
+    """A declaration's immutable local fact scope, not a retrieval-time guess."""
+    if (not isinstance(scope, dict) or set(scope) != {'entity_scope', 'time_scope'}
+            or any(not isinstance(value, str) or not value.strip() for value in scope.values())):
+        raise ProgramError('Variable scope requires nonempty entity_scope and time_scope strings')
+    return deepcopy(scope)
+
+
+def variable_scope(declaration, contract):
+    # Old plans retain their original fixed scope. New plans should declare the
+    # scope of every variable before any evidence is retrieved.
+    return (validate_scope(declaration['scope']) if 'scope' in declaration else
+            {key: contract[key] for key in ('entity_scope', 'time_scope')})
+
+
 def validate_program(program):
     if not isinstance(program, dict) or not {'variables', 'expression'} <= set(program):
         raise ProgramError('Program requires variables and expression')
@@ -153,6 +168,8 @@ def validate_program(program):
         if not isinstance(declaration, dict) or declaration.get('type') not in {
                 'bool', 'entity', 'number', 'text', 'set', 'record', 'rule'}:
             raise ProgramError('Unsupported variable type')
+        if 'scope' in declaration:
+            validate_scope(declaration['scope'])
         if 'domain' in declaration:
             domain = declaration['domain']
             if not isinstance(domain, (dict, list)):

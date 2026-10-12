@@ -1,7 +1,8 @@
 """One initial DAG plan, with typed bindings and a fixed output contract."""
 from copy import deepcopy
 from . import local_terminal
-from .residual import validate_program, validate_output_contract, ProgramError, references, UNITS
+from .residual import (validate_program, validate_output_contract, variable_scope,
+                       validate_scope, ProgramError, references, UNITS)
 from .reasoning import ProtocolError
 
 PLAN_SYSTEM = local_terminal.PLAN_SYSTEM.replace('Do not include extra fields.', '') + '''
@@ -14,7 +15,15 @@ output_contract has mode(value/one_reason/all_failures/semantic), result_type
 (none/one/all/semantic), optional fields. Do not reduce the user's output requirements.
 program has variables (ID -> declaration), expression, optional constraints,
 rules_complete and rule_binding. Declaration has type, demand (a planned task ID),
-optional domain, open, unit. Variables may share a task for bounded multi-field reading.
+optional domain, open, unit, scope. Variables may share a task for bounded multi-field reading.
+Explicitly declare each variable's scope={entity_scope,time_scope} BEFORE retrieval,
+using the meaning of that variable's own planned task, not the final answer's scope.
+For example, a historical observation and a future recommendation have different time
+scopes; compared entities may differ from the final comparison's entity scope.
+The scope of every terminal-task variable MUST equal the immutable output_contract scope.
+Supported parents retain their own scopes when used or audited by another task; never
+relabel historical evidence as current/future evidence to satisfy the output scope.
+Omitting scope is only compatibility for old plans and inherits output_contract scope.
 Omit optional fields that do not apply; optional does not mean fill with null.
 An unknown/unrestricted domain is represented by OMITTING domain, not null, a string,
 a scalar, or an empty array. For an open entity/text variable use, for example,
@@ -57,7 +66,11 @@ def planner_contract(legacy_schema):
         'demand': {'type':'string','minLength':1},
         'domain': {'description':'Optional legal domain; omit if unrestricted. Arrays list finite values; interval objects apply only to number variables.',
                    'anyOf':[{'type':'array','items':{},'uniqueItems':True}, interval_schema]},
-        'open': {'type':'boolean'}, 'unit': unit},
+        'open': {'type':'boolean'}, 'unit': unit,
+        'scope': {'type':'object', 'properties': {
+            'entity_scope': {'type':'string','minLength':1},
+            'time_scope': {'type':'string','minLength':1}},
+            'required':['entity_scope','time_scope'], 'additionalProperties':False}},
         'required':['type','demand'], 'additionalProperties':False}
     program = {'type':'object', 'properties': {
         'variables': {'type':'object','additionalProperties':declaration},
@@ -89,19 +102,25 @@ def validate_plan(value, legacy_validate):
     try:
         contract = validate_output_contract(value['output_contract'])
         program = validate_program(value['program'])
-        validate_bindings(program, plan['steps'], plan['final_node_id'])
+        validate_bindings(program, plan['steps'], plan['final_node_id'], contract=contract)
     except ProgramError as exc:
         raise ProtocolError(str(exc)) from exc
     return {**plan, 'output_contract':contract, 'program':program}
 
 
-def validate_bindings(program, steps, final_node_id):
+def validate_bindings(program, steps, final_node_id, *, contract=None):
     tasks = {s['output_slot']:s for s in steps}
     for declaration in program['variables'].values():
-        if set(declaration) - {'type','demand','domain','open','unit'}:
+        if set(declaration) - {'type','demand','domain','open','unit','scope'}:
             raise ProgramError('Unknown variable declaration metadata')
+        if 'scope' in declaration:
+            validate_scope(declaration['scope'])
         if declaration.get('demand') not in tasks:
             raise ProgramError('Variable demand must belong to the preplanned DAG')
+        if (contract is not None and declaration['demand'] == final_node_id
+                and variable_scope(declaration, contract) != {
+                    key: contract[key] for key in ('entity_scope','time_scope')}):
+            raise ProgramError('Terminal variable scope must match the immutable output contract')
     for variable,expression in program.get('task_expressions',{}).items():
         task=tasks[program['variables'][variable]['demand']]
         if task['execution']!='compose' or any(program['variables'][v]['demand'] not in task['inputs']

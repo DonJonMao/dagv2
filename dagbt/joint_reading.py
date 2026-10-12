@@ -34,8 +34,13 @@ value, not additive fragments. Combine applicable sources into one complete valu
 and cite all its premises. The controller never unions sets or merges records. If the visible text
 only establishes part of the requested value, return partial with value=null and
 explain the supported fragment in reason. Do not claim completeness from one window.
-Use the required scope strings exactly only when that scope actually applies; otherwise
-return unknown/irrelevant. Actual parents must be supplied supported bindings with
+requested_scopes[slot.variable] is that variable's authoritative local scope. Use its
+entity_scope and time_scope strings exactly only when that scope actually applies;
+otherwise return unknown/irrelevant. output_contract is the terminal answer's scope,
+not the scope of every historical fact or parent. A requested parent retains its own
+declared scope during terminal reading and audit. Never relabel historical evidence as
+current/future evidence. required_scope, when present, is only a shorthand shared by
+ALL requested_scopes. Actual parents must be supplied supported bindings with
 their versions; reproduce sources when joining documents. Sources may be combined
 across documents, but list ALL joint premises. A source slice is not an independent fact.
 Honor authoritative source_role: user statements, assistant suggestions, documents
@@ -168,7 +173,8 @@ class JointReader:
                     if p not in related:
                         related.add(p);frontier.append(p)
         parents = {v:{'value':values[v],'version':self.state.versions[v],'source_ids':sources[v],
-                      'demand':self.state.program['variables'][v]['demand'],'type':self.state.program['variables'][v]['type']}
+                      'demand':self.state.program['variables'][v]['demand'],'type':self.state.program['variables'][v]['type'],
+                      'scope':self.state.scope(v)}
                    for v in self.state.program['variables'] if v in related}
         known = [r for r in self.state.routes.values() if r['variable'] in variables]
         controller=getattr(self.e,'residual_control',None)
@@ -205,13 +211,17 @@ class JointReader:
                 'initial_dag_identity':digest(self.e.steps)},
             'variables':{v:self.state.program['variables'][v] for v in variables},
             'requested_slots':list(variables),
-            'required_scope':{k:self.state.contract[k] for k in ('entity_scope','time_scope')},
+            'requested_scopes':{v:self.state.scope(v) for v in variables},
             'output_contract':self.state.contract, 'program_revision':self.state.revision,
             'rule_binding':self.state.initial_program.get('rule_binding'),
             'supported_parents':wire(parents),'known_observations':wire(known),
             'source_spans':[{k:self.e.mapper.sources[a][k] for k in
                 ('id','doc_id','start','end','text','source_role','source_message_indices','time_metadata')}
                 for a in all_aliases]}
+        scopes=list(data['requested_scopes'].values())
+        if scopes and all(scope==scopes[0] for scope in scopes):
+            # Preserve the old shorthand only when it is true for every slot.
+            data['required_scope']=deepcopy(scopes[0])
         if controller:
             data['rules_completion_required']=controller.rules_completion_needed()
             data['supported_task_outputs']=wire(task_outputs)
@@ -270,6 +280,11 @@ class JointReader:
                 else:
                     observation['properties']={'stance':{'enum':['support','partial','unknown','irrelevant']},
                                                'retract_ids':{'maxItems':0}}
+                scope=data.get('requested_scopes',{}).get(variable,data.get('required_scope'))
+                if scope is not None:
+                    observation['allOf']=[{
+                        'if':{'properties':{'stance':{'enum':['support','contradiction']}}},
+                        'then':{'properties':{key:{'const':value} for key,value in scope.items()}}}]
                 branches.append({'properties':{'variable':{'const':variable},
                     'observations':{'items':observation}}})
             item['oneOf']=branches
@@ -385,8 +400,9 @@ class JointReader:
             raise ProtocolError('Supported/counter observation needs original sources')
         if not all(isinstance(row[f],str) for f in ('entity_scope','time_scope','reason')):
             raise ProtocolError('Scope/reason must be explicit')
-        if row['stance'] in ('support','contradiction') and any(row[k]!=self.state.contract[k] for k in ('entity_scope','time_scope')):
-            raise ProtocolError('Observation scope does not apply to this task')
+        if row['stance'] in ('support','contradiction') and any(
+                row[key]!=value for key,value in self.state.scope(variable).items()):
+            raise ProtocolError('Observation scope does not apply to declared variable '+variable)
         if row['stance']=='support':
             if variable in self.state.program.get('task_expressions',{}):
                 raise ProtocolError('Model observations cannot replace a deterministic DAG binding')

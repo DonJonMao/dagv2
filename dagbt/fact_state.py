@@ -1,12 +1,13 @@
 """Versioned typed observations; provenance routes are OR alternatives."""
 from copy import deepcopy
-from .residual import validate_value, validate_program, ProgramError
+from .residual import validate_value, validate_program, variable_scope, ProgramError
 from .residual_plan import validate_bindings
 from .transport import digest
 
 
 class FactState:
     def __init__(self, program, contract, steps, final_node_id):
+        validate_bindings(program, steps, final_node_id, contract=contract)
         self.initial_program = deepcopy(program)
         self.program, self.contract = deepcopy(program), deepcopy(contract)
         self.steps, self.final_node_id = deepcopy(steps), final_node_id
@@ -19,6 +20,9 @@ class FactState:
         self.instantiations = []
         self._identities = {}
 
+    def scope(self, variable):
+        return variable_scope(self.program['variables'][variable], self.contract)
+
     def valid(self):
         # Resolve parent routes in DAG order, never accept unsupported guesses.
         values, sources, route_ids = {}, {}, {}
@@ -27,6 +31,7 @@ class FactState:
                 if declaration['demand'] != task['output_slot']:
                     continue
                 routes = [r for r in self.routes.values() if r['variable']==variable and not r['revoked']
+                          and all(r.get(k)==v for k,v in self.scope(variable).items())
                           and ('binding_derivation' not in r or r['binding_derivation']['program_revision']==self.revision)
                           and all(p in values and self.versions[p]==ver for p,ver in r['parent_versions'].items())]
                 if not routes or len({digest(r['value']) for r in routes}) != 1:
@@ -63,6 +68,10 @@ class FactState:
         # callers outside JointReader and numeric domain intersections.
         rows=[{**r,'value':validate_value(r['value'],self.program['variables'][r['variable']])}
               if r['stance']=='support' else r for r in rows]
+        for row in rows:
+            if row['stance'] in ('support','contradiction') and any(
+                    row.get(key) != value for key,value in self.scope(row['variable']).items()):
+                raise ProgramError('Observation scope does not match its declared variable scope')
         for row in rows:
             if row['stance'] in ('unknown','partial','irrelevant'):
                 continue
@@ -107,7 +116,7 @@ class FactState:
             raise ProgramError('Rule instantiation cannot change a predeclared variable identity/type/demand')
         candidate = {**deepcopy(rule), 'variables':{**deepcopy(self.initial_program['variables']),**deepcopy(rule['variables'])}}
         validate_program(candidate)
-        validate_bindings(candidate, self.steps, self.final_node_id)
+        validate_bindings(candidate, self.steps, self.final_node_id, contract=self.contract)
         mode = self.contract['mode']
         if mode in ('one_reason','all_failures') and candidate['expression']['op'] != ('one_reason' if mode=='one_reason' else 'failures'):
             raise ProgramError('Sourced rule cannot change the fixed output mode')
@@ -136,8 +145,26 @@ class FactState:
     def restore(self, snapshot):
         if snapshot['initial_program'] != self.initial_program or snapshot['contract'] != self.contract:
             raise ProgramError('Resume cannot change initial program or output contract')
-        program=validate_program(snapshot['program'])
-        validate_bindings(program,self.steps,self.final_node_id)
+        def validate_restored_program(value):
+            program=validate_program(value)
+            validate_bindings(program,self.steps,self.final_node_id,contract=self.contract)
+            if any(program['variables'].get(v)!=declaration
+                   for v,declaration in self.initial_program['variables'].items()):
+                raise ProgramError('Resume cannot change a predeclared variable identity or scope')
+            return program
+        program=validate_restored_program(snapshot['program'])
+        historical=[validate_restored_program(row['program']) for row in snapshot['instantiations']]
+        if program!=self.initial_program and program not in historical:
+            raise ProgramError('Resumed program does not match a recorded rule instantiation')
+        for route in snapshot['routes']:
+            # Sourced rule revisions retain obsolete routes for provenance.
+            # They may match a historical dynamic declaration, but valid()
+            # admits only routes with the currently declared scope.
+            declarations=[p['variables'][route['variable']] for p in [program,*historical]
+                          if route.get('variable') in p['variables']]
+            if not any(all(route.get(k)==v for k,v in variable_scope(d,self.contract).items())
+                       for d in declarations):
+                raise ProgramError('Resumed observation scope differs from its declared variable scope')
         self.program=deepcopy(program)
         self.routes={r['id']:deepcopy(r) for r in snapshot['routes']}
         self.versions=deepcopy(snapshot['versions'])
