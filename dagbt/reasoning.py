@@ -93,14 +93,23 @@ class Reasoner:
     def estimate(self, operation, system, data, schema=None):
         """Estimated input tokens for exact wire JSON, including schema fields."""
         payload = self._payload(operation, system, data, schema)
-        return count_evidence_request_tokens((operation, str(self.sequence + 1)), self.url, payload, self.config)
+        return self._count_payload(operation, payload)['count']
+
+    def _count_payload(self, operation, payload):
+        stage = (operation, str(self.sequence + 1))
+        if hasattr(self.calls, 'count_reasoning_tokens'):
+            return self.calls.count_reasoning_tokens(stage, self.url, payload)
+        if self.config.get('tokenization') is not None:
+            raise ValueError('Configured deployment tokenization requires the shared production counter')
+        return {'count': count_evidence_request_tokens(stage, self.url, payload, self.config),
+                **evidence_token_accounting()}
 
     def _preflight(self, operation, count, *, reserve=None, extra_reserve=0):
         output = self.settings["reasoning_output_tokens"]
         margin = self.settings.get("input_margin", 256)
         if count + output + 8 + margin > self.settings["context_tokens"]:
             raise InputOverflow(f'{operation}: {count}+{output}+8+{margin} exceeds '
-                                f'{self.settings["context_tokens"]} (estimated tokens)')
+                                f'{self.settings["context_tokens"]} (request token accounting)')
         reserved = call_reservation(self.settings, operation, reserve, extra_reserve)
         if self.ledger.remaining("llm") <= reserved:
             raise BudgetExceeded("llm", operation, 1, 0)
@@ -113,7 +122,8 @@ class Reasoner:
         ``last_response``/``requests`` retain raw output and provider metadata.
         """
         payload = self._payload(operation, system, data, schema)
-        count = count_evidence_request_tokens((operation, str(self.sequence + 1)), self.url, payload, self.config)
+        accounting = self._count_payload(operation, payload)
+        count = accounting['count']
         self._preflight(operation, count, reserve=reserve, extra_reserve=extra_reserve)
         self.sequence += 1
         stage = (operation, str(self.sequence))
@@ -121,7 +131,8 @@ class Reasoner:
                   "logical_call_index": self.sequence,
                   "response_format": self.settings.get("response_format", "plain"),
                   "input_tokens_local": count, "output_token_reserve": payload["max_tokens"],
-                  "input_margin": self.settings.get("input_margin", 256), **evidence_token_accounting()}
+                  "input_margin": self.settings.get("input_margin", 256),
+                  **{k: v for k, v in accounting.items() if k != 'count'}}
         self.requests.append(record)
         self.last_response = record
         self.event({"event": "reasoning_request_started", "operation": operation,

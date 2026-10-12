@@ -54,9 +54,50 @@ residual 一题 `execution_failed`、一题 `budget_exhausted`。
 不增加独立 Reader、不弱化证据约束、不读取标签来选择答案。
 模型、endpoint 与凭据解析配置保持原样。完整验证结果随交付包记录。
 
+## 16K 容量计数修复与文献对齐
+
+参考 [Preference RAG 基线调研](PREFERENCE_RAG_BASELINE_PROTOCOL_20261012.md)，
+不将 PersonaMem 的 32K 历史版本当成请求上限，也不单独把 residual 扩容到 24K。
+ANN 36、LLM 24、输出预留 4096、输入余量 256 和上下文 16384 保持不变。
+
+第五轮开发 smoke 仍有一个终端窗口被旧本地估算拒绝；它没有发送生成请求。
+已用实际部署 `/tokenize` 对照此前 10 次 residual 和 6 次 original 的完整
+chat 请求，16 次计数均与已有服务 `prompt_tokens` 相同。原先失败首窗口实际
+输入 8650，带 repair envelope 为 8830；计入输出和全部余量后为 13010/13190，
+在 16384 之内。这只验证该窗口，不代替完整新 smoke 的结果。
+
+新增配置 `configs/residual-memory.personamem16k.json`，与原配置相比只显式启用
+同源部署计数接口。分窗、Reasoner 发出前检查和 Transport 最终检查共用同一
+完整消息计数，包括 system、schema、原文及 generation prompt；不按经验比例
+换算，不减输出预留。服务报告的最大容量只作为额外约束，不用于放大实验上限。
+
+两组最终聊天请求均使用同一服务计数门禁，并要求生成返回的 `prompt_tokens`
+与计数一致；不一致或缺失则记录失败，保留原响应，不重复生成来掩盖差异。
+计数接口失败不降级为猜算。旧 original 算法内部原有估算预检仍保留，可能更保守；
+没有改其规划、检索或选择逻辑，不能据此声称各方法的全部中间预算/算力相同。
+
+计数仅支持已验证的纯文本、plain schema 提示和服务默认聊天模板；工具、多模态、
+自定义模板及未知协议字段明确拒绝。计数缓存只在单个 Transport 生命周期内，
+按实际消息和模型区分；它不缓存或改写证据。计数 HTTP、缓存命中和耗时单独
+写入 `tokenization_events.jsonl` 与成本统计，不计入 LLM/ANN 调用或生成 token 总量。
+模型权重及 tokenizer 文件哈希未被独立核验。
+
+## 本次验证
+
+- 完整套件 1020 项通过，90 项可选 JSON Schema 测试在另一个具备依赖的环境
+  补验通过；原有数值运算警告单独记录在 `validation.json`。
+- 上传失败日志中的同两题重新运行，单次尝试：original 2/2 `ok`，residual
+  2/2 `ok`，后者两题均完成审计且没有未解决失败义务。
+- 18 次最终聊天请求的实际输入计数与生成 usage 全部一致；最大请求连同输出
+  和余量为 16199 / 16384。没有扩大预算，也未对答案准确率评分。
+- 计数存在额外 HTTP 开销：residual 两题分别为 251 / 787 次、约
+  19.56 / 83.59 秒。两组共 1044 次、约 103.59 秒，单列在辅助成本中。
+  两题执行通过不代表全部 589 题已验证，也不代表答对。
+
 ## 安装与运行
 
-补丁要求未手动修改的 a48 v2 部署。安装器验证文件哈希，拒绝覆盖活动实验，
+补丁要求未手动修改的 a48 v2 部署。安装器验证文件哈希，检测目标目录
+`outputs/` 下的活动 writer 锁并拒绝覆盖，
 自动备份，失败回滚，最后更新 `DEPLOYMENT.json`。重复安装同一补丁为幂等操作。
 
 上传 `dagv2_personamem_a48_v3_patch.tar.gz` 到服务器 `~/bt/` 后：
@@ -80,7 +121,7 @@ export DAGBT_PYTHON="$HOME/dagbt_runs/20260930_v3/dagv2/.venv/bin/python"
 ```bash
 cd ~/dagbt_runs/20261011_personamem_a48/dagv2
 export DAGBT_PYTHON="$HOME/dagbt_runs/20260930_v3/dagv2/.venv/bin/python"
-"$DAGBT_PYTHON" -m dagbt.runner launch --config configs/residual-memory.example.json --datasets personamem --arms original dagbt_residual_memory_v1 --output outputs/personamem_a48_v3_full
+"$DAGBT_PYTHON" -m dagbt.runner launch --config configs/residual-memory.personamem16k.json --datasets personamem --arms original dagbt_residual_memory_v1 --output outputs/personamem_a48_v3_full
 ```
 
 代码改变后必须使用新输出目录，不将旧运行的成功/失败行混入新版。

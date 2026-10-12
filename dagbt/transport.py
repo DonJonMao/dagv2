@@ -11,6 +11,7 @@ from .model_runtime import (prepare_request, normalize_response, resolve_api_key
                             REASONING_MARKER, evidence_wire_tokens, evidence_token_accounting)
 
 from .methods import terminal_method, capabilities
+from .token_counting import DeploymentTokenCounter, validate_tokenization_config
 
 class ServiceError(RuntimeError): pass
 class ResponseError(ValueError): pass
@@ -57,6 +58,45 @@ class Transport:
     def __init__(self, unit, output, config, ledger, tokenizer):
         self.unit,self.output,self.config,self.ledger,self.tokenizer=unit,Path(output),config,ledger,tokenizer
         self.events=[]
+        self.token_counter = (DeploymentTokenCounter(config, self._record_tokenization)
+                              if validate_tokenization_config(config) is not None else None)
+
+    def _record_tokenization(self, event):
+        value = {**event, 'unix': time.time()}
+        self.output.mkdir(parents=True, exist_ok=True)
+        with (self.output / 'tokenization_events.jsonl').open('a') as journal:
+            journal.write(json.dumps(value, ensure_ascii=False) + '\n')
+        self.ledger.record(value)
+
+    def count_reasoning_tokens(self, stage, url, payload):
+        """The partitioner and final transport check share the same wire count."""
+        _, wire, _ = prepare_request(stage, url, payload, self.config)
+        if self.token_counter is not None:
+            return self.token_counter.count(wire)
+        return {'count': evidence_wire_tokens(wire), **evidence_token_accounting()}
+
+    def _verify_token_count(self, body, accounting, record, path, stage):
+        if self.token_counter is None:
+            return
+        if record.get('tokenization_validation', {}).get('status') == 'failed':
+            self.ledger.record({'event': 'tokenization_usage_validation', 'stage': stage,
+                                'status': 'failed', 'reason': 'prior_validation_failure',
+                                'current_expected_prompt_tokens': accounting['count']})
+            raise ResponseError('Deployment tokenization does not match generation prompt_tokens (prior validation failed)')
+        usage = body.get('usage') if isinstance(body, dict) else None
+        observed = usage.get('prompt_tokens') if isinstance(usage, dict) else None
+        matched = type(observed) is int and observed == accounting['count']
+        validation = {'status': 'matched' if matched else 'failed',
+                      'expected_prompt_tokens': accounting['count'],
+                      'observed_prompt_tokens': observed if type(observed) is int else None,
+                      'tokenization_request_sha256': accounting['tokenization_request_sha256']}
+        record['tokenization_validation'] = validation
+        save(path, record)
+        self.ledger.record({'event': 'tokenization_usage_validation', 'stage': stage, **validation})
+        if not matched:
+            # The completed generation is preserved, but never retried merely
+            # to make an accounting disagreement disappear (including replay).
+            raise ResponseError('Deployment tokenization does not match generation prompt_tokens')
 
     supports_scoring_context = True
 
@@ -71,9 +111,14 @@ class Transport:
         kind='embedding_http' if embed else 'rerank_http' if rerank else 'reader' if reader else 'llm'
         evidence_reasoning=bool(payload.get(REASONING_MARKER)) and not (embed or rerank or reader)
         url,payload,legacy_text=prepare_request(stage,url,payload,self.config)
+        accounting = None
         if evidence_reasoning or (is_bridgetree(self.config) and not (embed or rerank)):
-            count=(evidence_wire_tokens(payload) if evidence_reasoning else
-                   count_request_tokens(stage,url,payload,self.config,self.tokenizer))
+            accounting = (self.token_counter.count(payload) if self.token_counter is not None else
+                          {'count': evidence_wire_tokens(payload), **evidence_token_accounting()}
+                          if evidence_reasoning else
+                          {'count': count_request_tokens(stage,url,payload,self.config,self.tokenizer),
+                           **token_accounting(self.config)})
+            count=accounting['count']
             context_limit=self.config.get('fusion',{}).get('context_tokens',16384)
             margin=int(self.config.get('fusion',{}).get('input_margin',256)) if evidence_reasoning else 0
             total=count+payload['max_tokens']+8+margin
@@ -81,12 +126,14 @@ class Transport:
                    'output_token_reserve':payload['max_tokens'],'safety_margin':8,'input_margin':margin,
                    'context_tokens':context_limit,'total_tokens_local':total,
                    'within_estimated_budget':total<=context_limit,
-                   **(evidence_token_accounting() if evidence_reasoning else token_accounting(self.config))}
+                   **{k:v for k,v in accounting.items() if k != 'count'}}
             self.ledger.record(event)
             if total>context_limit:
-                raise ResponseError(f'BridgeTree estimated context budget at {stage_text}: '
+                note = (accounting.get('token_estimator_id', 'unknown accounting') if self.token_counter is not None
+                        else 'regex estimate, not the deployed model tokenizer')
+                raise ResponseError(f'BridgeTree context budget at {stage_text}: '
                                     f'{count}+{payload["max_tokens"]}+8+{margin}>{context_limit}; '
-                                    'regex estimate, not the deployed model tokenizer')
+                                    + note)
         if rerank and self.config.get('fusion',{}).get('algorithm_version') == 'dagbt_local_terminal_v1' and not scoring_context_id:
             raise ResponseError('Local rerank requires scoring context identity')
         identity=request_identity(self.unit,url,payload,self.config,scoring_context_id)
@@ -97,6 +144,8 @@ class Transport:
             journal.write(json.dumps({'event':'call_started','request_ref':key,'stage':stage_text,'kind':kind,'unix':time.time(),'cache_hit':'response' in record})+'\n')
         if any(record.get(k)!=v for k,v in identity.items()):raise ResponseError('Request cache identity mismatch')
         if 'response' in record:
+            if self.token_counter is not None and not (embed or rerank):
+                self._verify_token_count(record['response'], accounting, record, path, stage_text)
             # Replay consumes logical budget so a resumed task follows the same frontier.
             charges=max(1,len(record.get('attempts',[])))
             for _ in range(charges):self._reserve(kind,stage_text,reserve,extra_reserve)
@@ -139,6 +188,8 @@ class Transport:
                 event={'event':'http_response','stage':stage_text,'response_ref':key,'kind':kind,
                        'usage':body.get('usage'), 'seconds':attempt['finished_unix']-attempt['started_unix']}
                 self.ledger.record(event);self.events.append(event)
+                if self.token_counter is not None and not (embed or rerank):
+                    self._verify_token_count(body, accounting, record, path, stage_text)
                 return {'response':normalize_response(body,legacy_text),'response_ref':key,'request':payload}
             if attempts_this_call < limit:time.sleep(min(2*attempts_this_call,5))
         raise ServiceError(f'Retry limit at {stage_text}; request {key}')

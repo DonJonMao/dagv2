@@ -77,6 +77,9 @@ def redacted_error(exc):
 
 
 def validate_config(config):
+    if 'tokenization' in config:
+        from dagbt.token_counting import validate_tokenization_config
+        validate_tokenization_config(config)
     if "_test_transport" in config:
         raise ValueError("_test_transport is forbidden in production runner configuration")
     if config.get("model_profile", "legacy") not in ("legacy", "bridgetree"):
@@ -283,6 +286,11 @@ def preflight(config, datasets, *, endpoints=True, output=None, arms=None):
             resolve(config, arm)
     report = {"original_integrity": verify_originals(), "datasets": {}, "endpoints": {}, "arms": arms,
               "config_digest": digest(config), "created_unix": time.time()}
+    if 'tokenization' in config:
+        report['request_tokenization'] = {
+            'mode': config['tokenization']['mode'], 'context_tokens': config.get('fusion', {}).get('context_tokens', 16384),
+            'scope': 'Final adapted text-chat messages use deployment counting; original native intermediate estimates remain unchanged',
+            'generation_usage_verification': 'required exact prompt_tokens match; failure is not retried'}
     dependencies = {"numpy": "numpy", "transformers": "transformers", "yaml": "PyYAML", "jinja2": "Jinja2"}
     missing_modules = [name for name in dependencies if importlib.util.find_spec(name) is None]
     if missing_modules:
@@ -485,6 +493,28 @@ def request_cost(output):
     result["physical_reader_attempts"] = by_kind.get("reader", {}).get("http_attempts", 0)
     result["layer_scope"] = "logical invocations include cache replay; physical attempts/usage exclude seeded old requests; reasoning and reader are separate"
     result["token_usage_complete"] = not any(result[k] for k in ("missing_usage_responses", "incomplete_or_failed_http_attempts", "malformed_request_records"))
+    tokenization_path = output / 'tokenization_events.jsonl'
+    if tokenization_path.exists():
+        # Auxiliary token counting is not generation, embedding or billable
+        # prompt usage. Keep its traffic and latency visible in their own group.
+        counted, malformed = [], 0
+        for line in tokenization_path.read_text().splitlines():
+            try:
+                value = json.loads(line)
+                if not isinstance(value, dict) or value.get('event') != 'tokenization_count':
+                    raise ValueError('Invalid tokenization event')
+                counted.append(value)
+            except (ValueError, TypeError):
+                malformed += 1
+        result['tokenization'] = {
+            'logical_calls': len(counted),
+            'cache_hits': sum(bool(v.get('cache_hit')) for v in counted),
+            'http_attempts': sum(v.get('http_attempts', 0) for v in counted),
+            'successful_http_requests': sum(v.get('successful_http_requests', 0) for v in counted),
+            'failed_counts': sum(v.get('status') != 'ok' for v in counted),
+            'observed_seconds': sum(v.get('seconds', 0) for v in counted),
+            'malformed_event_lines': malformed,
+            'scope': 'Auxiliary deployment tokenization only; excluded from generation/embedding token and call totals'}
     return result
 
 
@@ -645,6 +675,12 @@ def native_worker(connection, dataset, arm, config):
                     row["answer"]["error"] = "Final prediction must identify one unambiguous option label"
             from dagbt.model_runtime import token_accounting
             row.setdefault("diagnostics", {})["token_accounting"] = token_accounting(config)
+            if 'tokenization' in config:
+                from dagbt.token_counting import ESTIMATOR_ID
+                row['diagnostics']['request_context_accounting'] = {
+                    'token_count_is_estimate': False, 'token_estimator_id': ESTIMATOR_ID,
+                    'scope': 'Final adapted text-chat requests; native original intermediate estimates remain unchanged',
+                    'generation_usage_verification': 'required exact prompt_tokens match'}
             row["seconds"] = time.monotonic() - started
             connection.send({"type": "result", "row": row})
         except BaseException as exc:
