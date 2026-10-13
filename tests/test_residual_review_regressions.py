@@ -86,7 +86,7 @@ def test_single_and_multiple_successful_windows_have_same_answer_and_sources():
     assert results[0]==results[1]
 
 
-def test_failed_window_is_not_cleared_by_later_successful_window():
+def test_failed_window_without_repair_budget_keeps_later_windows_unread_and_pending():
     class FailedFirst(demo.SourcesOnly):
         def get(self,stage,url,payload):
             response=super().get(stage,url,payload)
@@ -101,9 +101,11 @@ def test_failed_window_is_not_cleared_by_later_successful_window():
     c=prepare(e);step,query,key=local_read(c,'x',e.ids);one_new_window(c.reader)
     c.reader.read(step,query,['x'],e.ids,key)
     assert c.reader.failed_obligations and c.reader.unread_obligations
+    requests=len(e.reasoner.requests)
     c.reader.read(step,query,['x'],e.ids,key)
-    assert c.state.valid()[0]['x']==7
-    assert not c.reader.unread_obligations and c.reader.failed_obligations
+    assert 'x' not in c.state.valid()[0]
+    assert len(e.reasoner.requests)==requests
+    assert c.reader.unread_obligations and c.reader.failed_obligations
     assert c.state.pending=={'x'} and c.candidate() is None
 
 

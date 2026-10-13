@@ -331,7 +331,7 @@ def test_dynamic_snapshot_declaration_must_match_recorded_rule_instantiation():
     assert fresh.public_dict() == rule_state().public_dict()
 
 
-def test_later_in_scope_support_does_not_erase_failed_obligation():
+def test_renamed_query_cannot_repair_a_failed_scope_without_new_evidence_or_repair_budget():
     reader, engine, state, calls = scoped_fixture(
         lambda index, data: response(observation(**(FUTURE if index == 1 else PAST))),
         max_repairs_per_request=0)
@@ -339,6 +339,6 @@ def test_later_in_scope_support_does_not_erase_failed_obligation():
     assert "history" in state.pending and reader.failed_obligations
     before = deepcopy(reader.failed_obligations)
     reader.read(engine.steps[0], "Read historical fact", ["history"], ["piano"], "new-query")
-    assert state.valid()[0]["history"] == ["piano"]
+    assert "history" not in state.valid()[0]
     assert "history" in state.pending and reader.failed_obligations == before
-    assert len(calls.requests) == 2 and engine.ledger.used.get("json_repairs", 0) == 0
+    assert len(calls.requests) == 1 and engine.ledger.used.get("json_repairs", 0) == 0

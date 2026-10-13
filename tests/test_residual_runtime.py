@@ -323,7 +323,14 @@ def test_scoped_repair_preserves_valid_rows_and_missing_counter_slot_stays_pendi
  # An independently supported A witness remains a complete legal answer; the
  # failed D slot is retained and cannot support a D-based certificate.
  repairs=[json.loads(r['payload']['messages'][1]['content']) for r in requests if r['stage'][0]=='joint_read_repair']
- assert repairs and all('return_age' not in d['variables'] for d in repairs)
+ scoped=[d for d in repairs if 'repair_scope' in d
+         and not any(r['review_allowed'] for r in d.get('failed_batch_reviews',[]))]
+ assert scoped and all('return_age' not in d['variables'] for d in scoped)
+ # A later new-source review is also charged as a repair. Its full reading
+ # window may check already-bound sibling slots for new counterevidence.
+ assert all('repair_scope' in d or any(r['review_allowed'] for r in d.get('failed_batch_reviews',[]))
+            for d in repairs)
+ assert e.ledger.used['json_repairs']<=e.ledger.limits['json_repairs']
  assert row['diagnostics']['cost']['llm_attempts']<=24
 
 def test_audit_retracts_decisive_fact_then_recomputes_instead_of_publishing_old_certificate():

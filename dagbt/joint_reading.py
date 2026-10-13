@@ -125,6 +125,29 @@ retract them, never an implicit union or overwrite. If the issue cannot be settl
 preserve it in slot.unresolved with its original evidence. Agreement is not required.
 '''
 
+FAILED_BATCH_REVIEW_INSTRUCTION = '''
+failed_batch_reviews retain earlier FAILED reading drafts, their validation errors,
+and ALL original text. They are unresolved obligations, never supported facts.
+Only entries with review_allowed=true authorize a paid scoped recovery in this
+request. Recheck each failed observation using its original ID; for duplicate IDs
+use every supplied replacement_observations ID. Keep every original counter and
+its protected stance, sources, scopes, actual parents and retraction targets.
+For citation_capacity, recheck the complete original draft and text; a genuinely
+sufficient smaller proof is allowed, dropping a necessary premise is not. For a
+whole-value disagreement preserve each original draft's sources and apply the
+whole-value review rules. Other failed drafts' previously visible original citations
+must be explicitly reviewed in sourced output, either on the corrected draft or
+an additional review observation. An invalid/unknown alias may be corrected, but
+a real negative source cannot be silently replaced by an unrelated positive one.
+Validated earlier observations are context, not drafts
+to overwrite. To finish a review, put its exact id in that variable's optional
+resolved_failed_batch_ids. Omission, unrelated support or an empty slot never
+resolves a failed batch. If its meaning still cannot be established, return the
+sourced partial/unknown review and its unresolved issue; do not invent agreement.
+Entries with review_allowed=false remain pending; changing query identity alone
+does not authorize retrying a failed batch or clearing its marker.
+'''
+
 COLUMNAR_INSTRUCTION = '''
 When source_span_columns is present, source_spans contains row arrays. Match each
 row position to source_span_columns to reconstruct every span object before
@@ -181,6 +204,7 @@ class JointReader:
         # different lifetimes. Successful later windows settle only unread work.
         self.unread_obligations = {}
         self.failed_obligations = {}
+        self.failed_batch_reviews = {}
         self.evidence_obligations = {}
 
     def material_signature(self):
@@ -199,6 +223,9 @@ class JointReader:
         obligations=self.obligation_snapshot()
         for item in obligations['evidence_obligations']:
             item.pop('origins',None)
+        for item in obligations['failed_batch_reviews']:
+            item.pop('seen_source_ids',None)
+            item.pop('seen_parent_signatures',None)
         return digest({'routes':sorted(routes,key=lambda r:r['id']),
             'program':self.state.program,'pending':sorted(self.state.pending),
             'read_windows':sorted([*key,value] for key,value in self.read_states.items()),
@@ -215,12 +242,73 @@ class JointReader:
     def obligation_snapshot(self):
         return {**{name:[[i,a,sorted(v)] for (i,a),v in getattr(self,name).items()]
                 for name in ('unread_obligations','failed_obligations')},
-                'evidence_obligations':deepcopy(sorted(self.evidence_obligations.values(),key=lambda x:x['id']))}
+                'evidence_obligations':deepcopy(sorted(self.evidence_obligations.values(),key=lambda x:x['id'])),
+                'failed_batch_reviews':deepcopy(sorted(self.failed_batch_reviews.values(),key=lambda x:x['id']))}
 
     def restore_obligations(self, snapshot):
         for name in ('unread_obligations','failed_obligations'):
             setattr(self,name,{(i,a):set(v) for i,a,v in snapshot.get(name,[])})
         self.evidence_obligations={item['id']:deepcopy(item) for item in snapshot.get('evidence_obligations',[])}
+        self.failed_batch_reviews={item['id']:deepcopy(item) for item in snapshot.get('failed_batch_reviews',[])}
+
+    @staticmethod
+    def _remap_review_sources(value, mapping):
+        """Remap vetted aliases without interpreting typed values or bad drafts."""
+        if isinstance(value,dict):
+            return {k:([mapping.get(s,s) if isinstance(s,str) else deepcopy(s) for s in item]
+                       if k in ('source_ids','required_source_ids') and isinstance(item,list)
+                       else deepcopy(item) if k in ('value','output')
+                       else JointReader._remap_review_sources(item,mapping)) for k,item in value.items()}
+        if isinstance(value,list):
+            return [JointReader._remap_review_sources(item,mapping) for item in value]
+        return deepcopy(value)
+
+    def _failed_parent_signature(self, variable):
+        task=next(s for s in self.e.steps if s['output_slot']==self.state.program['variables'][variable]['demand'])
+        values,_,routes=self.state.valid()
+        parents={v:{'version':self.state.versions[v],'value':values.get(v),'routes':routes.get(v,[])}
+                 for v,d in self.state.program['variables'].items() if d['demand'] in task['inputs']}
+        # Only actual local parent bindings matter. An unrelated global program
+        # revision or renamed query must not unlock another paid repair.
+        return digest(parents)
+
+    def failed_review_blocked(self, step, variables):
+        failed={record['variable'] for record in self.failed_batch_reviews.values()
+                if record['task_id']==step['output_slot']}
+        return bool(variables and set(variables)<=failed and (
+            self.e.s['max_repairs_per_request']<=0 or not self.e.ledger.remaining('json_repairs')
+            or self.e.ledger.remaining('llm')<=self.e.s['reserved_audit_calls']))
+
+    @staticmethod
+    def _failed_phase(data):
+        return data.get('phase', 'audit' if 'audit_instruction' in data else
+                        'terminal' if 'public_output_question' in data else 'history')
+
+    def failed_review_ready(self, step, variables, doc_ids=()):
+        if (self.e.s['max_repairs_per_request']<=0 or not self.e.ledger.remaining('json_repairs')
+                or self.e.ledger.remaining('llm')<=self.e.s['reserved_audit_calls']):
+            return False
+        available={s['source_id'] for s in self.e.mapper.sources.values() if s['doc_id'] in doc_ids}
+        return any(record['variable'] in variables and record['task_id']==step['output_slot']
+            and record['phase'] in ('history','history_evidence')
+            and (available-set(record['seen_source_ids']) or self._failed_parent_signature(record['variable'])
+                 not in record['seen_parent_signatures']) for record in self.failed_batch_reviews.values())
+
+    def _failed_payload(self, records, source_aliases, step, phase):
+        allowed=set()
+        result=[]
+        budget=(self.e.s['max_repairs_per_request']>0 and self.e.ledger.remaining('json_repairs')
+                and self.e.ledger.remaining('llm')>self.e.s['reserved_audit_calls'])
+        for record in records:
+            variable=record['variable']
+            changed=(set(source_aliases)-set(record['seen_source_ids'])
+                     or self._failed_parent_signature(variable) not in record['seen_parent_signatures'])
+            ready=bool(budget and changed and variable not in allowed and phase in ('history','history_evidence')
+                       and record['task_id']==step['output_slot'] and record['phase']==phase)
+            if ready:allowed.add(variable)
+            item={k:v for k,v in record.items() if k not in ('seen_source_ids','seen_parent_signatures')}
+            result.append({**self._remap_review_sources(item,source_aliases),'review_allowed':ready})
+        return result
 
     def _source(self, alias):
         source = self.e.mapper.sources[alias]
@@ -254,6 +342,8 @@ class JointReader:
                    for v in self.state.program['variables'] if v in related}
         known = [r for r in self.state.routes.values() if r['variable'] in variables]
         obligations=[item for item in self.evidence_obligations.values() if item['variable'] in set(variables)|related]
+        failed_reviews=[item for item in self.failed_batch_reviews.values()
+                        if item['variable'] in set(variables)|related]
         controller=getattr(self.e,'residual_control',None)
         task_outputs={p:certificate for p in step['inputs']
                       if (certificate:=controller.task_projection(p)) is not None} if controller else {}
@@ -269,6 +359,7 @@ class JointReader:
             elif isinstance(value,list):
                 for item in value:collect(item)
         for value in (known,parents,task_outputs,obligations):collect(value)
+        for record in failed_reviews:required_ids.update(record['source_ids'])
         required={a for a,s in self.e.mapper.sources.items() if s['source_id'] in required_ids}
         if required_ids-{self.e.mapper.sources[a]['source_id'] for a in required}:
             raise ProtocolError('Known observation references an unavailable original source')
@@ -335,6 +426,9 @@ class JointReader:
             if personal:
                 data['terminal_candidate']={'value':deepcopy(self.semantic_result),
                     'final_prediction':self.semantic_prediction}
+        if failed_reviews:
+            data['failed_batch_reviews']=self._failed_payload(
+                failed_reviews,source_aliases,step,self._failed_phase(data))
         return data
 
     @staticmethod
@@ -366,6 +460,8 @@ class JointReader:
         item=schema['properties']['slots']['items']
         if data.get('evidence_obligations'):
             item['properties']['resolved_obligation_ids']={'type':'array','items':{'type':'string'},'uniqueItems':True}
+        if data.get('failed_batch_reviews'):
+            item['properties']['resolved_failed_batch_ids']={'type':'array','items':{'type':'string'},'uniqueItems':True}
         if requested:
             item['properties']['variable']['enum']=requested
             targets_by_variable={v:[r['id'] for r in data.get('known_observations',[]) if r['variable']==v]
@@ -402,6 +498,11 @@ class JointReader:
                     obligation_ids=[item['id'] for item in data['evidence_obligations'] if item['variable']==variable]
                     properties['resolved_obligation_ids']=({'items':{'enum':obligation_ids}}
                         if obligation_ids else {'maxItems':0})
+                if data.get('failed_batch_reviews'):
+                    batch_ids=[record['id'] for record in data['failed_batch_reviews']
+                               if record['variable']==variable and record['review_allowed']]
+                    properties['resolved_failed_batch_ids']=({'items':{'enum':batch_ids}}
+                        if batch_ids else {'maxItems':0})
                 branches.append({'properties':properties})
             item['oneOf']=branches
         schema['properties']['slots'].update(minItems=len(requested),maxItems=len(requested))
@@ -537,6 +638,10 @@ class JointReader:
         system=SYSTEM+(COLUMNAR_INSTRUCTION if 'source_span_columns' in data else '')
         if data.get('repair_scope',{}).get('whole_value_reviews'):
             system+=WHOLE_VALUE_REVIEW_INSTRUCTION
+        if data.get('failed_batch_reviews'):
+            system+=FAILED_BATCH_REVIEW_INSTRUCTION
+            if any(record.get('whole_value_reviews') for record in data['failed_batch_reviews']):
+                system+=WHOLE_VALUE_REVIEW_INSTRUCTION
         if data.get('personal_response_selection'):
             from .personal_task import PERSONAL_HISTORY_GUIDANCE, PERSONAL_READING_GUIDANCE, PERSONAL_AUDIT_GUIDANCE
             if data.get('phase')=='history_evidence':
@@ -728,6 +833,146 @@ class JointReader:
                 failures[row['variable'],row['id']]=failures[row['variable'],'*']
         return failures
 
+    @staticmethod
+    def _failed_required_rows(record):
+        required={}
+        for failure in record['failed']:
+            replacements=failure.get('replacement_observations',[])
+            if replacements:
+                for draft in replacements:
+                    protected=[counter for counter in failure.get('required_counter_observations',[])
+                        if isinstance(draft.get('source_ids'),list) and isinstance(draft.get('retract_ids'),list)
+                        and JointReader._counter_identity({**counter,'variable':record['variable']})==
+                           JointReader._counter_identity({**draft,'variable':record['variable']})]
+                    required[draft['id']]={'draft':draft,'duplicate':True,'counters':protected}
+            elif failure['id']!='*' and failure.get('observation') is not None:
+                required[failure['id']]={'draft':failure['observation'],
+                    'counters':failure.get('required_counter_observations',[])}
+        return required
+
+    def _failed_row_guard(self, row, record, visible, step):
+        item=self._failed_required_rows(record).get(row['id'])
+        if item:
+            counters=item.get('counters',[])
+            if counters and self._counter_identity(row) not in {
+                    self._counter_identity({**counter,'variable':row['variable']}) for counter in counters}:
+                raise ProtocolError('Failed-batch review cannot change a protected original counter relation')
+            if item.get('duplicate'):
+                try:
+                    old=self._observation(item['draft'],row['variable'],visible,step)
+                except (ValueError,KeyError,TypeError):
+                    old=None
+                if old and any(row[k]!=old[k] for k in set(old)-{'id','reason'}):
+                    raise ProtocolError('Failed duplicate review cannot discard a previously valid draft or counter')
+        for group in record.get('whole_value_reviews',[]):
+            for draft in group['draft_observations']:
+                if draft['id']==row['id'] and not set(draft['source_ids'])<=set(row['source_ids']):
+                    raise ProtocolError('Failed whole-value review must retain every original draft source')
+
+    def _failed_review_candidates(self, reviews, rows, data, failures):
+        offered={record['id'] for record in data.get('failed_batch_reviews',[]) if record['review_allowed']}
+        visible={self.e.mapper.sources[s['id']]['source_id'] for s in data['source_spans']}
+        candidates=set()
+        for variable,slot in reviews.items():
+            for rid in slot.get('resolved_failed_batch_ids',[]):
+                record=self.failed_batch_reviews.get(rid)
+                if rid not in offered or record is None or record['variable']!=variable:
+                    failures[variable,'*']='Failed-batch resolution requires an offered, paid same-task history review ID'
+                    continue
+                checked={row['id']:row for row in rows if row['variable']==variable}
+                required=self._failed_required_rows(record)
+                protected={self._counter_identity({**counter,'variable':variable})
+                    for failure in record['failed'] for counter in failure.get('required_counter_observations',[])}
+                accepted={self._counter_identity(row) for row in checked.values() if row['stance']=='contradiction'}
+                required_sources=set()
+                for failure in record['failed']:
+                    draft=failure.get('observation')
+                    capacity=(isinstance(draft,dict) and draft.get('stance')=='support'
+                              and failure['feedback'].startswith('citation_capacity:'))
+                    drafts=[*failure.get('observations',[]),*failure.get('required_counter_observations',[])]
+                    if isinstance(draft,dict) and not capacity:drafts.append(draft)
+                    for draft in drafts:
+                        ids=draft.get('source_ids',[]) if isinstance(draft,dict) else []
+                        if isinstance(ids,list):
+                            required_sources.update(s for s in ids if isinstance(s,str) and s in record['source_ids'])
+                covered={s for row in checked.values() for s in row['source_ids']}
+                if (not set(required)<=set(checked) or not any(row['source_ids'] for row in checked.values())
+                        or not set(record['source_ids'])<=visible or not protected<=accepted
+                        or not required_sources<=covered):
+                    failures[variable,'*']='Failed-batch resolution requires every original failed draft ID, its complete original text and a sourced scoped review'
+                    continue
+                if not any(key[0]==variable for key in failures):
+                    candidates.add(rid)
+        return candidates
+
+    def _failed_pending_after(self, resolved=()):
+        markers={key:set(value) for key,value in self.failed_obligations.items()}
+        for rid in resolved:
+            record=self.failed_batch_reviews[rid]
+            key=(record['query_identity'],record['batch_identity'])
+            markers.get(key,set()).discard(record['variable'])
+        return set().union(*markers.values())
+
+    def _release_failed_reviews(self, resolved):
+        for rid in resolved:
+            record=self.failed_batch_reviews.pop(rid)
+            key=(record['query_identity'],record['batch_identity'])
+            self.failed_obligations.get(key,set()).discard(record['variable'])
+            if key in self.failed_obligations and not self.failed_obligations[key]:
+                del self.failed_obligations[key]
+
+    def _store_failed_reviews(self, step, identity, batch, data, current, failures,
+                              observed, slots, duplicates, protected, whole, valid, frozen):
+        mapping={a:s['source_id'] for a,s in self.e.mapper.sources.items()}
+        sources=sorted({mapping[s['id']] for s in data['source_spans']}|
+                       {mapping[s['id']] for s in current['source_spans']})
+        for variable in {key[0] for key in failures}:
+            original=next((record for record in data.get('failed_batch_reviews',[])
+                           if record['variable']==variable and record['review_allowed']
+                           and record['id'] in self.failed_batch_reviews),None)
+            rid=original['id'] if original else 'failed_batch_'+digest([identity,digest(batch),variable])[:24]
+            entries=[]
+            for (v,key),error in failures.items():
+                if v!=variable:continue
+                item={'variable':v,'id':key,'feedback':error,
+                      'observation':deepcopy(observed.get((v,key)))}
+                if key=='*':item['slot']=deepcopy(slots.get(v))
+                if (v,key) in protected:
+                    item['required_counter_observations']=deepcopy(list(protected[v,key].values()))
+                if (v,key) in duplicates:
+                    item['observations']=deepcopy(duplicates[v,key])
+                    item['replacement_observations']=[{**deepcopy(row),'id':key+'~draft-'+digest(row)[:16]}
+                        for row in duplicates[v,key] if (v,key+'~draft-'+digest(row)[:16]) not in frozen]
+                entries.append(self._remap_review_sources(item,mapping))
+            if rid in self.failed_batch_reviews:
+                record=self.failed_batch_reviews[rid]
+                existing={item['id']:item for item in record['failed']}
+                for item in entries:
+                    if item['id'] not in existing:
+                        record['failed'].append(item)
+                        existing[item['id']]=item
+                        continue
+                    old=existing[item['id']]
+                    for field in ('required_counter_observations','observations','replacement_observations'):
+                        for draft in item.get(field,[]):
+                            if draft not in old.setdefault(field,[]):old[field].append(deepcopy(draft))
+                record['source_ids']=sorted(set(record['source_ids'])|set(sources))
+                if variable in whole:
+                    group=self._remap_review_sources(whole[variable],mapping)
+                    if group not in record['whole_value_reviews']:
+                        record['whole_value_reviews'].append(group)
+            else:
+                record={'id':rid,'variable':variable,'query_identity':identity,'batch_identity':digest(batch),
+                    'task_id':step['output_slot'],'phase':self._failed_phase(data),'source_ids':sources,
+                    'failed':entries,'validated_observations':deepcopy([row for row in valid if row['variable']==variable]),
+                    'whole_value_reviews':self._remap_review_sources([whole[variable]] if variable in whole else [],mapping),
+                    'seen_source_ids':sources,'seen_parent_signatures':[self._failed_parent_signature(variable)]}
+                if not any(item.get('observation') is not None for item in entries):
+                    record['invalid_response']=deepcopy((self.e.reasoner.last_response or {}).get('raw_output'))
+                self.failed_batch_reviews[rid]=record
+            key=(record['query_identity'],record['batch_identity'])
+            self.failed_obligations.setdefault(key,set()).add(variable)
+
     def _update_evidence_obligations(self, reviews, rows, data, failures, identity):
         """Carry unresolved evidence until an explicit, sourced scoped review."""
         offered={item['id'] for item in data.get('evidence_obligations',[])}
@@ -774,7 +1019,8 @@ class JointReader:
                 'source_ids':sources,'descriptions':sorted(set(previous.get('descriptions',[]))|set(descriptions)),
                 'origins':sorted(set(previous.get('origins',[]))|{identity})}
 
-    def _handoff_failures(self, rows, rejectable, prediction=None, semantic_result=None, *, pending=None):
+    def _handoff_failures(self, rows, rejectable, prediction=None, semantic_result=None, *, pending=None,
+                          resolved_failed=()):
         """Admit a new proof only if its mandatory next use can actually fit.
 
         This is a wire-capacity check, not a claim of semantic sufficiency. No
@@ -809,6 +1055,13 @@ class JointReader:
         probe.semantic_prediction=prediction
         probe.semantic_result=semantic_result
         probe.evidence_obligations=deepcopy(self.evidence_obligations)
+        probe.failed_batch_reviews={rid:deepcopy(record) for rid,record in self.failed_batch_reviews.items()
+                                    if rid not in resolved_failed}
+        probe.failed_obligations=deepcopy(self.failed_obligations)
+        for rid in resolved_failed:
+            record=self.failed_batch_reviews[rid]
+            key=(record['query_identity'],record['batch_identity'])
+            probe.failed_obligations.get(key,set()).discard(record['variable'])
         values,_,route_ids=proposed.valid()
         outcome=possible_outputs(proposed.program,values,max_states=probe_engine.s['max_enumeration_states'])
         active=set(controller.active(outcome))
@@ -951,8 +1204,16 @@ class JointReader:
         aliases = [a for a,s in self.e.mapper.sources.items() if s['doc_id'] in doc_ids
                    and (audit or (identity,a) not in self.read_states)]
         relevant_obligations=any(item['variable'] in variables for item in self.evidence_obligations.values())
+        failed_variables={record['variable'] for record in self.failed_batch_reviews.values()
+                          if record['variable'] in variables and record['task_id']==step['output_slot']}
+        recovery_ready=(not semantic and not audit and not terminal_output
+                        and self.failed_review_ready(step,variables,doc_ids))
+        if failed_variables and set(variables)<=failed_variables and not recovery_ready:
+            # A renamed query/checkpoint cannot buy fresh attempts for the same
+            # failed text. New original evidence and budget are both necessary.
+            return False
         if (not aliases and not semantic and not audit
-                and not (relevant_obligations and review_existing_obligations)):
+                and not recovery_ready and not (relevant_obligations and review_existing_obligations)):
             return False
         external_pending=set(self.state.pending)-self.pending_variables()
         for alias in aliases:
@@ -975,6 +1236,18 @@ class JointReader:
                 raise InputOverflow('Local sources/parents/counters exceed real wire capacity')
             del pending[:consumed]
             data=self._payload(step,query,variables,batch,semantic,audit=audit)
+            durable_reviews=[record for record in data.get('failed_batch_reviews',[]) if record['review_allowed']]
+            if durable_reviews:
+                # This is a repair of old drafts, not a free fresh read. It uses
+                # one repair from the new evidence window's finite allowance.
+                self.e.ledger.reserve('json_repairs',operation+'_repair')
+                for offered in durable_reviews:
+                    record=self.failed_batch_reviews[offered['id']]
+                    record['seen_source_ids']=sorted(set(record['seen_source_ids'])|
+                        {self.e.mapper.sources[s['id']]['source_id'] for s in data['source_spans']})
+                    signature=self._failed_parent_signature(record['variable'])
+                    if signature not in record['seen_parent_signatures']:
+                        record['seen_parent_signatures'].append(signature)
             visible={s['id']:s for s in data['source_spans']}
             valid, failures, completed, frozen = [], {}, set(), set()
             observed_rows, observed_slots, duplicate_rows, repair_inputs = {}, {}, {}, set()
@@ -985,7 +1258,7 @@ class JointReader:
             prediction=None
             semantic_result=None
             audit_verdict=None
-            max_repairs=self.e.s['max_repairs_per_request']
+            max_repairs=self.e.s['max_repairs_per_request']-bool(durable_reviews)
             for attempt in range(max_repairs+1):
                 prior_frozen=set(frozen)
                 reviews={}
@@ -996,7 +1269,7 @@ class JointReader:
                 visible={s['id']:s for s in current['source_spans']}
                 try:
                     wire=self._wire_data(current)
-                    response=self.e.reasoner.request(operation if attempt==0 else operation+'_repair',
+                    response=self.e.reasoner.request(operation if attempt==0 and not durable_reviews else operation+'_repair',
                         self._system(wire),wire,schema=self._schema(current),reserve=0 if audit else None)
                     if isinstance(response,dict) and isinstance(response.get('slots'),list):
                         # Repeating an identical draft is idempotent. Different
@@ -1061,13 +1334,16 @@ class JointReader:
                             raise ProtocolError('Duplicate/unrequested reading slot')
                         seen.add(variable)
                         observed_slots[variable]=deepcopy(slot)
-                        if (set(slot)-{'variable','observations','unresolved','resolved_obligation_ids'}
+                        if (set(slot)-{'variable','observations','unresolved','resolved_obligation_ids','resolved_failed_batch_ids'}
                                 or not {'variable','observations','unresolved'}<=set(slot)
                                 or not isinstance(slot['observations'],list) or not isinstance(slot['unresolved'],list)
                                 or any(not isinstance(g,str) for g in slot['unresolved'])
                                 or not isinstance(slot.get('resolved_obligation_ids',[]),list)
                                 or any(not isinstance(oid,str) for oid in slot.get('resolved_obligation_ids',[]))
-                                or len(set(slot.get('resolved_obligation_ids',[])))!=len(slot.get('resolved_obligation_ids',[]))):
+                                or len(set(slot.get('resolved_obligation_ids',[])))!=len(slot.get('resolved_obligation_ids',[]))
+                                or not isinstance(slot.get('resolved_failed_batch_ids',[]),list)
+                                or any(not isinstance(rid,str) for rid in slot.get('resolved_failed_batch_ids',[]))
+                                or len(set(slot.get('resolved_failed_batch_ids',[])))!=len(slot.get('resolved_failed_batch_ids',[]))):
                             next_failures[variable,'*']='Malformed slot';continue
                         reviews[variable]=slot
                         self.gaps[identity,variable]=list(slot['unresolved'])
@@ -1101,6 +1377,11 @@ class JointReader:
                                 next_failures[key]='Repair invented an unrequested observation';continue
                             try:
                                 normalized=self._observation(row,variable,visible,step,require_grounding=not audit)
+                                for offered in data.get('failed_batch_reviews',[]):
+                                    if (offered['review_allowed'] and offered['variable']==variable
+                                            and offered['id'] in slot.get('resolved_failed_batch_ids',[])):
+                                        self._failed_row_guard(normalized,
+                                            self.failed_batch_reviews[offered['id']],visible,step)
                                 if (key in protected_counters
                                         and self._counter_identity(normalized) not in protected_counters[key]):
                                     raise ProtocolError('Envelope repair cannot reclassify or change a source-validated counter draft')
@@ -1181,14 +1462,17 @@ class JointReader:
                         frozen.discard(key);resolved.discard(key);completed.discard(key[0])
                         next_failures[key]=error
                 before_obligations=deepcopy(self.evidence_obligations)
+                recovered=self._failed_review_candidates(observed_slots,valid,data,next_failures)
                 self._update_evidence_obligations(reviews,valid,current,next_failures,identity)
+                recovered={rid for rid in recovered if not any(
+                    key[0]==self.failed_batch_reviews[rid]['variable'] for key in next_failures)}
                 prospective_pending=(external_pending
                     |set().union(*[v for (i,a),v in self.unread_obligations.items() if i!=identity or a not in batch],
-                                 *self.failed_obligations.values())
+                                 self._failed_pending_after(recovered))
                     |{item['variable'] for item in self.evidence_obligations.values()}
                     |{key[0] for key in next_failures})
                 rejected=self._handoff_failures(valid,frozen-prior_frozen,prediction,semantic_result,
-                                                pending=prospective_pending)
+                                                pending=prospective_pending,resolved_failed=recovered)
                 if rejected:
                     self.evidence_obligations=before_obligations
                     valid=[row for row in valid if (row['variable'],row['id']) not in rejected]
@@ -1224,6 +1508,9 @@ class JointReader:
                         'attempt':attempt+1,'previous_response_identity':digest(previous)}}
                 if 'audit_instruction' in data:
                     current['audit_instruction']=data['audit_instruction']
+                if data.get('failed_batch_reviews'):
+                    current['failed_batch_reviews']=[deepcopy(record) for record in data['failed_batch_reviews']
+                                                      if record['variable'] in failed_variables]
                 offered_reviews=[deepcopy(group) for variable,group in whole_value_reviews.items()
                                  if variable in failed_variables]
                 if offered_reviews:
@@ -1255,6 +1542,11 @@ class JointReader:
                     for variable in terminal_variables:
                         failures[variable,'terminal_output']=terminal_error
             related={k[0] for k in failures}
+            recovered=self._failed_review_candidates(observed_slots,valid,data,failures)
+            # Release only after source/ID/counter validation AND every actual
+            # downstream handoff have passed. Legal counters are still applied
+            # below even when some other draft prevents releasing the marker.
+            self._release_failed_reviews(recovered)
             unresolved_whole=related&set(whole_value_reviews)
             if unresolved_whole:
                 # A repair that could not run or finish must retain its original
@@ -1263,12 +1555,12 @@ class JointReader:
                 self._update_evidence_obligations({v:{'observations':[],
                     'unresolved':['Complete-value disagreement remains unresolved; review the original scoped evidence without discarding conflicts.']}
                     for v in unresolved_whole},[],data,failures,identity)
-            # A later independent reading cannot erase a failed counter slot.
-            # Only this batch's scoped repair can settle its own failed rows.
+            # Unrelated successful reads never erase another batch's marker.
             for alias in batch:
                 self.unread_obligations.pop((identity,alias),None)
             if related:
-                self.failed_obligations.setdefault((identity,digest(batch)),set()).update(related)
+                self._store_failed_reviews(step,identity,batch,data,current,failures,
+                    observed_rows,observed_slots,duplicate_rows,protected_counters,whole_value_reviews,valid,frozen)
             # Apply all valid facts AND all counters before any residual check.
             self.clues.setdefault(identity, [])
             for row in valid:

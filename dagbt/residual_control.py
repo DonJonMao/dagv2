@@ -570,8 +570,9 @@ class ResidualControl:
                 for parent in self.state.routes[rid]['parent_versions']:
                     if parent not in related:
                         related.add(parent);frontier.append(parent)
-        return any(item['variable'] in related and identity not in item.get('origins',[])
-            for item in self.reader.evidence_obligations.values())
+        return (self.reader.failed_review_ready(step,related)
+            or any(item['variable'] in related and identity not in item.get('origins',[])
+                   for item in self.reader.evidence_obligations.values()))
 
     def run(self):
         if self.e.audit_complete and self.certificate is not None and self.certificate==self.candidate():
@@ -683,6 +684,10 @@ class ResidualControl:
                             executed=True;break
                         continue
                     if self.e.ledger.remaining('llm')<=self.e.s['reserved_audit_calls']:
+                        self.exhausted.add(key);continue
+                    if self.reader.failed_review_blocked(step,variables):
+                        # Extra ANN windows cannot repair a required failed
+                        # batch after its repair budget is unavailable.
                         self.exhausted.add(key);continue
                     if self.e.fixed_pool is not None:
                         local=self.e.fixed_pool
