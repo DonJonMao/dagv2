@@ -129,6 +129,14 @@ retract them, never an implicit union or overwrite. If the issue cannot be settl
 preserve it in slot.unresolved with its original evidence. Agreement is not required.
 '''
 
+WHOLE_VALUE_REFERENCE_INSTRUCTION = '''
+In repair_scope.whole_value_reviews, known_observation_ids replaces the list of
+known_observations with references in the same order. Resolve each ID to its
+unique top-level known_observations row (decode its table first, if present).
+The entire row is referenced, including its value, sources, parents, versions,
+revision ancestry and counters. References do not remove any review obligation.
+'''
+
 FAILED_BATCH_REVIEW_INSTRUCTION = '''
 failed_batch_reviews retain earlier FAILED reading drafts, their validation errors,
 and ALL original text. They are unresolved obligations, never supported facts.
@@ -646,6 +654,30 @@ class JointReader:
                 if size(rows)+len(COLUMNAR_INSTRUCTION.encode('utf-8'))<size(packed):
                     packed=rows
         known=packed.get('known_observations',[])
+        groups=packed.get('repair_scope',{}).get('whole_value_reviews',[])
+        if known and groups:
+            # The same complete routes otherwise occur both in the ordinary
+            # state and the whole-value repair envelope. Share only exact,
+            # uniquely identified copies; never rewrite a differing draft.
+            by_id={}
+            for row in known:
+                if isinstance(row,dict) and isinstance(row.get('id'),str):
+                    by_id.setdefault(row['id'],[]).append(row)
+            shared=deepcopy(packed)
+            changed=False
+            for group in shared['repair_scope']['whole_value_reviews']:
+                rows=group.get('known_observations',[])
+                if (not rows or 'known_observation_ids' in group
+                        or any(not isinstance(row,dict) or not isinstance(row.get('id'),str) for row in rows)
+                        or len({row['id'] for row in rows})!=len(rows)):
+                    continue
+                if all(len(by_id.get(row['id'],[]))==1
+                       and digest(row)==digest(by_id[row['id']][0]) for row in rows):
+                    group['known_observation_ids']=[row['id'] for row in rows]
+                    del group['known_observations']
+                    changed=True
+            if changed and size(shared)+len(WHOLE_VALUE_REFERENCE_INSTRUCTION.encode('utf-8'))<size(packed):
+                packed=shared
         if len(known)>=8 and all(isinstance(row,dict) and set(row)==set(known[0]) for row in known):
             # Histories can have many alternative proof routes. Their repeated
             # typed values/scopes/reasons dominate the context even when the
@@ -779,6 +811,8 @@ class JointReader:
         system=SYSTEM+(COLUMNAR_INSTRUCTION if 'source_span_columns' in data else '')
         if data.get('repair_scope',{}).get('whole_value_reviews'):
             system+=WHOLE_VALUE_REVIEW_INSTRUCTION
+            if any('known_observation_ids' in group for group in data['repair_scope']['whole_value_reviews']):
+                system+=WHOLE_VALUE_REFERENCE_INSTRUCTION
         if data.get('failed_batch_reviews'):
             system+=FAILED_BATCH_REVIEW_INSTRUCTION
             if any(record.get('whole_value_reviews') for record in data['failed_batch_reviews']):

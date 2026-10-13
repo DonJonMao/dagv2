@@ -54,7 +54,11 @@ def test_existing_ambiguous_routes_can_be_reviewed_without_a_new_support_draft()
             return response()
         group=data['repair_scope']['whole_value_reviews'][0]
         assert group['draft_observations']==[]
-        assert {row['id'] for row in group['known_observations']}==set(old_routes)
+        routes=group.get('known_observations')
+        if routes is None:
+            by_id={row['id']:row for row in data['known_observations']}
+            routes=[by_id[rid] for rid in group['known_observation_ids']]
+        assert {row['id'] for row in routes}==set(old_routes)
         counter=observation('superseded',['s1','s2'],stance='contradiction',
                             retract_ids=old_routes,reason='Both old accounts were incomplete scoped wholes.')
         counter['value']=None
