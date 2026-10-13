@@ -97,6 +97,12 @@ replacement ID exactly once. Those deterministic replacement IDs separate the
 original drafts; fix their validation errors without dropping any draft or counter.
 repair_scope.failed includes the actual invalid observation and
 its validation feedback. Correct those drafts in place, preserving each requested ID.
+An id="*" failure authorizes repairing that variable's whole slot, including new
+unique observation IDs for genuine additional reviews; it never unfreezes rows.
+Named failed IDs must each remain present, including an ID rejected as an
+unrequested addition in the previous response: it is now a required failed draft.
+Correct that draft under the same ID or preserve sourced partial/unknown evidence;
+do not delete it or add other IDs unless a wildcard or replacement list permits it.
 Already validated observations are frozen and must not be restated or changed.
 If repair_scope supplies required_counter_observations, preserve every original
 counter's stance, cited sources, scopes, actual parents and retraction targets.
@@ -190,6 +196,10 @@ SUMMARY_REVISION_INSTRUCTION = '''
 An explicitly declared personal_history_summary is a revisable representation of
 sourced history. Compatible additional facts do not contradict the older facts.
 Only summary_revision_contracts authorizes this request to revise such a summary:
+this permission exists only in phase=history_evidence. Terminal response selection
+and audit forbid summary_revision even for requested historical parent summaries.
+They may still report genuine sourced counters or conservative partial/unresolved
+issues; the phase restriction never permits discarding contrary evidence.
 return a support observation with summary_revision={supersedes_route_ids,
 previous_version,reason}, using exact offered route IDs and the current version.
 summary_revision_contracts.required_source_ids covers replacing ALL offered
@@ -215,7 +225,7 @@ In failed_batch_reviews this feedback describes the retained original failed
 observation; repair_scope describes the current attempted correction.
 retract_ids stays empty. This explicitly retires the older representation, not its
 facts. Never use revision to hide a genuine contradiction, unavailable evidence,
-or a different scope/parent version. Ordinary facts, terminal choices and audits
+or a different scope/parent version. Ordinary facts and all terminal/audit variables
 cannot use summary_revision. If a complete compatible account is not supported,
 return sourced partial/unresolved instead. Multiple new supports must agree on
 one whole value. Existing superseded_by links identify retired representations;
@@ -232,7 +242,8 @@ when source_documents is present, its metadata reference (dN), never source_ids.
 '''
 
 AUDIT_INSTRUCTION = ('Check actual facts and ALL known scoped counters against original sources. '
-    'Return audit_verdict=supported only if checked with no unresolved relevant issue; unknown otherwise. '
+    'Return audit_verdict=supported only if checked with no unresolved relevant issue; '
+    'conflict for an established relevant contradiction, or unknown when evidence is insufficient or unresolved. '
     'Include sourced corrections/retractions before verdict. Verify the proposed terminal output without silently replacing its option label.')
 
 OBSERVATION_TABLE_INSTRUCTION = '''
@@ -263,6 +274,9 @@ SCHEMA = {'type':'object','properties':{'slots':{'type':'array','items':{'type':
     'final_prediction':{'type':['string','null']},
     'semantic_answer':{},
     'audit_verdict':{'type':'string','enum':['supported','unknown','conflict']}},'required':['slots'],'additionalProperties':False}
+
+FROZEN_RESTATEMENT_ERROR = ('Already validated observations remain frozen: omit ordinary restatements; '
+    'use only explicitly offered reviewed_observation_ids when a further review needs them')
 
 
 class JointReader:
@@ -607,6 +621,8 @@ class JointReader:
         schema=deepcopy(SCHEMA)
         if data.get('phase')=='history_evidence':
             schema['properties']={'slots':schema['properties']['slots']}
+        if 'audit_instruction' in data:
+            schema['required'].append('audit_verdict')
         requested=list(data.get('requested_slots',data['variables']))
         item=schema['properties']['slots']['items']
         summary_contracts=data.get('summary_revision_contracts',{})
@@ -1509,13 +1525,13 @@ class JointReader:
             wire['summary_revision']=deepcopy(row['summary_revision'])
         return wire
 
-    def _offer_frozen_reviews(self, current, valid, frozen, feedback):
+    def _offer_frozen_reviews(self, current, valid, frozen, eligible_variables):
         """Offer only this batch's validated rows; durable records grant nothing."""
         offered={}
         visible={source['id']:source for source in current['source_spans']}
         for entry in current['repair_scope']['failed']:
             variable=entry['variable']
-            if entry['id']!='*' or variable not in feedback:
+            if entry['id']!='*' or variable not in eligible_variables:
                 continue
             originals=entry.get('slot',{}).get('observations',[])
             references=[];complete=[]
@@ -1544,7 +1560,7 @@ class JointReader:
         result=[];variable=slot['variable']
         for identifier in ids:
             if any(isinstance(item,dict) and item.get('id')==identifier for item in slot['observations']):
-                raise ProtocolError('A referenced frozen observation must not be restated or changed')
+                raise ProtocolError(FROZEN_RESTATEMENT_ERROR)
             key=(variable,identifier)
             row=offered.get(key)
             candidates=[item for item in valid if (item['variable'],item['id'])==key]
@@ -1819,12 +1835,40 @@ class JointReader:
                 break
         return prediction,semantic_result,error
 
+    def _mandatory_scope_payload(self, step, query, variables, doc_ids, identity, *,
+                                 semantic, audit, terminal_output):
+        """Validate a whole compose/audit scope before changing reader state.
+
+        Visibility is not authority to settle another query's unfinished work.
+        A legacy window outside this closure must finish in its original scope;
+        this interface does not migrate or narrow existing unread markers.
+        """
+        if doc_ids:
+            raise ProtocolError('mandatory_closure cannot be mixed with candidate doc_ids')
+        if not audit and step.get('execution')!='compose':
+            raise ProtocolError('mandatory_closure is restricted to compose or audit')
+        probe=copy(self)
+        probe.current_identity=identity
+        probe.current_terminal_output=terminal_output
+        data=probe._payload(step,query,variables,[],semantic,audit=audit)
+        aliases=[source['id'] for source in data['source_spans']]
+        requested=set(variables)
+        for (owner,alias),pending in self.unread_obligations.items():
+            if owner==identity and (alias not in aliases or not pending<=requested):
+                raise ProtocolError('mandatory_closure cannot replace incomplete same-query source or variable work')
+            if owner!=identity and pending&requested:
+                raise ProtocolError('mandatory_closure cannot settle relevant unread work owned by another query')
+        return data
+
     def read(self, step, query, variables, doc_ids, identity, *, semantic=False, audit=False,
-             terminal_output=False, review_existing_obligations=True):
+             terminal_output=False, review_existing_obligations=True, source_scope='document_windows'):
+        if source_scope not in ('document_windows','mandatory_closure'):
+            raise ProtocolError('Unknown reading source_scope')
         before=self.material_signature()
-        self.current_identity = identity
-        self.current_terminal_output=terminal_output
         operation = 'audit_joint' if audit else 'semantic_compose' if semantic else 'joint_read'
+        # Parent review slots do not turn a failed task output into new work.
+        task_variables={v for v in variables
+                        if self.state.program['variables'][v]['demand']==step['output_slot']}
         if not audit:
             values,_,ids=self.state.valid()
             related={v for v,d in self.state.program['variables'].items() if v in values and d['demand'] in step['inputs']}
@@ -1839,34 +1883,67 @@ class JointReader:
             # New local text can withdraw an actual grounding parent. Never
             # silently discard such a counter because it is outside local outputs.
             variables=list(dict.fromkeys([*variables,*sorted(related)]))
-        aliases = [a for a,s in self.e.mapper.sources.items() if s['doc_id'] in doc_ids
-                   and (audit or (identity,a) not in self.read_states)]
+        if source_scope=='mandatory_closure':
+            scope=self._mandatory_scope_payload(step,query,variables,doc_ids,identity,
+                semantic=semantic,audit=audit,terminal_output=terminal_output)
+            aliases=[source['id'] for source in scope['source_spans']]
+            local_failed={record['variable'] for record in scope.get('failed_batch_reviews',[])
+                          if record['task_id']==step['output_slot']} & task_variables
+            authorized={record['variable'] for record in scope.get('failed_batch_reviews',[])
+                        if record['review_allowed']}
+            # A successful sibling output cannot buy another attempt on a
+            # failed output. Each requested failed output needs its own current
+            # same-task/phase paid recovery offer; keep the full requested scope
+            # or refuse it, rather than silently dropping unfinished variables.
+            if local_failed-authorized:
+                return False
+            recovery_ready=bool(authorized)
+        else:
+            aliases=[a for a,s in self.e.mapper.sources.items() if s['doc_id'] in doc_ids
+                     and (audit or (identity,a) not in self.read_states)]
+            recovery_ready=(not semantic and not audit and not terminal_output
+                            and self.failed_review_ready(step,variables,doc_ids))
+        self.current_identity = identity
+        self.current_terminal_output=terminal_output
         relevant_obligations=any(item['variable'] in variables for item in self.evidence_obligations.values())
         failed_variables={record['variable'] for record in self.failed_batch_reviews.values()
                           if record['variable'] in variables and record['task_id']==step['output_slot']}
-        recovery_ready=(not semantic and not audit and not terminal_output
-                        and self.failed_review_ready(step,variables,doc_ids))
-        if failed_variables and set(variables)<=failed_variables and not recovery_ready:
+        if failed_variables and task_variables and task_variables<=failed_variables and not recovery_ready:
             # A renamed query/checkpoint cannot buy fresh attempts for the same
             # failed text. New original evidence and budget are both necessary.
             return False
-        if (not aliases and not semantic and not audit
+        if (source_scope=='document_windows' and not aliases and not semantic and not audit
                 and not recovery_ready and not (relevant_obligations and review_existing_obligations)):
             return False
         external_pending=set(self.state.pending)-self.pending_variables()
         for alias in aliases:
-            self.unread_obligations[identity,alias]=set(variables)
-        # Source windows are explicit partitions, with same-document neighbours.
+            if source_scope=='mandatory_closure':
+                # Preflight established full requested coverage; preserve the
+                # exact ownership of existing work, including on overflow.
+                self.unread_obligations.setdefault((identity,alias),set(variables))
+            else:
+                self.unread_obligations[identity,alias]=set(variables)
+        # Retrieval partitions document windows with neighbours. Compose/audit
+        # consumes its exact mandatory original-source closure in one batch.
         groups = []
-        for alias in aliases:
-            source = self.e.mapper.sources[alias]
-            adjacent = [self.e.mapper.source_aliases.get(source.get(k)) for k in ('previous_span_id','next_span_id')]
-            groups.append(list(dict.fromkeys([alias]+[a for a in adjacent if a])))
+        if source_scope=='mandatory_closure':
+            groups=[list(aliases)]
+        else:
+            for alias in aliases:
+                source = self.e.mapper.sources[alias]
+                adjacent = [self.e.mapper.source_aliases.get(source.get(k)) for k in ('previous_span_id','next_span_id')]
+                groups.append(list(dict.fromkeys([alias]+[a for a in adjacent if a])))
         if not groups:
             groups=[[]]
         pending = list(groups)
         while pending:
-            batch,consumed=self._fitting_prefix(operation,step,query,variables,pending,semantic,audit)
+            if source_scope=='mandatory_closure':
+                batch=list(pending[0])
+                self._fresh_initial_selection=None
+                trial=self._payload(step,query,variables,batch,semantic,audit=audit)
+                consumed=1 if self._fits(operation,trial) else 0
+            else:
+                batch,consumed=self._fitting_prefix(operation,step,query,variables,pending,semantic,audit)
             if not consumed:
                 self.batches.append({'operation':operation,'identity':identity,'status':'capacity_unavailable',
                                      'unread_source_aliases':pending})
@@ -1916,6 +1993,7 @@ class JointReader:
                 next_failures={}
                 next_source_feedback={}
                 reviewed_frozen={}
+                frozen_restatements=set()
                 visible={s['id']:s for s in current['source_spans']}
                 try:
                     wire=self._wire_data(current)
@@ -1998,6 +2076,10 @@ class JointReader:
                                 or len(set(slot.get('resolved_failed_batch_ids',[])))!=len(slot.get('resolved_failed_batch_ids',[]))):
                             next_failures[variable,'*']='Malformed slot';continue
                         reviews[variable]=slot
+                        if any(isinstance(row,dict) and isinstance(row.get('id'),str)
+                               and (variable,row['id']) in frozen for row in slot['observations']):
+                            frozen_restatements.add(variable)
+                            next_failures[variable,'*']=FROZEN_RESTATEMENT_ERROR
                         try:
                             reviewed_frozen[variable]=self._reviewed_frozen_rows(
                                 slot,current,offered_frozen,valid,frozen,visible)
@@ -2028,11 +2110,13 @@ class JointReader:
                                 next_failures[key]='Duplicate observation ID remains ambiguous; all original drafts must be preserved'
                                 continue
                             if key in frozen:
+                                next_failures[variable,'*']=FROZEN_RESTATEMENT_ERROR
                                 continue
                             observed_rows[key]=deepcopy(row)
                             replacement_keys={k for keys in duplicate_replacements.values() for k in keys}
                             if attempt and (variable,'*') not in failures and key not in failures and key not in replacement_keys:
-                                next_failures[key]='Repair invented an unrequested observation';continue
+                                next_failures[key]=('Repair invented an unrequested observation; this ID is now a named '
+                                    'failed draft. Preserve and correct it in the next repair; do not delete it.');continue
                             try:
                                 normalized=self._observation(row,variable,visible,step,require_grounding=not audit,
                                     allow_summary_revision=not audit and current.get('phase')=='history_evidence')
@@ -2207,7 +2291,12 @@ class JointReader:
                     # serialized size is subject to the same input limit.
                     current['repair_scope']['invalid_response']=deepcopy(
                         (self.e.reasoner.last_response or {}).get('raw_output'))
-                offered_frozen=self._offer_frozen_reviews(current,valid,frozen,obligation_feedback)
+                # A restatement error is a slot repair, not a demand to submit
+                # the frozen row again. Re-offer only this response's confirmed
+                # restatements, while an unrelated failure revokes that reason.
+                reference_variables=set(obligation_feedback)|{v for v in frozen_restatements
+                    if failures.get((v,'*'))==FROZEN_RESTATEMENT_ERROR}
+                offered_frozen=self._offer_frozen_reviews(current,valid,frozen,reference_variables)
                 semantic_repair=deepcopy(current)
                 semantic_repair['repair_scope'].pop('attempt')
                 semantic_repair['repair_scope'].pop('previous_response_identity')

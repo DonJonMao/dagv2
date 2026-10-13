@@ -451,7 +451,11 @@ def test_paid_durable_review_keeps_its_authorization_during_its_remaining_local_
             return whole_review_response(data, drop_source=True)
         assert 'repair_scope' in data
         assert offered_ids[0] == offered, 'Updating seen-source state cannot revoke this already-paid local repair'
-        return whole_review_response(data)
+        result = whole_review_response(data)
+        failed_ids = {row['id'] for row in data['repair_scope']['failed']}
+        result['slots'][0]['observations'] = [
+            row for row in result['slots'][0]['observations'] if row['id'] in failed_ids]
+        return result
     calls.respond = review_then_correct
     reader.read(engine.steps[0], 'Review historical activities', ['history'],
                 ['advice'], 'new-evidence-then-local-correction', review_existing_obligations=True)

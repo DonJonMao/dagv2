@@ -372,14 +372,17 @@ def test_changed_failed_observation_can_repair_again_and_validated_row_is_frozen
     bad2 = observation("repair-me", ["unavailable-second"])
     changed_good = observation("accepted", ["s1"], ["invented new activity"])
     outputs = [response(good, bad1), response(changed_good, bad2),
-               response(changed_good, observation("repair-me", ["s1"]))]
+               response(observation("repair-me", ["s1"]))]
     reader, engine, state, calls = fixture(lambda index, data: deepcopy(outputs[index - 1]))
     assert read(reader)
     assert len(calls.requests) == 3
     repairs = [request["data"]["repair_scope"] for request in calls.requests[1:]]
     assert [repair["attempt"] for repair in repairs] == [1, 2]
     assert repairs[0]["previous_response_identity"] != repairs[1]["previous_response_identity"]
-    assert [repair["failed"][0]["observation"] for repair in repairs] == [bad1, bad2]
+    assert [next(row["observation"] for row in repair["failed"]
+                 if row["id"] == "repair-me") for repair in repairs] == [bad1, bad2]
+    assert any(row["id"] == "*" and "frozen" in row["feedback"].lower()
+               for row in repairs[1]["failed"])
     assert all(row["id"] != "accepted" for repair in repairs for row in repair["failed"])
     assert engine.ledger.used["json_repairs"] == 2
     assert state.valid()[0]["history"] == ["piano"]

@@ -423,15 +423,12 @@ class ResidualControl:
         return outcome,active
 
     def audit(self,certificate=None):
-        values, sources, _=self.state.valid()
         if certificate:
             variables=set(certificate['binding_dependencies'])-set(self.state.program.get('task_expressions',{}))
             if certificate.get('rule_assumptions'):
                 variables.add(certificate['rule_assumptions']['variable'])
-            source_ids=certificate['source_ids']
         else:
             variables=self.semantic_dependencies()-set(self.state.program.get('task_expressions',{}))
-            source_ids=sorted({s for v in variables for s in sources.get(v,[])})
         # Call counters/history and duplicate counter records do not constitute
         # new evidence. A changed answer, real route or counter does.
         routes=[]
@@ -452,20 +449,13 @@ class ResidualControl:
             self.audit_replayed=True
             return False
         self.audited.add(key)
-        doc_ids=list(dict.fromkeys(self.e.spans[s]['doc_id'] for s in source_ids))
-        # Include every known relevant counter, including revoked routes.
-        for r in self.state.routes.values():
-            if r['variable'] in variables:
-                for sid in r['source_ids']:
-                    d=self.e.spans[sid]['doc_id']
-                    if d not in doc_ids:doc_ids.append(d)
-                for counter in r['revoked']:
-                    for sid in counter['source_ids']:
-                        d=self.e.spans[sid]['doc_id']
-                        if d not in doc_ids:doc_ids.append(d)
         step={**next(s for s in self.e.steps if s['output_slot']==self.e.final_node_id),
               'inputs':[s['output_slot'] for s in self.e.steps if s['output_slot']!=self.e.final_node_id]}
-        self.reader.read(step,self.e.q['question'],sorted(variables),doc_ids,key,audit=True)
+        # Reproduce the full reader closure, including every relevant route,
+        # revoked-route counter, obligation and the existing audit parents.
+        # A proof span does not select every other span in its source document.
+        self.reader.read(step,self.e.q['question'],sorted(variables),[],key,audit=True,
+            source_scope='mandatory_closure')
         relevant=[b for b in self.reader.batches if b['identity']==key and b['operation']=='audit_joint']
         self.e.audit_complete=bool(relevant) and all(b.get('audit_complete') for b in relevant)
         return self.e.audit_complete
@@ -651,7 +641,9 @@ class ResidualControl:
                     continue
                 _, sources, _=self.state.valid()
                 parent_vars=[v for p in step['inputs'] for v in self.demand_variables(p)]
-                parent_docs=list(dict.fromkeys(self.e.spans[s]['doc_id'] for v in parent_vars for s in sources.get(v,[])))
+                compose=step['execution']=='compose'
+                parent_docs=[] if compose else list(dict.fromkeys(
+                    self.e.spans[s]['doc_id'] for v in parent_vars for s in sources.get(v,[])))
                 identity={'algorithm':self.e.s['algorithm_version'],'query':query,'node_id':nid,
                     'program_revision':self.state.revision,'program_identity':digest(self.state.program),
                     'initial_dag_identity':digest(self.e.steps),'bindings':{v:self.state.versions[v] for v in parent_vars},
@@ -666,10 +658,12 @@ class ResidualControl:
                     continue
                 try:
                     before_read=self.reader.material_signature()
-                    if self.read_progress(step,query,variables,list(dict.fromkeys(self.local_pools.get(nid,[])+parent_docs)),key,
+                    local_docs=list(dict.fromkeys(self.local_pools.get(nid,[])+parent_docs))
+                    if self.read_progress(step,query,variables,local_docs,key,
                             semantic=semantic and nid==self.e.final_node_id and step['execution']=='compose',
                             terminal_output=nid==self.e.final_node_id and self.e.output_options is not None,
-                            review_existing_obligations=self.review_existing_obligations(step,variables,key)):
+                            review_existing_obligations=self.review_existing_obligations(step,variables,key),
+                            source_scope='mandatory_closure' if compose else 'document_windows'):
                         self.forced_demands.discard(nid)
                         self.visited.update([nid] if self.local_complete(nid) else []);executed=True;break
                     self.forced_demands.discard(nid)

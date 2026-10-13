@@ -118,6 +118,9 @@ def test_paid_durable_review_remains_authorized_for_its_one_remaining_local_repa
             result['slots'][0]['observations'][0]['entity_scope']='mistyped-scope'
         else:
             assert 'repair_scope' in data
+            failed_ids={row['id'] for row in data['repair_scope']['failed']}
+            result['slots'][0]['observations']=[row for row in result['slots'][0]['observations']
+                                                if row['id'] in failed_ids]
         return result
     calls.respond=review
     reader.read(engine.steps[0],'Review histories with new original text',['history'],['advice'],'deferred-repair')

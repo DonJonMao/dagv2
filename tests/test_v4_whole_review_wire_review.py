@@ -142,10 +142,12 @@ def long_summary_reader(*, repetitions=18):
 
 
 def test_real_whole_repair_request_uses_references_and_preserves_original_review_semantics():
-    # Exercise real reference encoding and semantic repair without coupling
-    # admission to unrelated SYSTEM prose. The exact 16k threshold is tested
-    # separately below, with both configured 4096 output reserves unchanged.
-    reader, engine, state, calls, original, value = long_summary_reader(repetitions=8)
+    # This case verifies lossless long-value references and semantic repair.
+    # Give that fixture room instead of repeatedly shrinking its value when
+    # protocol instructions grow. The helper and the separate capacity case
+    # below keep 16k and both 4096 output reserves; this is no 16k fit claim.
+    reader, engine, state, calls, original, value = long_summary_reader()
+    engine.s['context_tokens'] = 32768
     expanded = value + ' The user also enjoyed painting last spring.'
     def reply(index, data):
         if index == 1:

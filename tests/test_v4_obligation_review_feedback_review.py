@@ -204,7 +204,8 @@ def test_identical_scope_does_not_authorize_a_different_variables_frozen_observa
 
 def test_failure_keeps_exact_durable_sources_but_does_not_grant_free_or_cross_batch_refs():
     reader, engine, state, calls, aliases = obligation_fixture()
-    calls.respond = lambda index, data: claim(observation(PROOF, aliases[:3]))
+    calls.respond = lambda index, data: (claim(observation(PROOF, aliases[:3]))
+                                         if index == 1 else claim(refs=[PROOF]))
     read_issue(reader, engine)
     assert len(calls.requests) == 2 and OID in reader.evidence_obligations
     checkpoint = json.loads(json.dumps(reader.obligation_snapshot()))
