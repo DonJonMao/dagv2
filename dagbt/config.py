@@ -2,7 +2,7 @@
 from __future__ import annotations
 from collections.abc import Mapping
 from copy import deepcopy
-from .methods import capabilities, terminal_method, UNSCORED, JOINT, RESIDUAL
+from .methods import capabilities, terminal_method, UNSCORED, JOINT, RESIDUAL, RESIDUAL_V2
 
 DEFAULTS = {
     'algorithm_version': 'dagbt_fusion_reliability_v3',
@@ -47,7 +47,7 @@ METHODS = {
     'fusion_chain': {'reader_chain': True},
     'fusion_navigation_closure': {'navigation_closure': True},
 }
-for _method in (UNSCORED, JOINT, RESIDUAL):
+for _method in (UNSCORED, JOINT, RESIDUAL, RESIDUAL_V2):
     METHODS[_method] = {**METHODS['dagbt_local_terminal_v1'],
         'algorithm_version': _method, 'proxy_mode': 'none', 'set_score_calls': 0}
 

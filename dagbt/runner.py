@@ -117,7 +117,7 @@ def frozen_sources():
         paths.append(ROOT / "scripts" / "run_v3.sh")
     paths.extend(ROOT / 'scripts' / name for name in ('smoke_local_terminal.py','demo_local_terminal.py',
         'benchmark_bt_reranker_prefix_cache.py','smoke_residual_memory.py','demo_residual_memory.py',
-        'ablate_residual_memory.py') if (ROOT / 'scripts' / name).is_file())
+        'ablate_residual_memory.py','personamem_v4.py') if (ROOT / 'scripts' / name).is_file())
     paths.append(ROOT / 'serving' / 'bt_prefix_cache_probe.py')
     return {str(p.relative_to(ROOT)): file_hash(p) for p in sorted(set(paths))}
 
@@ -663,7 +663,8 @@ def native_worker(connection, dataset, arm, config):
                     # the legacy Reader's "one option label only" instruction.
                     output_question = q["user_question"] if terminal_method(arm) else q["question"]
                     row = run_question(generation_question, question_resources, calls, e.CONFIG,
-                                       method=arm, reader_question=output_question, output_options=q['options'])
+                                       method=arm, reader_question=output_question, output_options=q['options'],
+                                       task_kind='personal_response_selection')
                 else:
                     row = run_question(generation_question, question_resources, calls, e.CONFIG, method=arm)
             if memory_scopes is not None:
@@ -701,17 +702,43 @@ class Worker:
         if self.process is not None and self.process.is_alive():
             return
         self.close()
-        parent, child = self.context.Pipe()
-        self.connection = parent
-        self.process = self.context.Process(target=self.target, args=(child, self.dataset, self.arm, self.config), daemon=True)
-        self.process.start()
-        child.close()
-        timeout = self.config.get("experiment", {}).get("worker_startup_timeout_seconds", 300)
-        message = self._receive(timeout)
-        if message.get("type") != "ready":
+        child = None
+        handlers, pending = {}, {}
+        try:
+            try:
+                # Process.start can already have created an OS child while
+                # Process.pid is still unset. An asynchronous Python stop
+                # exception in that interval loses the only cleanup handle.
+                # Delay callable stop handlers until registration finishes.
+                # Do not block signals with pthread_sigmask: the spawned
+                # interpreter would inherit that mask and resist terminate().
+                import threading
+                if (threading.current_thread() is threading.main_thread()
+                        and self.context.get_start_method() == "spawn"):
+                    for signum in (signal.SIGINT, signal.SIGTERM):
+                        handler = signal.getsignal(signum)
+                        if callable(handler):
+                            handlers[signum] = handler
+                            signal.signal(signum, lambda number, frame: pending.setdefault(number, frame))
+                parent, child = self.context.Pipe()
+                self.connection = parent
+                self.process = self.context.Process(target=self.target, args=(child, self.dataset, self.arm, self.config), daemon=True)
+                self.process.start()
+            finally:
+                if child is not None:
+                    child.close()
+                for signum, handler in handlers.items():
+                    signal.signal(signum, handler)
+                for signum, frame in pending.items():
+                    handlers[signum](signum, frame)
+            timeout = self.config.get("experiment", {}).get("worker_startup_timeout_seconds", 300)
+            message = self._receive(timeout)
+            if message.get("type") != "ready":
+                raise RuntimeError("Worker preparation failed: " + json.dumps(message))
+            self.hashes = message.get("hashes", {})
+        except BaseException:
             self.close()
-            raise RuntimeError("Worker preparation failed: " + json.dumps(message))
-        self.hashes = message.get("hashes", {})
+            raise
 
     def _receive(self, timeout):
         if not self.connection.poll(timeout):
@@ -739,7 +766,7 @@ class Worker:
             raise
 
     def close(self):
-        if self.process is not None:
+        if self.process is not None and self.process.pid is not None:
             if self.process.is_alive():
                 self.process.terminate()
                 self.process.join(3)
@@ -1341,6 +1368,29 @@ def validate_experiment_options(config, args):
             raise ValueError("Activation-scored Bridge arms require a configured pointwise reranker")
     if args.limit is not None and args.limit <= 0:
         raise ValueError("--limit must be positive")
+    if args.limit is not None and getattr(args, 'question_ids_file', None):
+        raise ValueError('Use either --limit or --question-ids-file, not both')
+
+
+def experiment_questions(args):
+    """Select public IDs explicitly for reproducible stratified smoke tests."""
+    selection = getattr(args, 'question_ids_file', None)
+    if not selection:
+        return {d: load_questions(d, args.limit) for d in args.datasets}
+    selected = load(selection)
+    if not isinstance(selected, dict) or set(selected) != set(args.datasets):
+        raise ValueError('Question ID file must map each requested dataset to its ordered ID list')
+    scopes = {}
+    for dataset in args.datasets:
+        ids = selected[dataset]
+        if (not isinstance(ids, list) or not ids or any(not isinstance(u, str) for u in ids)
+                or len(ids) != len(set(ids))):
+            raise ValueError('Question IDs must be nonempty, unique strings')
+        public = {q['id']: q for q in load_questions(dataset)}
+        if set(ids) - set(public):
+            raise ValueError('Question ID file contains unknown public questions')
+        scopes[dataset] = [public[u] for u in ids]
+    return scopes
 
 
 def run_experiment(args):
@@ -1353,12 +1403,13 @@ def run_experiment(args):
         save(output / "pid.json", {"pid": os.getpid(), "pgid": os.getpgrp(), "started_unix": time.time(),
                                   "output": str(output), "process_command": process_command})
         save(output / "progress.json", {"state": "validating", "updated_unix": time.time()})
-        scopes = {d: load_questions(d, args.limit) for d in datasets}
+        scopes = experiment_questions(args)
         manifest = {"schema": 1, "config": config, "datasets": datasets, "arms": arms,
                     "question_ids": {d: [q["id"] for q in qs] for d, qs in scopes.items()},
                     "questions_digest": {d: digest(qs) for d, qs in scopes.items()}, "source_hashes": frozen_sources(),
                     "original_hash_manifest": file_hash(ROOT / "original_manifest.json"),
-                    "scope": "all_packaged_questions_per_dataset" if args.limit is None else f"first_{args.limit}_per_dataset",
+                    "scope": ("explicit_public_question_ids" if getattr(args, 'question_ids_file', None) else
+                              "all_packaged_questions_per_dataset" if args.limit is None else f"first_{args.limit}_per_dataset"),
                     "dataset_manifests": {d: file_hash(ROOT / "data" / d / "manifest.json")
                                           for d in datasets if d == "personamem"},
                     "baseline": ("native make_plan/native.solve; original archive algorithm with query-dimension guard tied to new index; shared BT model/resource adapter replaces backend protocol, token accounting and corpus vectors"
@@ -1505,6 +1556,7 @@ def launch(args):
     output = Path(args.output).resolve()
     config = validate_config(load(args.config))
     validate_experiment_options(config, args)
+    experiment_questions(args)
     if lock_is_held(output):
         raise RuntimeError("Output already has a live experiment")
     report = preflight(config, args.datasets, endpoints=not args.offline_preflight, output=output, arms=args.arms)
@@ -1513,6 +1565,8 @@ def launch(args):
     command = [sys.executable, "-m", "dagbt.runner", "run", "--config", str(Path(args.config).resolve()), "--output", str(output), "--datasets", *args.datasets, "--arms", *args.arms]
     if args.limit is not None:
         command += ["--limit", str(args.limit)]
+    if getattr(args, 'question_ids_file', None):
+        command += ['--question-ids-file', str(Path(args.question_ids_file).resolve())]
     if args.retry_failed:
         command += ["--retry-failed"]
     if args.offline_preflight:
@@ -1535,6 +1589,7 @@ def main(argv=None):
             command.add_argument("--output", required=True)
             command.add_argument("--arms", nargs="+", default=["original", "fusion"])
             command.add_argument("--limit", type=int)
+            command.add_argument('--question-ids-file', help='JSON object mapping dataset names to ordered public question IDs')
             command.add_argument("--retry-failed", action="store_true")
     for name in ("status", "stop", "diagnostics"):
         command = sub.add_parser(name)

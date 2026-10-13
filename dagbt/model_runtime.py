@@ -24,7 +24,7 @@ TOKEN_ESTIMATOR_ID = "regex_word_or_punctuation_v1"
 EVIDENCE_TOKEN_ESTIMATOR_ID = "regex_or_utf8_bytes_div3_v2"
 REASONING_MARKER = "_dagbt_evidence_reasoning"
 DEFAULT_BT_LLM_ENDPOINT = "http://111.19.156.30:8006/v1/chat/completions"
-DEFAULT_BT_LLM_API_KEY = "Aa@11111"
+DEFAULT_BT_LLM_API_KEY = ""  # Deployment credentials come from environment/local file only.
 
 
 def is_bridgetree(config: Mapping[str, Any]) -> bool:
@@ -207,7 +207,7 @@ def normalize_response(response: Mapping[str, Any], legacy_text_response: bool =
 
 
 def resolve_api_key(config: Mapping[str, Any], kind: str) -> str:
-    """Environment, deployed BT LLM default, then endpoint-bound local credentials."""
+    """Explicit environment, then endpoint-bound local credentials; no embedded key."""
     env_names = {"llm": ("DAG_LLM_API_KEY", "BRIDGETREE_CHAT_API_KEY"),
                  "embedding": ("DAG_EMBED_API_KEY",), "reranker": ("DAG_RERANK_API_KEY",)}
     if kind not in env_names:
@@ -218,8 +218,6 @@ def resolve_api_key(config: Mapping[str, Any], kind: str) -> str:
     endpoint = (str(config.get("llm_base_url", "")).rstrip("/") + "/chat/completions" if kind == "llm"
                 else str(config.get("embedding_base_url", "")).rstrip("/") + "/embeddings" if kind == "embedding"
                 else config.get("reranker", {}).get("url"))
-    if kind == "llm" and is_bridgetree(config) and endpoint == DEFAULT_BT_LLM_ENDPOINT:
-        return DEFAULT_BT_LLM_API_KEY
     configured = config.get("credentials_file")
     if not configured:
         return ""

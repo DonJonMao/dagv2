@@ -5,6 +5,7 @@ LOCAL = 'dagbt_local_terminal_v1'
 UNSCORED = 'dagbt_local_terminal_proxy_free_v1'
 JOINT = 'dagbt_joint_memory_v1'
 RESIDUAL = 'dagbt_residual_memory_v1'
+RESIDUAL_V2 = 'dagbt_residual_memory_v2'
 
 
 @dataclass(frozen=True)
@@ -20,6 +21,7 @@ _CAPABILITIES = {
     UNSCORED: Capabilities(terminal=True, scoring=False),
     JOINT: Capabilities(terminal=True, scoring=False, joint_reading=True),
     RESIDUAL: Capabilities(terminal=True, scoring=False, joint_reading=True, residual_control=True),
+    RESIDUAL_V2: Capabilities(terminal=True, scoring=False, joint_reading=True, residual_control=True),
 }
 
 

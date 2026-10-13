@@ -2,7 +2,7 @@
 from copy import deepcopy
 from . import local_terminal
 from .residual import (validate_program, validate_output_contract, variable_scope,
-                       validate_scope, ProgramError, references, UNITS)
+                       validate_scope, validate_program_contract, ProgramError, references, UNITS)
 from .reasoning import ProtocolError
 
 PLAN_SYSTEM = local_terminal.PLAN_SYSTEM.replace('Do not include extra fields.', '') + '''
@@ -40,6 +40,30 @@ Expressions ONLY use {op:const,value:...}, {op:var,id:...}, {op:and/or/not/eq/ne
 or {op:record/failures/one_reason,fields:{name:expression}}. No code.
 Use symbolic value mode for ordinary sourced facts/entity chains and comparisons.
 For genuinely open advice use semantic mode, with the terminal text variable as expression.
+one_reason and all_failures are ONLY Boolean-witness operators over named conditions:
+one_reason requires expression={op:one_reason,fields:{name:boolean_expression,...}}
+and result_type=record; its result has exactly decision and reason. all_failures
+requires expression={op:failures,fields:{name:boolean_expression,...}} and result_type=set;
+its result lists all failed condition names. These modes do NOT mean an ordinary
+natural-language explanation, a historical reason, or a list of personalized reasons.
+Use value for sourced explanation text/lists, or semantic for an open synthesis.
+The expression's declared result type must match output_contract.result_type,
+including an initial rule-bound placeholder; tuple expressions produce arrays (set).
+For symbolic modes without a rule_binding completion route, rules_complete=false
+is allowed only for necessary-condition and/one_reason programs that can certify
+a negative witness; it can never certify a positive or exhaustive result.
+Semantic mode is assessed from supported evidence and never receives a symbolic
+completeness certificate. Do not mark rules complete
+unless their completeness is justified by the task or applicable original evidence.
+rules_complete describes the completeness of the solving relation/decision rules,
+NOT corpus completeness, retrieval coverage, confidence, or whether factual input
+values are already known. For a direct sourced fact/entity lookup, or a fixed
+comparison/composition whose full function is specified by the question, the
+solving relation is complete even while all its factual inputs are still unbound:
+set rules_complete=true (or omit it). Missing facts remain unknown variables and
+require sources. Use false only when applicable decision rules themselves must
+still be obtained from memory through rule_binding, or for the explicit permitted
+negative-witness case. Never invent thresholds, source values, or completeness.
 Rules from memory: do NOT invent thresholds. Plan a rule task and all foreseeable
 condition-checking tasks with that rule as an unbound parent. Set rules_complete=false.
 rule_binding={variable:rule_variable,condition_demands:[preplanned task IDs]} permits a
@@ -108,14 +132,16 @@ def validate_plan(value, legacy_validate):
     return {**plan, 'output_contract':contract, 'program':program}
 
 
-def validate_bindings(program, steps, final_node_id, *, contract=None):
+def validate_bindings(program, steps, final_node_id, *, contract=None,
+                      rule_completion_available=False):
+    program = validate_program(program)
     tasks = {s['output_slot']:s for s in steps}
     for declaration in program['variables'].values():
         if set(declaration) - {'type','demand','domain','open','unit','scope'}:
             raise ProgramError('Unknown variable declaration metadata')
         if 'scope' in declaration:
             validate_scope(declaration['scope'])
-        if declaration.get('demand') not in tasks:
+        if not isinstance(declaration.get('demand'), str) or declaration['demand'] not in tasks:
             raise ProgramError('Variable demand must belong to the preplanned DAG')
         if (contract is not None and declaration['demand'] == final_node_id
                 and variable_scope(declaration, contract) != {
@@ -131,11 +157,14 @@ def validate_bindings(program, steps, final_node_id, *, contract=None):
         if not isinstance(binding, dict) or set(binding) != {'variable','condition_demands'}:
             raise ProgramError('Rule binding needs variable and preplanned condition_demands')
         variable = binding['variable']
-        if variable not in program['variables'] or program['variables'][variable]['type'] != 'rule':
+        if (not isinstance(variable, str) or variable not in program['variables']
+                or program['variables'][variable]['type'] != 'rule'):
             raise ProgramError('Rule binding variable must be declared as rule')
         demand = program['variables'][variable]['demand']
         conditions = binding['condition_demands']
-        if not isinstance(conditions, list) or not conditions or len(set(conditions)) != len(conditions):
+        if (not isinstance(conditions, list) or not conditions
+                or any(not isinstance(c, str) for c in conditions)
+                or len(set(conditions)) != len(conditions)):
             raise ProgramError('Rule needs unique preplanned condition tasks')
         if any(c not in tasks or demand not in tasks[c]['inputs'] for c in conditions):
             raise ProgramError('Every condition task must declare its unbound rule input')
@@ -147,4 +176,8 @@ def validate_bindings(program, steps, final_node_id, *, contract=None):
     if any(program['variables'][v]['demand'] not in closure(final_node_id)
            for v in references(program['expression'])):
         raise ProgramError('Output expression is outside terminal DAG dependencies')
+    if contract is not None:
+        validate_program_contract(program, contract,
+            allow_rule_placeholder=binding is not None,
+            rule_completion_available=rule_completion_available or binding is not None)
     return deepcopy(program)

@@ -1,7 +1,7 @@
 """Local fact-and-source reading, bounded by the actual reasoning wire input."""
-from copy import deepcopy
+from copy import copy, deepcopy
 import json
-from .residual import validate_value, ProgramError, UNITS
+from .residual import validate_value, possible_outputs, ProgramError, UNITS
 from .reasoning import ProtocolError, InputOverflow, RefusalError, OutputTruncated
 from .budget import BudgetExceeded
 from .support import make_span, validate_span
@@ -28,6 +28,13 @@ expand source_documents[doc_id] for that span's original doc_id and time_metadat
 Its text, offsets, source_role and source_message_indices remain on the span.
 Document aliases (such as d1) are metadata references, NEVER source_ids.
 Support requires explicit applicable original text, not retrieval count or guesswork.
+source_ids must be the shortest sufficient set of original spans establishing the
+claimed value and its scope. Cite every necessary joint premise, but never cite
+an entire reading window just because all of it was visible. An oversized proof
+cannot be forwarded or audited: a citation_capacity repair must recheck the SAME
+draft against all supplied original text and return a genuinely sufficient smaller
+proof, or partial/unresolved if no such proof exists. Never delete a necessary
+premise merely to fit a size limit, and never remove a counter to save space.
 Each support value asserts the WHOLE value of that variable, including set/record
 variables. Multiple support observations are alternative proofs of the SAME complete
 value, not additive fragments. Combine applicable sources into one complete value
@@ -81,9 +88,20 @@ have null labels.
 Repair returns only failed observations/slots, retaining IDs; never delete an invalid
 counter-observation. If a failed ID has conflicting duplicate observations, inspect
 ALL supplied drafts and resolve that ID without discarding potential counterevidence.
+If repair_scope supplies replacement_observations for a duplicated ID, return EACH
+replacement ID exactly once. Those deterministic replacement IDs separate the
+original drafts; fix their validation errors without dropping any draft or counter.
 repair_scope.failed includes the actual invalid observation and
 its validation feedback. Correct those drafts in place, preserving each requested ID.
 Already validated observations are frozen and must not be restated or changed.
+evidence_obligations are outstanding scoped issues from earlier reads, not new
+facts. Their original sources MUST be examined even under a new query identity.
+To discharge an issue, explicitly return its id in that variable's optional
+resolved_obligation_ids, leave no unresolved issue in the slot, and provide
+supported/corrective/irrelevant observations reviewing its cited original sources.
+An empty slot does not resolve an earlier issue. Do not assert hypothetical
+whole-corpus exhaustiveness requirements; scoped sufficient evidence may resolve
+a missing-evidence issue without having read every memory.
 '''
 
 COLUMNAR_INSTRUCTION = '''
@@ -96,7 +114,15 @@ when source_documents is present, its metadata reference (dN), never source_ids.
 
 AUDIT_INSTRUCTION = ('Check actual facts and ALL known scoped counters against original sources. '
     'Return audit_verdict=supported only if checked with no unresolved relevant issue; unknown otherwise. '
-    'Include sourced corrections/retractions before verdict. This is paid semantic verification, not output selection.')
+    'Include sourced corrections/retractions before verdict. Verify the proposed terminal output without silently replacing its option label.')
+
+OBSERVATION_TABLE_INSTRUCTION = '''
+When known_observation_columns is present, known_observations contains row arrays.
+Reconstruct every observation by matching columns. A cell shaped {"shared":N}
+refers to known_observation_values[N], including its original JSON type; expand it
+before interpreting the observation. All rows and their original source/counter
+obligations are present. These tables are storage encoding, not new evidence.
+'''
 
 OBSERVATION_SCHEMA = {'type':'object','properties':{
     'id':{'type':'string'},
@@ -134,17 +160,46 @@ class JointReader:
         # different lifetimes. Successful later windows settle only unread work.
         self.unread_obligations = {}
         self.failed_obligations = {}
+        self.evidence_obligations = {}
+
+    def material_signature(self):
+        """Progress excludes call counters, duplicate proofs and log identities.
+
+        Re-examining the same window or replaying the same cached draft cannot
+        keep a controller alive. New windows, gaps, obligations, values and
+        counterevidence can. Repeated identical retractions are one fact change.
+        """
+        routes=[]
+        for row in self.state.routes.values():
+            item={k:deepcopy(v) for k,v in row.items() if k not in ('reason','revoked')}
+            item['revoked']=sorted({digest(r) for r in row.get('revoked',[])})
+            routes.append(item)
+        terminal=self.semantic_inputs or {}
+        obligations=self.obligation_snapshot()
+        for item in obligations['evidence_obligations']:
+            item.pop('origins',None)
+        return digest({'routes':sorted(routes,key=lambda r:r['id']),
+            'program':self.state.program,'pending':sorted(self.state.pending),
+            'read_windows':sorted([*key,value] for key,value in self.read_states.items()),
+            'gaps':sorted([*key,sorted(set(value))] for key,value in self.gaps.items() if value),
+            'clues':sorted([key,sorted(set(value))] for key,value in self.clues.items() if value),
+            'obligations':obligations,
+            'terminal':[self.semantic_result,self.semantic_prediction,
+                        terminal.get('validation_complete'),terminal.get('binding_dependencies')]})
 
     def pending_variables(self):
-        return set().union(*self.unread_obligations.values(), *self.failed_obligations.values())
+        return (set().union(*self.unread_obligations.values(), *self.failed_obligations.values())
+                |{item['variable'] for item in self.evidence_obligations.values()})
 
     def obligation_snapshot(self):
-        return {name:[[i,a,sorted(v)] for (i,a),v in getattr(self,name).items()]
-                for name in ('unread_obligations','failed_obligations')}
+        return {**{name:[[i,a,sorted(v)] for (i,a),v in getattr(self,name).items()]
+                for name in ('unread_obligations','failed_obligations')},
+                'evidence_obligations':deepcopy(sorted(self.evidence_obligations.values(),key=lambda x:x['id']))}
 
     def restore_obligations(self, snapshot):
         for name in ('unread_obligations','failed_obligations'):
             setattr(self,name,{(i,a):set(v) for i,a,v in snapshot.get(name,[])})
+        self.evidence_obligations={item['id']:deepcopy(item) for item in snapshot.get('evidence_obligations',[])}
 
     def _source(self, alias):
         source = self.e.mapper.sources[alias]
@@ -177,6 +232,7 @@ class JointReader:
                       'scope':self.state.scope(v)}
                    for v in self.state.program['variables'] if v in related}
         known = [r for r in self.state.routes.values() if r['variable'] in variables]
+        obligations=[item for item in self.evidence_obligations.values() if item['variable'] in set(variables)|related]
         controller=getattr(self.e,'residual_control',None)
         task_outputs={p:certificate for p in step['inputs']
                       if (certificate:=controller.task_projection(p)) is not None} if controller else {}
@@ -191,7 +247,7 @@ class JointReader:
                         collect(item)
             elif isinstance(value,list):
                 for item in value:collect(item)
-        for value in (known,parents,task_outputs):collect(value)
+        for value in (known,parents,task_outputs,obligations):collect(value)
         required={a for a,s in self.e.mapper.sources.items() if s['source_id'] in required_ids}
         if required_ids-{self.e.mapper.sources[a]['source_id'] for a in required}:
             raise ProtocolError('Known observation references an unavailable original source')
@@ -218,6 +274,16 @@ class JointReader:
             'source_spans':[{k:self.e.mapper.sources[a][k] for k in
                 ('id','doc_id','start','end','text','source_role','source_message_indices','time_metadata')}
                 for a in all_aliases]}
+        if obligations:
+            data['evidence_obligations']=wire(obligations)
+        if not audit:
+            required_parents={v:{p:self.state.versions[p] for p in values
+                if self.state.program['variables'][p]['demand'] in next(
+                    task['inputs'] for task in self.e.steps
+                    if task['output_slot']==self.state.program['variables'][v]['demand'])}
+                for v in variables}
+            if any(required_parents.values()):
+                data['required_parent_versions']=required_parents
         scopes=list(data['requested_scopes'].values())
         if scopes and all(scope==scopes[0] for scope in scopes):
             # Preserve the old shorthand only when it is true for every slot.
@@ -225,13 +291,23 @@ class JointReader:
         if controller:
             data['rules_completion_required']=controller.rules_completion_needed()
             data['supported_task_outputs']=wire(task_outputs)
-        if semantic or self.current_terminal_output:
+        personal=getattr(self.e,'personal_response_selection',False)
+        if semantic or self.current_terminal_output or (audit and personal):
             data['public_output_question'] = self.e.reader_question
             if self.e.output_options is not None:
                 data['public_options'] = deepcopy(self.e.output_options)
                 data['terminal_expression']=deepcopy(self.state.program['expression'])
+        if personal:
+            from .personal_task import PERSONAL_READING_GUIDANCE, PERSONAL_AUDIT_GUIDANCE
+            data['personal_response_selection']=True
+            data['personal_task_instruction']=PERSONAL_AUDIT_GUIDANCE if audit else PERSONAL_READING_GUIDANCE
+            if controller and getattr(controller,'audit_feedback',None):
+                data['audit_correction']=deepcopy(controller.audit_feedback)
         if audit:
             data['audit_instruction']=AUDIT_INSTRUCTION
+            if personal:
+                data['terminal_candidate']={'value':deepcopy(self.semantic_result),
+                    'final_prediction':self.semantic_prediction}
         return data
 
     @staticmethod
@@ -259,6 +335,8 @@ class JointReader:
         schema=deepcopy(SCHEMA)
         requested=list(data.get('requested_slots',data['variables']))
         item=schema['properties']['slots']['items']
+        if data.get('evidence_obligations'):
+            item['properties']['resolved_obligation_ids']={'type':'array','items':{'type':'string'},'uniqueItems':True}
         if requested:
             item['properties']['variable']['enum']=requested
             targets_by_variable={v:[r['id'] for r in data.get('known_observations',[]) if r['variable']==v]
@@ -275,6 +353,11 @@ class JointReader:
                 observation={'if':{'properties':{'stance':{'const':'support'}}},
                     'then':{'properties':{'value':JointReader._value_schema(data['variables'][variable])}},
                     'else':{'properties':{'value':{'type':'null'}}}}
+                parents=data.get('required_parent_versions',{}).get(variable,{})
+                if parents:
+                    observation['then']['properties']['parent_versions']={
+                        'properties':{p:{'const':version} for p,version in parents.items()},
+                        'required':list(parents)}
                 if targets:
                     observation['properties']={'retract_ids':{'items':{'enum':targets}}}
                 else:
@@ -285,8 +368,12 @@ class JointReader:
                     observation['allOf']=[{
                         'if':{'properties':{'stance':{'enum':['support','contradiction']}}},
                         'then':{'properties':{key:{'const':value} for key,value in scope.items()}}}]
-                branches.append({'properties':{'variable':{'const':variable},
-                    'observations':{'items':observation}}})
+                properties={'variable':{'const':variable},'observations':{'items':observation}}
+                if data.get('evidence_obligations'):
+                    obligation_ids=[item['id'] for item in data['evidence_obligations'] if item['variable']==variable]
+                    properties['resolved_obligation_ids']=({'items':{'enum':obligation_ids}}
+                        if obligation_ids else {'maxItems':0})
+                branches.append({'properties':properties})
             item['oneOf']=branches
         schema['properties']['slots'].update(minItems=len(requested),maxItems=len(requested))
         options=data.get('public_options')
@@ -329,7 +416,32 @@ class JointReader:
                       'source_spans':[[span[column] for column in columns] for span in spans]}
                 # Include the extra decoding instruction in the benefit check.
                 if size(rows)+len(COLUMNAR_INSTRUCTION.encode('utf-8'))<size(packed):
-                    return rows
+                    packed=rows
+        known=packed.get('known_observations',[])
+        if len(known)>=8 and all(isinstance(row,dict) and set(row)==set(known[0]) for row in known):
+            # Histories can have many alternative proof routes. Their repeated
+            # typed values/scopes/reasons dominate the context even when the
+            # raw text fits. Share exact cells losslessly; never pick a prefix
+            # of proofs or erase a revoked route and its counter sources.
+            columns=list(known[0])
+            counts={}
+            cells={}
+            for row in known:
+                for value in row.values():
+                    identity=digest(value)
+                    counts[identity]=counts.get(identity,0)+1
+                    cells[identity]=value
+            shared={identity:index for index,identity in enumerate(
+                key for key,count in counts.items() if count>1 and size(cells[key])>18)}
+            table={**packed,'known_observation_columns':columns,
+                'known_observation_values':[deepcopy(cells[key]) for key in shared],
+                'known_observations':[[{'shared':shared[digest(row[key])]} if digest(row[key]) in shared
+                                       else deepcopy(row[key]) for key in columns] for row in known]}
+            # Literal objects of the reference shape must not become ambiguous.
+            ambiguous=any(isinstance(value,dict) and set(value)=={'shared'}
+                          and digest(value) not in shared for value in cells.values())
+            if not ambiguous and size(table)+len(OBSERVATION_TABLE_INSTRUCTION.encode('utf-8'))<size(packed):
+                packed=table
         return packed
 
     def _estimate(self, operation, data):
@@ -360,9 +472,48 @@ class JointReader:
             'estimated_total_tokens':total,'reason':'actual_repair_input_exceeds_context'})
         return False
 
+    def _fitting_prefix(self, operation, step, query, variables, pending, semantic, audit):
+        """Find an exactly checked prefix without tokenizing every growing row.
+
+        Packing can make token size nonmonotone. Binary search only proposes a
+        prefix; every accepted one is verified. If no tested prefix fits, check
+        remaining prefixes before declaring capacity unavailable. Unconsumed
+        source groups remain pending in their original order.
+        """
+        tested={}
+        def trial(size):
+            if size not in tested:
+                aliases=list(dict.fromkeys(a for group in pending[:size] for a in group))
+                data=self._payload(step,query,variables,aliases,semantic,audit=audit)
+                tested[size]=(self._fits(operation,data),aliases)
+            return tested[size][0]
+        length=len(pending)
+        if trial(length):
+            return tested[length][1],length
+        lo,hi,best=1,length-1,0
+        while lo<=hi:
+            middle=(lo+hi)//2
+            if trial(middle):
+                best=middle;lo=middle+1
+            else:
+                hi=middle-1
+        if not best:
+            for size in range(1,length):
+                if trial(size):
+                    best=size;break
+        return (tested[best][1],best) if best else ([],0)
+
     @staticmethod
     def _system(data):
         system=SYSTEM+(COLUMNAR_INSTRUCTION if 'source_span_columns' in data else '')
+        if data.get('personal_response_selection'):
+            from .personal_task import PERSONAL_READING_GUIDANCE, PERSONAL_AUDIT_GUIDANCE
+            system+='\n'+(PERSONAL_AUDIT_GUIDANCE if 'audit_instruction' in data else PERSONAL_READING_GUIDANCE)
+            system+='\nFor the personalized response-selection terminal ONLY, support means a source-grounded assessment that this candidate response best fits the user. A proposed suggestion need not itself be a past event quoted in memory. Historical variables still require original evidence for every factual assertion; options never supply historical evidence.\n'
+        if 'known_observation_columns' in data:
+            system+=OBSERVATION_TABLE_INSTRUCTION
+        if data.get('terminal_repair'):
+            system+='\nTerminal-only repair: return slots=[] and corrected semantic_answer and final_prediction. Validated observations are immutable; use terminal_repair.expected_value exactly, preserving its JSON type. A null label is allowed only as genuine abstention, never as a substitute for consistency.\n'
         if data.get('public_options') is not None:
             from .personamem import TERMINAL_CHOICE_INSTRUCTION
             return system + TERMINAL_CHOICE_INSTRUCTION
@@ -407,6 +558,10 @@ class JointReader:
             if variable in self.state.program.get('task_expressions',{}):
                 raise ProtocolError('Model observations cannot replace a deterministic DAG binding')
             row={**row,'value':validate_value(row['value'], self.state.program['variables'][variable])}
+            if (getattr(self.e,'personal_response_selection',False)
+                    and self.state.program['variables'][variable]['demand']==self.state.final_node_id
+                    and row['value'] not in self.e.output_options):
+                raise ProtocolError('Personalized terminal value must be the exact selected public option text, not a fact summary')
         elif row['value'] is not None:
             raise ProtocolError('Non-support observation must not bind a value')
         if row['stance']!='contradiction' and row['retract_ids']:
@@ -428,13 +583,244 @@ class JointReader:
         # compose is allowed to eliminate an unused planned dependency.
         required = {v for v,d in self.state.program['variables'].items() if v in values and d['demand'] in step['inputs']}
         if require_grounding and row['stance']=='support' and not required <= set(parents):
-            raise ProtocolError('Observation omitted a grounded parameter dependency')
+            raise ProtocolError('Observation omitted a grounded parameter dependency; required parent_versions: '+
+                                json.dumps({v:self.state.versions[v] for v in sorted(required)},sort_keys=True))
         spans = [self._source(a) for a in row['source_ids']]
         for span in spans:
             self.e.spans[span['id']] = span
         return {**deepcopy(row),'variable':variable,'source_ids':[s['id'] for s in spans]}
 
-    def read(self, step, query, variables, doc_ids, identity, *, semantic=False, audit=False, terminal_output=False):
+    def _terminal_check(self, rows, prediction, semantic_result):
+        """Check typed output against the prospective state before publication."""
+        from .personamem import parse_choice
+        # Historical request snapshots can dwarf the live fact graph. They are
+        # irrelevant to a prospective reduction and must not be copied here.
+        proposed=self._prospective_state(rows)
+        outcome=possible_outputs(proposed.program,proposed.valid()[0],
+            max_states=self.e.s.get('max_enumeration_states',10000))
+        if outcome['status']!='determined':
+            return None, 'A terminal label requires a supported, unambiguous terminal value' if prediction is not None else None
+        expected=outcome['outputs'][0]
+        if digest(semantic_result)!=digest(expected):
+            return expected, 'semantic_answer must equal the supported terminal value exactly, preserving its JSON type'
+        choice=parse_choice(prediction,self.e.output_options)
+        if prediction is not None and choice is None:
+            return expected, 'final_prediction must be a valid public option label or null on genuine abstention'
+        if getattr(self.e,'personal_response_selection',False) and choice is not None:
+            if expected!=self.e.output_options[ord(choice)-ord('a')]:
+                return expected, 'final_prediction selects a different option from the supported terminal response'
+        return expected,None
+
+    def _prospective_state(self, rows, pending=None):
+        proposed=copy(self.state)
+        for name,value in vars(self.state).items():
+            setattr(proposed,name,[] if name=='history' else deepcopy(value))
+        proposed.integrate(rows,proposed.pending if pending is None else pending)
+        return proposed
+
+    def _update_evidence_obligations(self, reviews, rows, data, failures, identity):
+        """Carry unresolved evidence until an explicit, sourced scoped review."""
+        offered={item['id'] for item in data.get('evidence_obligations',[])}
+        visible={self.e.mapper.sources[s['id']]['source_id'] for s in data['source_spans']}
+        for variable,slot in reviews.items():
+            reported={r.get('id') for r in slot['observations'] if isinstance(r,dict)}
+            reviewed=[r for r in rows if r['variable']==variable and r['id'] in reported]
+            unresolved=slot['unresolved']
+            partial=[r for r in reviewed if r['stance'] in ('partial','unknown') and r['source_ids']]
+            settled=[r for r in reviewed if r['stance'] in ('support','contradiction','irrelevant') and r['source_ids']]
+            # A source-free absence of support is a search gap, not contrary
+            # evidence. Scoped support can settle that gap naturally. Sourced
+            # issues require the explicit original-text review below.
+            if (not unresolved and not partial and any(r['stance']=='support' for r in settled)
+                    and not any(key[0]==variable for key in failures)):
+                for oid,item in list(self.evidence_obligations.items()):
+                    if (item['variable']==variable and not item['source_ids']
+                            and oid not in slot.get('resolved_obligation_ids',[])):
+                        del self.evidence_obligations[oid]
+            for oid in slot.get('resolved_obligation_ids',[]):
+                obligation=self.evidence_obligations.get(oid)
+                covered={sid for r in settled for sid in r['source_ids']}
+                required=set(obligation['source_ids']) if obligation else set()
+                if (oid not in offered or obligation is None or obligation['variable']!=variable
+                        or unresolved or partial or any(key[0]==variable for key in failures)
+                        or not settled or not required<=visible or not required<=covered):
+                    failures[variable,'*']='Evidence obligation resolution requires its offered ID, original sources, a sourced scoped review, and no unresolved issue'
+                    continue
+                del self.evidence_obligations[oid]
+            if not unresolved and not partial:
+                continue
+            sources=sorted({sid for r in (partial or reviewed) for sid in r['source_ids']})
+            if unresolved:
+                # An unresolved issue must carry all the text just examined
+                # because slot.unresolved has no per-issue citation map.
+                # Neither an accompanying support nor a partial observation
+                # proves that its citations cover every unresolved issue.
+                sources=sorted(visible)
+            descriptions=sorted(set(unresolved)|{r['reason'] for r in partial if r['reason']})
+            scope=self.state.scope(variable)
+            oid='obligation_'+digest([variable,scope,sources])[:24]
+            previous=self.evidence_obligations.get(oid,{})
+            self.evidence_obligations[oid]={'id':oid,'variable':variable,**scope,
+                'source_ids':sources,'descriptions':sorted(set(previous.get('descriptions',[]))|set(descriptions)),
+                'origins':sorted(set(previous.get('origins',[]))|{identity})}
+
+    def _handoff_failures(self, rows, rejectable, prediction=None, semantic_result=None, *, pending=None):
+        """Admit a new proof only if its mandatory next use can actually fit.
+
+        This is a wire-capacity check, not a claim of semantic sufficiency. No
+        source is sliced or deleted. A rejected draft remains a scoped repair
+        obligation, and valid counters still enter the state. Existing published
+        routes are never rewritten to make room for a new route.
+        """
+        existing={self.state.support_identity(route) for route in self.state.routes.values() if not route['revoked']}
+        supports=[r for r in rows if r['stance']=='support' and (r['variable'],r['id']) in rejectable
+                  and self.state.support_identity(r) not in existing]
+        if not supports:
+            return {}
+        from .residual_control import ResidualControl
+        from .methods import capabilities
+        proposed=self._prospective_state(rows,pending)
+        proposed.pending|={item['variable'] for item in self.evidence_obligations.values()}
+        probe_engine=copy(self.e)
+        probe_engine.fact_state=proposed
+        probe_engine.final_node_id=proposed.final_node_id
+        probe_engine.s={**self.e.s,'max_enumeration_states':self.e.s.get('max_enumeration_states',10000)}
+        probe_engine.capabilities=getattr(self.e,'capabilities',capabilities(self.e.s['algorithm_version']))
+        controller=ResidualControl(probe_engine)
+        actual_controller=getattr(self.e,'residual_control',None)
+        for field in ('visited','forced_demands','audit_feedback'):
+            if actual_controller is not None and hasattr(actual_controller,field):
+                setattr(controller,field,deepcopy(getattr(actual_controller,field)))
+        probe_engine.residual_control=controller
+        probe=controller.reader
+        # Preserve a customized exact counter in tests/deployments; ordinary
+        # production uses the same real reasoner and _fits implementation.
+        probe._fits=self._fits
+        probe.semantic_prediction=prediction
+        probe.semantic_result=semantic_result
+        probe.evidence_obligations=deepcopy(self.evidence_obligations)
+        values,_,route_ids=proposed.valid()
+        outcome=possible_outputs(proposed.program,values,max_states=probe_engine.s['max_enumeration_states'])
+        active=set(controller.active(outcome))
+        certificate=controller.candidate()
+        ready=(certificate is not None and not controller.forced_demands
+               and (probe_engine.capabilities.residual_control or not active))
+        affected={proposed.program['variables'][r['variable']]['demand'] for r in supports}
+        checks=[]
+        for target in self.e.steps:
+            if ready or target['output_slot'] not in active:
+                continue
+            conflict_recheck=(target['output_slot'] in affected and any(
+                r['variable'] not in values and proposed.program['variables'][r['variable']]['demand']==target['output_slot']
+                for r in supports))
+            if not (set(target['inputs']) & affected) and not conflict_recheck:
+                continue
+            related={v for v,declaration in proposed.program['variables'].items()
+                     if v in values and declaration['demand'] in target['inputs']}
+            frontier=list(related)
+            while frontier:
+                for rid in route_ids.get(frontier.pop(),[]):
+                    for parent in proposed.routes[rid]['parent_versions']:
+                        if parent not in related:
+                            related.add(parent);frontier.append(parent)
+            variables=set(controller.demand_variables(target['output_slot']))|related
+            variables-=set(proposed.program.get('task_expressions',{}))
+            query=controller.grounded(target)
+            if query is None:
+                # Still check the current mandatory footprint; do not invent
+                # values or source obligations for an as-yet unbound parent.
+                query=target['question']
+                for parent in target['inputs']:
+                    known={v:values[v] for v in controller.demand_variables(parent) if v in values}
+                    if known:
+                        query+='\nEstablished '+parent+': '+json.dumps(known,ensure_ascii=False,sort_keys=True)
+            terminal=target['output_slot']==proposed.final_node_id
+            semantic=terminal and proposed.contract['mode']=='semantic'
+            checks.append(('semantic_compose' if semantic else 'joint_read',target,query,variables,semantic,False))
+        terminal_variables=controller.demand_variables(proposed.final_node_id)
+        audit_variables=None
+        if ready:
+            audit_variables=set(certificate['binding_dependencies'])-set(proposed.program.get('task_expressions',{}))
+            if certificate.get('rule_assumptions'):
+                audit_variables.add(certificate['rule_assumptions']['variable'])
+        elif terminal_variables and all(v in values for v in terminal_variables):
+            audit_variables=controller.semantic_dependencies()-set(proposed.program.get('task_expressions',{}))
+        if audit_variables:
+            target={**next(s for s in self.e.steps if s['output_slot']==proposed.final_node_id),
+                    'inputs':[s['output_slot'] for s in self.e.steps if s['output_slot']!=proposed.final_node_id]}
+            checks.append(('audit_joint',target,self.e.q['question'],audit_variables,False,True))
+        failures={}
+        for operation,target,query,variables,semantic,audit in checks:
+            probe.current_identity=digest(['mandatory_handoff',target['output_slot'],proposed.revision,proposed.versions])
+            probe.current_terminal_output=not audit and target['output_slot']==proposed.final_node_id and self.e.output_options is not None
+            data=probe._payload(target,query,variables,[],semantic,audit=audit)
+            if probe._fits(operation,data):
+                continue
+            implicated=[r for r in supports if r['variable'] in variables]
+            for row in implicated:
+                failures[row['variable'],row['id']]=(
+                    'citation_capacity: mandatory '+operation+' at '+target['output_slot']+
+                    ' exceeds the actual context including repair reserve. Recheck this same draft; cite the shortest '
+                    'sufficient original spans, not the whole reading window. Keep every necessary premise and counter. '
+                    'If no sufficient fitting proof exists, return partial/unresolved instead of support.')
+            self.e.event({'event':'joint_support_capacity_rejected','next_operation':operation,
+                'next_node_id':target['output_slot'],'source_spans':len(data['source_spans']),
+                'support_draft_ids':[r['id'] for r in implicated],
+                'source_ids_preserved':True,'context_tokens':self.e.s['context_tokens']})
+        if ready and self.e.output_options is not None:
+            exact=[text for text in self.e.output_options if str(text).strip()==str(certificate['output']).strip()]
+            # A factual terminal produced its label in the same generation;
+            # only a computed symbolic terminal can need this separate format.
+            if len(exact)!=1 and self.semantic_inputs is None and semantic_result is None:
+                system,data,schema=controller.terminal_format_request(certificate)
+                count=self.e.reasoner.estimate('semantic_compose',system,data,schema)
+                if count+self.e.s['reasoning_output_tokens']+self.e.s['input_margin']+8>self.e.s['context_tokens']:
+                    relevant=set(certificate['binding_dependencies'])
+                    for row in supports:
+                        if row['variable'] in relevant:
+                            failures[row['variable'],row['id']]='citation_capacity: mandatory symbolic terminal format exceeds actual wire capacity; refine only to a sufficient original-source proof or leave unresolved'
+        return failures
+
+    def _repair_terminal(self, operation, data, rows, prediction, semantic_result,
+                         step, identity, attempts_used):
+        """Use the same finite repair allowance; never rewrite validated facts."""
+        expected,error=self._terminal_check(rows,prediction,semantic_result)
+        repair_inputs=set()
+        while (error and attempts_used<self.e.s['max_repairs_per_request']
+               and self.e.ledger.remaining('json_repairs')):
+            repair={**deepcopy(data),'variables':{},'requested_slots':[],
+                'requested_scopes':{},'terminal_repair':{
+                    'expected_value':expected,'feedback':error,
+                    'previous_semantic_answer':semantic_result,'previous_prediction':prediction}}
+            identity_digest=digest(repair)
+            if identity_digest in repair_inputs:
+                break
+            repair_inputs.add(identity_digest)
+            if not self._repair_fits(operation+'_repair',repair,step,identity,attempts_used+1):
+                break
+            self.e.ledger.reserve('json_repairs',operation+'_repair')
+            attempts_used+=1
+            try:
+                wire=self._wire_data(repair)
+                schema=self._schema(repair)
+                schema['required']=['slots','semantic_answer','final_prediction']
+                response=self.e.reasoner.request(operation+'_repair',self._system(wire),wire,schema=schema)
+                if (not isinstance(response,dict) or set(response)!={'slots','semantic_answer','final_prediction'}
+                        or response['slots']!=[]):
+                    raise ProtocolError('Terminal-only repair must preserve validated facts and return slots=[]')
+                prediction=response['final_prediction']
+                semantic_result=response['semantic_answer']
+                expected,error=self._terminal_check(rows,prediction,semantic_result)
+            except (ProtocolError,OutputTruncated) as exc:
+                error=str(exc)
+            except (BudgetExceeded,InputOverflow,ConnectionError,OSError) as exc:
+                self.e.errors.append({'node_id':step['output_slot'],'type':type(exc).__name__,'error':str(exc)})
+                break
+        return prediction,semantic_result,error
+
+    def read(self, step, query, variables, doc_ids, identity, *, semantic=False, audit=False,
+             terminal_output=False, review_existing_obligations=True):
+        before=self.material_signature()
         self.current_identity = identity
         self.current_terminal_output=terminal_output
         operation = 'audit_joint' if audit else 'semantic_compose' if semantic else 'joint_read'
@@ -454,7 +840,9 @@ class JointReader:
             variables=list(dict.fromkeys([*variables,*sorted(related)]))
         aliases = [a for a,s in self.e.mapper.sources.items() if s['doc_id'] in doc_ids
                    and (audit or (identity,a) not in self.read_states)]
-        if not aliases and not semantic and not audit:
+        relevant_obligations=any(item['variable'] in variables for item in self.evidence_obligations.values())
+        if (not aliases and not semantic and not audit
+                and not (relevant_obligations and review_existing_obligations)):
             return False
         external_pending=set(self.state.pending)-self.pending_variables()
         for alias in aliases:
@@ -468,29 +856,27 @@ class JointReader:
         if not groups:
             groups=[[]]
         pending = list(groups)
-        progressed = False
         while pending:
-            batch=[]
-            while pending:
-                trial=list(dict.fromkeys(batch+pending[0]))
-                if not self._fits(operation,self._payload(step,query,variables,trial,semantic,audit=audit)):
-                    break
-                batch=trial;pending.pop(0)
-            if not batch and pending:
+            batch,consumed=self._fitting_prefix(operation,step,query,variables,pending,semantic,audit)
+            if not consumed:
                 self.batches.append({'operation':operation,'identity':identity,'status':'capacity_unavailable',
                                      'unread_source_aliases':pending})
                 self.state.integrate([],external_pending|self.pending_variables())
                 raise InputOverflow('Local sources/parents/counters exceed real wire capacity')
+            del pending[:consumed]
             data=self._payload(step,query,variables,batch,semantic,audit=audit)
             visible={s['id']:s for s in data['source_spans']}
             valid, failures, completed, frozen = [], {}, set(), set()
             observed_rows, observed_slots, duplicate_rows, repair_inputs = {}, {}, {}, set()
+            duplicate_replacements={}
             current=deepcopy(data)
             prediction=None
             semantic_result=None
             audit_verdict=None
             max_repairs=self.e.s['max_repairs_per_request']
             for attempt in range(max_repairs+1):
+                prior_frozen=set(frozen)
+                reviews={}
                 response=None
                 outstanding={key:error for key,error in failures.items() if key[1]!='*'}
                 resolved=set()
@@ -500,6 +886,16 @@ class JointReader:
                     wire=self._wire_data(current)
                     response=self.e.reasoner.request(operation if attempt==0 else operation+'_repair',
                         self._system(wire),wire,schema=self._schema(current),reserve=0 if audit else None)
+                    if isinstance(response,dict) and isinstance(response.get('slots'),list):
+                        # Repeating an identical draft is idempotent. Different
+                        # drafts sharing an ID remain explicit repair obligations.
+                        response=deepcopy(response)
+                        for slot in response['slots']:
+                            if isinstance(slot,dict) and isinstance(slot.get('observations'),list):
+                                unique={}
+                                for row in slot['observations']:
+                                    unique.setdefault(digest(row),row)
+                                slot['observations']=list(unique.values())
                     # Capture identifiable drafts before any envelope/slot error.
                     # A later generic protocol failure must not erase an already
                     # observed counter, even if its containing slot is duplicated.
@@ -533,8 +929,15 @@ class JointReader:
                             raise ProtocolError('Duplicate/unrequested reading slot')
                         seen.add(variable)
                         observed_slots[variable]=deepcopy(slot)
-                        if set(slot)!={'variable','observations','unresolved'} or not isinstance(slot['observations'],list) or not isinstance(slot['unresolved'],list) or any(not isinstance(g,str) for g in slot['unresolved']):
+                        if (set(slot)-{'variable','observations','unresolved','resolved_obligation_ids'}
+                                or not {'variable','observations','unresolved'}<=set(slot)
+                                or not isinstance(slot['observations'],list) or not isinstance(slot['unresolved'],list)
+                                or any(not isinstance(g,str) for g in slot['unresolved'])
+                                or not isinstance(slot.get('resolved_obligation_ids',[]),list)
+                                or any(not isinstance(oid,str) for oid in slot.get('resolved_obligation_ids',[]))
+                                or len(set(slot.get('resolved_obligation_ids',[])))!=len(slot.get('resolved_obligation_ids',[]))):
                             next_failures[variable,'*']='Malformed slot';continue
+                        reviews[variable]=slot
                         self.gaps[identity,variable]=list(slot['unresolved'])
                         groups={}
                         for i,row in enumerate(slot['observations']):
@@ -561,10 +964,25 @@ class JointReader:
                             if key in frozen:
                                 continue
                             observed_rows[key]=deepcopy(row)
-                            if attempt and (variable,'*') not in failures and key not in failures:
+                            replacement_keys={k for keys in duplicate_replacements.values() for k in keys}
+                            if attempt and (variable,'*') not in failures and key not in failures and key not in replacement_keys:
                                 next_failures[key]='Repair invented an unrequested observation';continue
                             try:
-                                valid.append(self._observation(row,variable,visible,step,require_grounding=not audit));frozen.add(key);resolved.add(key)
+                                normalized=self._observation(row,variable,visible,step,require_grounding=not audit)
+                                for original,replacements in duplicate_replacements.items():
+                                    if key not in replacements:
+                                        continue
+                                    draft=duplicate_rows[original][replacements.index(key)]
+                                    try:
+                                        unchanged=self._observation(draft,variable,visible,step,require_grounding=not audit)
+                                    except (ValueError,KeyError,TypeError):
+                                        # Invalid original fields remain editable;
+                                        # a valid counter only needed a unique ID.
+                                        continue
+                                    fields=set(unchanged)-{'id','reason'}
+                                    if any(normalized[field]!=unchanged[field] for field in fields):
+                                        raise ProtocolError('Duplicate-ID repair cannot change an already valid draft or discard its counterevidence')
+                                valid.append(normalized);frozen.add(key);resolved.add(key)
                             except (ValueError,KeyError,TypeError) as exc:
                                 next_failures[key]=str(exc)
                         if attempt:
@@ -575,6 +993,12 @@ class JointReader:
                             completed.add(variable)
                     for variable in wanted-seen:
                         next_failures[variable,'*']='Missing reading slot'
+                    for original, replacements in duplicate_replacements.items():
+                        if all(key in frozen for key in replacements):
+                            next_failures.pop(original,None)
+                            resolved.add(original)
+                            if not any(key[0]==original[0] for key in next_failures):
+                                completed.add(original[0])
                     prediction=response.get('final_prediction',prediction)
                     semantic_result=response.get('semantic_answer',semantic_result)
                     if audit:
@@ -597,20 +1021,43 @@ class JointReader:
                 for key,error in outstanding.items():
                     if key not in resolved:
                         next_failures.setdefault(key,error)
+                before_obligations=deepcopy(self.evidence_obligations)
+                self._update_evidence_obligations(reviews,valid,current,next_failures,identity)
+                prospective_pending=(external_pending
+                    |set().union(*[v for (i,a),v in self.unread_obligations.items() if i!=identity or a not in batch],
+                                 *self.failed_obligations.values())
+                    |{item['variable'] for item in self.evidence_obligations.values()}
+                    |{key[0] for key in next_failures})
+                rejected=self._handoff_failures(valid,frozen-prior_frozen,prediction,semantic_result,
+                                                pending=prospective_pending)
+                if rejected:
+                    self.evidence_obligations=before_obligations
+                    valid=[row for row in valid if (row['variable'],row['id']) not in rejected]
+                    for key,error in rejected.items():
+                        frozen.discard(key);resolved.discard(key);completed.discard(key[0])
+                        next_failures[key]=error
+                    self._update_evidence_obligations(reviews,valid,current,next_failures,identity)
                 failures=next_failures
                 if not failures:
                     break
                 if attempt==max_repairs or not self.e.ledger.remaining('json_repairs'):
                     break
                 failed_variables={k[0] for k in failures}
+                for key,rows in duplicate_rows.items():
+                    duplicate_replacements.setdefault(key,[(key[0],key[1]+'~draft-'+digest(row)[:16]) for row in rows])
                 # Failed drafts must be editable in place. Validated observations
                 # remain frozen locally; do not silently replace failed counters.
                 # Missing rows retain their last observed draft across repairs.
                 previous=response if response is not None else self.e.reasoner.last_response
-                current={**self._payload(step,query,failed_variables,batch,semantic),
+                current={**self._payload(step,query,failed_variables,batch,semantic,audit=audit),
                     'repair_scope':{'failed':[{'variable':v,'id':rid,'feedback':error[:240],
                         'observation':deepcopy(observed_rows.get((v,rid))),
-                        **({'observations':deepcopy(duplicate_rows[v,rid])} if (v,rid) in duplicate_rows else {}),
+                        **({'required_parent_versions':deepcopy(current.get('required_parent_versions',{}).get(v,{}))}
+                           if 'grounded parameter dependency' in error else {}),
+                        **({'observations':deepcopy(duplicate_rows[v,rid]),
+                            'replacement_observations':[{**deepcopy(row),'id':key[1]}
+                                for row,key in zip(duplicate_rows[v,rid],duplicate_replacements[v,rid])
+                                if key not in frozen]} if (v,rid) in duplicate_rows else {}),
                         **({'slot':deepcopy(observed_slots.get(v))} if rid=='*' else {})}
                         for (v,rid),error in sorted(failures.items())],
                         'attempt':attempt+1,'previous_response_identity':digest(previous)}}
@@ -635,6 +1082,13 @@ class JointReader:
                     break
                 self.e.ledger.reserve('json_repairs',operation+'_repair')
                 repair_inputs.add(repair_identity)
+            if not failures and not audit and (semantic or terminal_output) and self.e.output_options is not None:
+                prediction,semantic_result,terminal_error=self._repair_terminal(
+                    operation,data,valid,prediction,semantic_result,step,identity,attempt)
+                if terminal_error:
+                    terminal_variables=[v for v in variables if self.state.program['variables'][v]['demand']==self.state.final_node_id]
+                    for variable in terminal_variables:
+                        failures[variable,'terminal_output']=terminal_error
             related={k[0] for k in failures}
             # A later independent reading cannot erase a failed counter slot.
             # Only this batch's scoped repair can settle its own failed rows.
@@ -653,8 +1107,10 @@ class JointReader:
             diagnostic={'operation':operation,'identity':identity,'source_aliases':batch,
                 'visible_source_aliases':list(visible),'valid_rows':len(valid),'failed_slots':[
                     {'variable':v,'id':rid,'error':err} for (v,rid),err in failures.items()],
-                'complete':not failures,'input_tokens':self.e.reasoner.requests[-1]['input_tokens_local']}
+                'complete':not failures,'input_tokens':(
+                    self.e.reasoner.requests[-1]['input_tokens_local'] if self.e.reasoner.requests else None)}
             if audit:
+                diagnostic['audit_verdict']=audit_verdict
                 diagnostic['audit_complete'] = not failures and audit_verdict=='supported' and not any(
                     self.gaps.get((identity,v)) for v in variables)
             self.batches.append(diagnostic);self.e.event({'event':'joint_read_completed',**diagnostic})
@@ -663,15 +1119,24 @@ class JointReader:
                     r['stance']=='irrelevant' for r in valid) else 'read')
             if semantic or terminal_output:
                 self.semantic_inputs={'doc_ids':list(dict.fromkeys(s['doc_id'] for s in visible.values())),
-                    'validation_complete':not failures,'response_ref':self.e.reasoner.last_response.get('response_ref'),
+                    'validation_complete':not failures,'response_ref':(self.e.reasoner.last_response or {}).get('response_ref'),
                     'logical_call_index':self.e.reasoner.sequence,
                     'scope':'joint_terminal_output' if terminal_output else 'semantic_terminal'}
+                values,_,route_ids=self.state.valid()
+                dependencies={v for v in variables if self.state.program['variables'][v]['demand']==self.state.final_node_id}
+                frontier=list(dependencies)
+                while frontier:
+                    for rid in route_ids.get(frontier.pop(),[]):
+                        for parent in self.state.routes[rid]['parent_versions']:
+                            if parent not in dependencies:
+                                dependencies.add(parent);frontier.append(parent)
+                self.semantic_inputs['binding_dependencies']={v:{'version':self.state.versions[v],
+                    'identity':digest(values[v])} for v in sorted(dependencies) if v in values}
                 self.semantic_prediction=prediction
                 self.semantic_result=semantic_result
-            progressed=True
             if failures:
                 break
-        return progressed
+        return before!=self.material_signature()
 
     def public_dict(self):
         return {'mapping_calls':0,'batches':deepcopy(self.batches),

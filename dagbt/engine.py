@@ -51,7 +51,7 @@ def _strings(value, name):
     return value
 
 class Engine:
-    def __init__(self,q,resources,calls,config,method,*,reader_question=None,output_options=None):
+    def __init__(self,q,resources,calls,config,method,*,reader_question=None,output_options=None,task_kind=None):
         if set(q)-{'id','question'}:raise ProtocolError('Generation question must contain only id/question')
         self.q,self.docs,self.ids,self.vectors,self.index,self.tokenizer=q,*resources
         self.config=deepcopy(config);self.s=resolve(config,method);self.config['fusion']=self.s
@@ -66,8 +66,17 @@ class Engine:
         self.reader_question=q['question'] if reader_question is None else reader_question
         self.personal=reader_question is not None
         self.output_options = deepcopy(output_options)
+        if task_kind not in (None, 'personal_response_selection'):
+            raise ProtocolError('Unknown public task kind')
+        self.personal_response_selection = bool(task_kind == 'personal_response_selection'
+                                                and self.capabilities.joint_reading)
+        if self.personal_response_selection:
+            if (not isinstance(output_options, list) or len(output_options) != 4
+                    or any(not isinstance(option, str) or not option.strip() for option in output_options)):
+                raise ProtocolError('PersonaMem requires four nonempty public response options')
         self.output_identity = digest({'question': self.reader_question, 'options': self.output_options,
-                                       'contract': self.s['algorithm_version']})
+                                       'contract': self.s['algorithm_version'],
+                                       **({'task_kind':task_kind} if task_kind is not None else {})})
         self.semantic_evidence={}
         if not self.local_terminal:
             self.baseline_ids=[]
@@ -105,6 +114,11 @@ class Engine:
             system = residual_plan.PLAN_SYSTEM
             schema = residual_plan.planner_contract(self.e.PLAN_SCHEMA)
             validate = lambda value: residual_plan.validate_plan(value, self.repair.validate_plan)
+            if self.personal_response_selection:
+                from .personal_task import PERSONAL_PLAN_GUIDANCE, validate_personal_plan
+                system += '\n' + PERSONAL_PLAN_GUIDANCE
+                validate = lambda value: validate_personal_plan(
+                    residual_plan.validate_plan(value, self.repair.validate_plan), self.q['question'])
         plan=self.reasoner.json('planner',prompts.plan_system(system,self.personal),self.q['question'],validate,schema)
         if len(plan['steps'])>self.s['max_initial_nodes']:raise ProtocolError('Initial node cap exceeded')
         self.steps=deepcopy(plan['steps'])
@@ -683,6 +697,9 @@ class Engine:
         plan=validate_plan({'steps':snapshot['steps'],'final_node_id':snapshot['final_node_id'],
             'output_contract':snapshot['fact_state']['contract'],
             'program':snapshot['fact_state']['initial_program']},self.repair.validate_plan)
+        if self.personal_response_selection:
+            from .personal_task import validate_personal_plan
+            validate_personal_plan(plan, self.q['question'])
         self.steps=plan['steps'];self.final_node_id=plan['final_node_id']
         self.output_identity = digest({'format_identity':self.output_identity,
             'output_contract':plan['output_contract'],'initial_program':plan['program'],'initial_dag':self.steps})
@@ -698,8 +715,9 @@ class Engine:
         return self.residual_control.run()
 
 
-def run_question(q,resources,calls,config,method='fusion',*,reader_question=None,output_options=None):
-    engine=Engine(q,resources,calls,config,method,reader_question=reader_question,output_options=output_options)
+def run_question(q,resources,calls,config,method='fusion',*,reader_question=None,output_options=None,task_kind=None):
+    engine=Engine(q,resources,calls,config,method,reader_question=reader_question,output_options=output_options,
+                  task_kind=task_kind)
     try:return engine.run()
     except Exception as exc:
         if engine.semantic_evidence:

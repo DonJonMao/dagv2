@@ -156,6 +156,57 @@ def variable_scope(declaration, contract):
             {key: contract[key] for key in ('entity_scope', 'time_scope')})
 
 
+def expression_type(expr, variables):
+    """Validate a whitelist expression and return its declared JSON value type."""
+    if not isinstance(expr, dict):
+        raise ProgramError('Expression must be a JSON object')
+    op = expr.get('op')
+    if not isinstance(op, str):
+        raise ProgramError('Expression operator must be a string')
+    if op == 'const' and set(expr) == {'op', 'value'}:
+        try:
+            json.dumps(expr['value'],allow_nan=False)
+        except (TypeError,ValueError) as exc:
+            raise ProgramError('Constants must be finite JSON') from exc
+        value = expr['value']
+        if isinstance(value, dict) and (set(value) == {'number', 'unit'} or {'lower', 'upper'} <= set(value)):
+            interval(value)
+            return 'number'
+        return ('null' if value is None else 'bool' if type(value) is bool else 'number'
+                if type(value) in (int, float) else 'entity'
+                if isinstance(value, str) else 'set' if isinstance(value, list) else 'record')
+    if (op == 'var' and set(expr) == {'op', 'id'} and isinstance(expr['id'], str)
+            and expr['id'] in variables):
+        return variables[expr['id']]['type']
+    if op in ('record', 'failures', 'one_reason') and set(expr) == {'op', 'fields'}:
+        if (not isinstance(expr['fields'], dict) or not expr['fields']
+                or any(not isinstance(name, str) or not name for name in expr['fields'])):
+            raise ProgramError('Output fields must be a nonempty record')
+        kinds = [expression_type(v, variables) for v in expr['fields'].values()]
+        if op != 'record' and any(k != 'bool' for k in kinds):
+            raise ProgramError('Failure outputs require boolean conditions')
+        return 'set' if op == 'failures' else 'record'
+    if set(expr) != {'op', 'args'} or not isinstance(expr.get('args'), list):
+        raise ProgramError('Unsupported expression or fields: ' + str(op))
+    args = expr['args']
+    kinds = [expression_type(a, variables) for a in args]
+    if op in ('and', 'or') and args and all(k == 'bool' for k in kinds):
+        return 'bool'
+    if op == 'not' and kinds == ['bool']:
+        return 'bool'
+    if op in COMPARISONS and len(args) == 2 and kinds[0] == kinds[1]:
+        if op not in ('eq', 'ne') and kinds[0] != 'number':
+            raise ProgramError('Ordered comparison requires numeric operands')
+        return 'bool'
+    if op == 'if' and len(args) == 3 and kinds[0] == 'bool' and kinds[1] == kinds[2]:
+        return kinds[1]
+    if op == 'tuple':
+        # The evaluator returns an ordered JSON array, represented by the
+        # language's array-valued set kind, never a JSON object/record.
+        return 'set'
+    raise ProgramError('Invalid expression arity or operand types: ' + str(op))
+
+
 def validate_program(program):
     if not isinstance(program, dict) or not {'variables', 'expression'} <= set(program):
         raise ProgramError('Program requires variables and expression')
@@ -191,44 +242,7 @@ def validate_program(program):
             raise ProgramError('open must be boolean')
 
     def check(expr):
-        if not isinstance(expr, dict):
-            raise ProgramError('Expression must be a JSON object')
-        op = expr.get('op')
-        if op == 'const' and set(expr) == {'op', 'value'}:
-            try:
-                json.dumps(expr['value'],allow_nan=False)
-            except (TypeError,ValueError) as exc:
-                raise ProgramError('Constants must be finite JSON') from exc
-            return ('bool' if type(expr['value']) is bool else 'number'
-                    if type(expr['value']) in (int, float) or isinstance(expr['value'], dict)
-                    and set(expr['value']) == {'number', 'unit'} else 'entity'
-                    if isinstance(expr['value'], str) else 'set' if isinstance(expr['value'], list) else 'record')
-        if op == 'var' and set(expr) == {'op', 'id'} and expr['id'] in variables:
-            return variables[expr['id']]['type']
-        if op in ('record', 'failures', 'one_reason') and set(expr) == {'op', 'fields'}:
-            if not isinstance(expr['fields'], dict) or not expr['fields']:
-                raise ProgramError('Output fields must be a nonempty record')
-            kinds = [check(v) for v in expr['fields'].values()]
-            if op != 'record' and any(k != 'bool' for k in kinds):
-                raise ProgramError('Failure outputs require boolean conditions')
-            return 'set' if op == 'failures' else 'record'
-        if set(expr) != {'op', 'args'} or not isinstance(expr.get('args'), list):
-            raise ProgramError('Unsupported expression or fields: ' + str(op))
-        args = expr['args']
-        kinds = [check(a) for a in args]
-        if op in ('and', 'or') and args and all(k == 'bool' for k in kinds):
-            return 'bool'
-        if op == 'not' and kinds == ['bool']:
-            return 'bool'
-        if op in COMPARISONS and len(args) == 2 and kinds[0] == kinds[1]:
-            if op not in ('eq', 'ne') and kinds[0] != 'number':
-                raise ProgramError('Ordered comparison requires numeric operands')
-            return 'bool'
-        if op == 'if' and len(args) == 3 and kinds[0] == 'bool' and kinds[1] == kinds[2]:
-            return kinds[1]
-        if op == 'tuple':
-            return 'record'
-        raise ProgramError('Invalid expression arity or operand types: ' + str(op))
+        return expression_type(expr, variables)
 
     check(program['expression'])
     definitions=program.get('task_expressions',{})
@@ -237,6 +251,8 @@ def validate_program(program):
     for variable,expression in definitions.items():
         if variable not in variables or check(expression)!=variables[variable]['type']:
             raise ProgramError('Deterministic task expression type differs from its binding')
+    if not isinstance(program.get('constraints', []), list):
+        raise ProgramError('Joint constraints must be an array of expressions')
     for constraint in program.get('constraints', []):
         if check(constraint) != 'bool':
             raise ProgramError('Joint constraints must be boolean')
@@ -477,6 +493,14 @@ def live_demands(program, valid_facts, *, max_states=10000):
 def certify_output(program, valid_facts, contract, *, program_revision=0,
                    versions=None, sources=None, pending_variables=(), max_states=10000):
     validate_output_contract(contract)
+    try:
+        # A caller may ask about an uninstantiated rule placeholder or a
+        # different mode. Neither can receive a certificate. Reachability is
+        # checked at plan/state admission; incomplete rules are checked below
+        # against the actual negative witness, never auto-completed here.
+        validate_program_contract(program, contract, rule_completion_available=True)
+    except ProgramError:
+        return None
     mode = contract['mode']
     if mode == 'semantic' or (mode in ('one_reason', 'all_failures') and
             program['expression']['op'] != ('one_reason' if mode == 'one_reason' else 'failures')):
@@ -529,10 +553,73 @@ def validate_output_contract(contract):
         raise ProgramError('One-reason output must retain one explanation')
     if contract['mode'] == 'all_failures' and contract['explanation'] != 'all':
         raise ProgramError('All-failures output must retain completeness')
+    if contract['mode'] == 'one_reason' and contract['result_type'] != 'record':
+        raise ProgramError('one_reason is a Boolean-witness operator producing a decision/reason record, not explanation text')
+    if contract['mode'] == 'all_failures' and contract['result_type'] != 'set':
+        raise ProgramError('all_failures is a Boolean-witness operator producing a set of failed condition names')
     if 'fields' in contract and (not isinstance(contract['fields'],list) or not contract['fields'] or
             any(not isinstance(f,str) or not f for f in contract['fields']) or len(set(contract['fields']))!=len(contract['fields'])):
         raise ProgramError('Contract fields must be unique nonempty string names')
+    if 'fields' in contract and contract['result_type'] != 'record':
+        raise ProgramError('Contract fields require a record result type')
+    if (contract['mode'] == 'one_reason' and 'fields' in contract
+            and set(contract['fields']) != {'decision', 'reason'}):
+        raise ProgramError('one_reason record fields are exactly decision and reason')
     return deepcopy(contract)
+
+
+def validate_program_contract(program, contract, *, allow_rule_placeholder=False,
+                              rule_completion_available=False):
+    """Reject static dead ends without changing the immutable output contract.
+
+    A sourced rule can replace a typed initial variable expression. Its concrete
+    instantiation must satisfy the mode/root relation; only that initial
+    placeholder is exempt. An existing rule route can supply a later complete
+    rule collection, so intermediate instantiations may remain incomplete.
+    """
+    program = validate_program(program)
+    contract = validate_output_contract(contract)
+    expression = program['expression']
+    kind = expression_type(expression, program['variables'])
+    if kind != contract['result_type']:
+        # JSON string constants do not carry the entity/text distinction of a
+        # declared variable. Permit either spelling for a literal string only.
+        literal_string = (expression['op'] == 'const'
+                          and isinstance(expression['value'], str)
+                          and contract['result_type'] in ('text', 'entity'))
+        if not literal_string:
+            raise ProgramError('Program expression result type differs from the immutable output contract')
+    placeholder = (allow_rule_placeholder and expression['op'] == 'var'
+                   and program.get('rule_binding') is not None)
+    required_root = {'one_reason': 'one_reason', 'all_failures': 'failures'}.get(contract['mode'])
+    if required_root is not None and expression['op'] != required_root and not placeholder:
+        raise ProgramError(f"Output mode {contract['mode']} requires expression root {required_root}; "
+                           'ordinary explanation text or lists use value/semantic mode')
+    if 'fields' in contract and expression['op'] in ('record', 'const'):
+        fields = (expression['fields'] if expression['op'] == 'record'
+                  else expression['value'] if isinstance(expression['value'], dict) else {})
+        if set(fields) != set(contract['fields']):
+            raise ProgramError('Program record fields differ from the immutable output contract')
+    if (contract['mode'] != 'semantic' and not program.get('rules_complete', True)
+            and not rule_completion_available and not placeholder):
+        short_circuit = expression['op'] in ('one_reason', 'and')
+        if short_circuit:
+            outcome = possible_outputs(program, {})
+            # A root's spelling alone is insufficient: an all-true necessary
+            # conjunction (or contradictory legal domain) has no negative
+            # witness route. Indeterminate outcomes retain the possibility.
+            if outcome['status'] == 'inconsistent':
+                short_circuit = False
+            elif outcome['status'] == 'determined':
+                output = outcome['outputs'][0]
+                short_circuit = (output is False if expression['op'] == 'and'
+                                 else isinstance(output, dict) and output.get('decision') is False)
+        if not short_circuit:
+            raise ProgramError('Incomplete rules have no rule completion route or supported negative-witness short circuit. '
+                               'rules_complete concerns the solving relation, not unknown factual inputs; '
+                               'a direct sourced lookup has a complete relation with unbound facts. '
+                               'Memory-derived decision rules require a preplanned rule_binding.')
+    return program
 
 
 def certificate_valid(certificate, program, valid_facts, contract, *, program_revision=0,

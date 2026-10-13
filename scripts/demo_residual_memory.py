@@ -42,7 +42,7 @@ def rule_plan(mode):
      step('O','根据{rules}检查脱网可用性。',['rules']),
      step('decision','综合规则与符合性输出完整所需结果。',['rules','D','A','O'],'compose')],
    'final_node_id':'decision','output_contract':contract(mode,'set' if mode=='all_failures' else 'record'),
-   'program':{'variables':{'rule':{'type':'rule','demand':'rules'},'result':{'type':'record','demand':'decision'}},
+   'program':{'variables':{'rule':{'type':'rule','demand':'rules'},'result':{'type':'set' if mode=='all_failures' else 'record','demand':'decision'}},
      'expression':var('result'),'rules_complete':False,
      'rule_binding':{'variable':'rule','condition_demands':['D','A','O']}}}
 
@@ -83,7 +83,8 @@ class SourcesOnly:
     val=None;used=[]
     if self.scenario=='rule':
      if v=='rule' and 'm1' in docs and 'm2' in docs:
-      a=int(re.search(r'新增(\d+)秒',text).group(1));d=int(re.search(r'删除后(\d+)秒起',text).group(1))
+      rule_text=docs['m2']['text']
+      a=int(re.search(r'新增(\d+)秒',rule_text).group(1));d=int(re.search(r'删除后(\d+)秒起',rule_text).group(1))
       violation=op('and',op('ge',var('return_age'),const({'number':d,'unit':'s'})),var('returned'))
       fields={'D':op('if',violation,
                   const(False),var('delete_compliant')),
@@ -93,7 +94,7 @@ class SourcesOnly:
        'add_age':{'type':'number','unit':'s','demand':'A'},'offline':{'type':'bool','demand':'O'}},
        'expression':{'op':'failures' if self.plan['output_contract']['mode']=='all_failures' else 'one_reason','fields':fields},
        'constraints':[op('not',op('and',var('delete_compliant'),violation))],
-       'rules_complete':'无其他门槛' in text};used=['m1','m2']
+       'rules_complete':'无其他门槛' in rule_text};used=['m1','m2']
      if v in ('return_age','returned') and 'm4' in docs and '针对 V8' in docs['m4']['text']:
       val=int(re.search(r'删除后(\d+)秒',docs['m4']['text']).group(1)) if v=='return_age' else '仍被返回' in docs['m4']['text'];used=['m4']
      if v=='add_age' and 'm8' in docs:
@@ -123,7 +124,43 @@ class SourcesOnly:
       rows=[{'id':v+'-gap','stance':'partial','value':None,'source_ids':[docs.get({'rule':'m1','return_age':'m3','returned':'m3','add_age':'m6','offline':'m7'}.get(v),next(iter(docs.values())))['id']],
        'entity_scope':data['required_scope']['entity_scope'],'time_scope':data['required_scope']['time_scope'],
        'parent_versions':{},'retract_ids':[],'reason':'Only a clue; no value established'}]
-    slots.append({'variable':v,'observations':rows,'unresolved':[] if val is not None or operation.startswith('audit_joint') else ['Still need an applicable observation']})
+    # A cited partial row already names the exact unresolved clue. Do not add
+    # a second, uncited challenge to every unrelated passage in this window.
+    slot={'variable':v,'observations':rows,'unresolved':[] if rows or operation.startswith('audit_joint') else ['Still need an applicable observation']}
+    if val is not None and rows and not self.bad_rows:
+     # Explicitly review the retained original clue before discharging its
+     # obligation. This synthetic service knows only the finite invented source
+     # grammar above; an arbitrary/contradictory new passage is not ignored.
+     visible={s['id']:s for s in data['source_spans']}
+     supported={source for row in rows for source in row['source_ids']}
+     resolved=[]
+     for obligation in data.get('evidence_obligations',[]):
+      if obligation['variable']!=v:continue
+      required=set(obligation['source_ids'])
+      if not required<=set(visible):continue
+      remainder=required-supported
+      def known_clue(alias):
+       source=visible[alias];doc=source['doc_id'];raw=source['text']
+       if self.scenario=='rule':return doc in PASSAGES and raw==PASSAGES[doc]
+       if self.scenario=='chain':
+        patterns={'film':r'Ash Wind was directed by [^.]+\.',
+                  'school':r'[^.]+ earns degrees of [^.]+\.',
+                  'city':r'[^.]+ is located in [^.]+\.'}
+        return doc in patterns and re.fullmatch(patterns[doc],raw) is not None
+       if self.scenario=='comparison':
+        return (doc in ('x','y') and re.fullmatch(doc+r' = \d+\.',raw) is not None
+                or raw in ('No value here.','First clue.','Second clue.'))
+       return False
+      if not all(known_clue(alias) for alias in remainder):continue
+      if remainder:
+       rows.append({'id':v+'-review-'+obligation['id'],'stance':'irrelevant','value':None,
+        'source_ids':sorted(remainder),'entity_scope':data['required_scope']['entity_scope'],
+        'time_scope':data['required_scope']['time_scope'],'parent_versions':{},'retract_ids':[],
+        'reason':'Re-read the retained synthetic clue: it points to the now supplied detailed test '
+                 'or describes another declared task/version; it supplies no competing value for this scoped variable.'})
+      resolved.append(obligation['id'])
+     if resolved:slot['resolved_obligation_ids']=resolved
+    slots.append(slot)
    value={'slots':slots}
    if operation.startswith('semantic_compose') or data.get('public_options'):
     terminal_values=[r['value'] for slot in slots if data['variables'][slot['variable']]['demand']==data['task']['output_slot']

@@ -22,6 +22,10 @@ def display(value):
 
 
 class ResidualControl:
+    # A failed audit authorizes another evidence-backed attempt, never publication
+    # of its rejected answer. All attempts still share the original ledger.
+    MAX_AUDIT_CORRECTIONS = 2
+
     def __init__(self, engine):
         self.e, self.state = engine, engine.fact_state
         self.reader = JointReader(engine,self.state)
@@ -33,6 +37,12 @@ class ResidualControl:
         self.format_identity = None
         self.formatted_prediction = None
         self.format_input = None
+        self.audit_corrections = 0
+        self.audit_feedback = None
+        self.audit_replayed = False
+        self.semantic_audit_identity = None
+        self.forced_demands = set()
+        self.read_attempts, self.read_effects, self.compose_exhausted = set(), set(), set()
         self.e.derivation_verifier = self.verify_derivation
 
     def candidate(self):
@@ -155,6 +165,20 @@ class ResidualControl:
             cert['rule_assumptions']={'variable':v,'version':self.state.versions[v],
                 'identity':digest(values[v]),'route_ids':self.state.rule_route_ids}
             cert['source_ids']=sorted(set(cert['source_ids'])|set(sources[v]))
+        # Local elimination relies on the same actual grounding chain as
+        # publication. A settled child cannot hide its pending parent source.
+        _,_,routes=self.state.valid()
+        dependencies=set(cert['fact_versions'])
+        if cert.get('rule_assumptions'):
+            dependencies.add(cert['rule_assumptions']['variable'])
+        frontier=list(dependencies)
+        while frontier:
+            for rid in routes.get(frontier.pop(),[]):
+                for parent in self.state.routes[rid]['parent_versions']:
+                    if parent not in dependencies:
+                        dependencies.add(parent);frontier.append(parent)
+        if dependencies & self.state.pending:
+            return None
         cert['scope']={'task_projection':task,**scope}
         return cert
 
@@ -176,6 +200,84 @@ class ResidualControl:
                     if p not in variables:
                         variables.add(p);pending.append(p)
         return variables
+
+    def semantic_binding_identity(self):
+        """Identity of the actual typed terminal and its grounding assumptions."""
+        values,sources,routes=self.state.valid()
+        return digest({v:{'value':values.get(v),'sources':sources.get(v,[]),
+            'routes':routes.get(v,[]),'version':self.state.versions.get(v),
+            'pending':v in self.state.pending} for v in sorted(self.semantic_dependencies())})
+
+    def semantic_inputs_current(self):
+        if self.reader.semantic_inputs is None:
+            return False
+        values,_,_=self.state.valid()
+        dependencies=self.semantic_dependencies()
+        current={v:{'version':self.state.versions[v],'identity':digest(values[v])}
+            for v in sorted(dependencies) if v in values}
+        return (dependencies<=set(values) and not dependencies & self.state.pending and
+            current==self.reader.semantic_inputs.get('binding_dependencies'))
+
+    def semantic_publication_identity(self):
+        dependencies=self.semantic_dependencies()
+        routes=[]
+        for route in self.state.routes.values():
+            if route['variable'] in dependencies:
+                row=deepcopy(route)
+                row['revoked']=sorted({digest(r):r for r in row['revoked']}.values(),key=digest)
+                routes.append(row)
+        return digest([self.semantic_binding_identity(),self.state.program,
+            sorted(routes,key=digest),self.reader.semantic_result,self.reader.semantic_prediction])
+
+    def typed_terminal_value(self):
+        # Legacy DAG node answers are display strings, not typed bindings. Never
+        # round-trip those strings when validating or publishing a typed result.
+        values,_,_=self.state.valid()
+        expression=self.state.program['expression']
+        if expression['op']=='var':
+            return deepcopy(values.get(expression['id']))
+        outcome=possible_outputs(self.state.program,values,
+            max_states=self.e.s['max_enumeration_states'])
+        if outcome['status']=='determined':
+            return deepcopy(outcome['outputs'][0])
+        return None
+
+    def recover_after_audit(self,reason):
+        """Keep all counters/obligations and allow bounded local correction."""
+        self.e.audit_complete=False
+        self.semantic_audit_identity=None
+        self.certificate=None
+        if (self.audit_corrections>=self.MAX_AUDIT_CORRECTIONS or
+                self.audit_replayed or
+                self.e.ledger.remaining('llm')<=self.e.s['reserved_audit_calls']):
+            return False
+        self.audit_corrections+=1
+        recent=[b for b in self.reader.batches if b['operation']=='audit_joint']
+        self.audit_feedback={'reason':reason,'correction_round':self.audit_corrections,
+            'previous_semantic_answer':deepcopy(self.reader.semantic_result),
+            'previous_prediction':self.reader.semantic_prediction,
+            'audits':[{'verdict':b.get('audit_verdict'),
+                'failed_slots':deepcopy(b.get('failed_slots',[]))} for b in recent[-1:]],
+            'instruction':'Re-evaluate using the original evidence and all retained counterevidence. '
+                'Retract an unsupported old route explicitly before replacing it. '
+                'A corrected terminal must pass a fresh audit; do not repeat the rejected answer unchanged.'}
+        if self.state.contract['mode']=='semantic':
+            self.forced_demands.add(self.e.final_node_id)
+            self.reader.semantic_inputs=None
+            self.reader.semantic_result=None
+            self.reader.semantic_prediction=None
+        else:
+            # A symbolic certificate may depend on retrieval nodes only. Re-read
+            # those local facts, not an unrelated terminal answer generation.
+            values,_,_=self.state.valid()
+            variables=set(values)|self.state.pending
+            self.forced_demands.update(self.state.program['variables'][v]['demand']
+                for v in variables if v not in self.state.program.get('task_expressions',{}))
+        self.format_identity=None;self.formatted_prediction=None;self.format_input=None
+        self.e.event({'event':'audit_correction_scheduled','reason':reason,
+            'round':self.audit_corrections,'max_rounds':self.MAX_AUDIT_CORRECTIONS,
+            'active_demands':sorted(self.forced_demands)})
+        return True
 
     def grounded(self,step):
         values,_,_=self.state.valid()
@@ -220,9 +322,12 @@ class ResidualControl:
         if not self.e.capabilities.residual_control:
             tasks|={s['output_slot'] for s in self.e.steps if s['execution']=='retrieval' and s['output_slot'] not in self.visited}
         # A locally certified field has solved its DAG node even when an
-        # unused input remains unbound. Keep pending observations repairable.
-        tasks={t for t in tasks if self.task_projection(t) is None or
-               any(v in self.state.pending for v in self.demand_variables(t))}
+        # eliminated input retains an unresolved evidence obligation. The
+        # certificate itself rejects pending *used* assumptions. Keep every
+        # other obligation stored: invalidating the decisive source removes
+        # this projection and reactivates its local task automatically.
+        tasks={t for t in tasks if self.task_projection(t) is None}
+        tasks |= self.forced_demands
         steps={s['output_slot']:s for s in self.e.steps}
         def parents(task):
             for p in steps[task]['inputs']:
@@ -323,16 +428,27 @@ class ResidualControl:
             if certificate.get('rule_assumptions'):
                 variables.add(certificate['rule_assumptions']['variable'])
             source_ids=certificate['source_ids']
-            key=digest(certificate)
         else:
             variables=self.semantic_dependencies()-set(self.state.program.get('task_expressions',{}))
             source_ids=sorted({s for v in variables for s in sources.get(v,[])})
-            key=digest([values,self.state.versions,self.reader.semantic_inputs])
+        # Call counters/history and duplicate counter records do not constitute
+        # new evidence. A changed answer, real route or counter does.
+        routes=[]
+        for route in self.state.routes.values():
+            if route['variable'] in variables:
+                row=deepcopy(route)
+                row['revoked']=sorted({digest(r):r for r in row['revoked']}.values(),key=digest)
+                routes.append(row)
+        key=digest([certificate,self.semantic_binding_identity(),
+            self.reader.semantic_result,self.reader.semantic_prediction,sorted(routes,key=digest)])
+        self.audit_replayed=False
         if not variables and certificate:
             # Pure tautology has no semantic facts to audit. Still validate its
             # nonempty worlds and derivation with the free evaluator.
             self.e.audit_complete=True;return True
         if key in self.audited:
+            self.e.audit_complete=False
+            self.audit_replayed=True
             return False
         self.audited.add(key)
         doc_ids=list(dict.fromkeys(self.e.spans[s]['doc_id'] for s in source_ids))
@@ -353,11 +469,28 @@ class ResidualControl:
         self.e.audit_complete=bool(relevant) and all(b.get('audit_complete') for b in relevant)
         return self.e.audit_complete
 
+    def terminal_format_request(self, certificate):
+        """The exact paid formatting envelope, shared with capacity checks."""
+        from .personamem import TERMINAL_CHOICE_INSTRUCTION
+        sources=[deepcopy(self.e.spans[s]) for s in certificate['source_ids']]
+        data={'terminal_node_id':self.e.final_node_id,'certificate':certificate,
+              'semantic_result':certificate['output'],'original_source_spans':sources,
+              'public_output_question':self.e.reader_question,'public_options':self.e.output_options,
+              'output_identity':self.e.output_identity}
+        schema={'type':'object','properties':{'semantic_answer':{},'final_prediction':{'type':['string','null']}},
+                'required':['semantic_answer','final_prediction'],'additionalProperties':False}
+        system=('This is the first and only generation at the designated deterministic DAG terminal. '
+            'Return semantic_answer (the exact typed result) and its corresponding final_prediction together. '
+            'Use the computed result and its original sources. Return null label if ambiguous. '
+            'Never guess or change the semantic result. No subsequent Reader or option matcher will run.'
+            + TERMINAL_CHOICE_INSTRUCTION)
+        return system,data,schema
+
     def terminal_format(self, certificate):
         """The designated terminal's output phase, no upstream option exposure."""
         if self.e.output_options is None:
             return True
-        from .personamem import parse_choice, TERMINAL_CHOICE_INSTRUCTION
+        from .personamem import parse_choice
         value=certificate['output']
         matches=[chr(97+i) for i,text in enumerate(self.e.output_options) if str(text).strip()==str(value).strip()]
         if len(matches)==1:
@@ -378,13 +511,8 @@ class ResidualControl:
         if self.format_identity==identity:
             return self.formatted_prediction is not None
         self.format_identity=identity
-        sources=[deepcopy(self.e.spans[s]) for s in certificate['source_ids']]
-        data={'terminal_node_id':self.e.final_node_id,'certificate':certificate,
-              'semantic_result':value,'original_source_spans':sources,
-              'public_output_question':self.e.reader_question,'public_options':self.e.output_options,
-              'output_identity':self.e.output_identity}
-        schema={'type':'object','properties':{'semantic_answer':{},'final_prediction':{'type':['string','null']}},
-                'required':['semantic_answer','final_prediction'],'additionalProperties':False}
+        system,data,schema=self.terminal_format_request(certificate)
+        sources=data['original_source_spans']
         def validate(response):
             if not isinstance(response,dict) or set(response)!={'semantic_answer','final_prediction'}:
                 raise ProtocolError('Terminal output requires semantic_answer and final_prediction together')
@@ -394,15 +522,56 @@ class ResidualControl:
             if prediction is not None and parse_choice(prediction,self.e.output_options) is None:
                 raise ProtocolError('Invalid terminal option label')
             return prediction
-        self.formatted_prediction=self.e.reasoner.json('semantic_compose',
-            'This is the first and only generation at the designated deterministic DAG terminal. Return semantic_answer (the exact typed result) and its corresponding final_prediction together. Use the computed result and its original sources. Return null label if ambiguous. Never guess or change the semantic result. No subsequent Reader or option matcher will run.' + TERMINAL_CHOICE_INSTRUCTION,
-            data,validate,schema,reserve_repairs=0)
+        self.formatted_prediction=self.e.reasoner.json('semantic_compose',system,data,validate,schema,reserve_repairs=0)
         self.format_input={'doc_ids':list(dict.fromkeys(s['doc_id'] for s in sources)),
             'validation_complete':self.formatted_prediction is not None,
             'response_ref':self.e.reasoner.last_response.get('response_ref'),
             'request':deepcopy(self.e.reasoner.last_response),'output_identity':self.e.output_identity,
             'certificate_identity':digest(certificate),'scope':'semantic_terminal_output'}
         return self.formatted_prediction is not None
+
+    def read_progress(self, step, query, variables, doc_ids, identity, **options):
+        """A repeated local read/effect cannot restart the control loop.
+
+        A parent review can clear a gap that a terminal immediately recreates,
+        so comparing only each individual call's before/after state is not
+        enough. Keep scoped input/effect identities across those transitions.
+        This does not exhaust retrieval: a rejected repeat still falls through
+        to the same bridge session, whose frontier may supply genuinely new
+        original text. The reader signature includes every new window, fact,
+        source, counter and obligation, but excludes logs and call counters.
+        """
+        before=self.reader.material_signature()
+        attempt=digest([identity,before,list(dict.fromkeys(doc_ids)),options])
+        if attempt in self.read_attempts:
+            self.e.event({'event':'local_read_replay_skipped','node_id':step['output_slot'],
+                'identity':identity,'reason':'same_original_text_and_material_state'})
+            return False
+        self.read_attempts.add(attempt)
+        changed=self.reader.read(step,query,variables,doc_ids,identity,**options)
+        effect=digest([identity,self.reader.material_signature()])
+        fresh=effect not in self.read_effects
+        self.read_effects.add(effect)
+        if changed and not fresh:
+            self.e.event({'event':'local_read_cycle_detected','node_id':step['output_slot'],
+                'identity':identity,'reason':'previous_material_state_recreated',
+                'pending_variables':sorted(self.state.pending)})
+        return changed and fresh
+
+    def review_existing_obligations(self, step, variables, identity):
+        if step['output_slot'] in self.forced_demands:
+            return True
+        values,_,routes=self.state.valid()
+        related=set(variables)|{v for v,d in self.state.program['variables'].items()
+            if v in values and d['demand'] in step['inputs']}
+        frontier=list(related)
+        while frontier:
+            for rid in routes.get(frontier.pop(),[]):
+                for parent in self.state.routes[rid]['parent_versions']:
+                    if parent not in related:
+                        related.add(parent);frontier.append(parent)
+        return any(item['variable'] in related and identity not in item.get('origins',[])
+            for item in self.reader.evidence_obligations.values())
 
     def run(self):
         if self.e.audit_complete and self.certificate is not None and self.certificate==self.candidate():
@@ -416,18 +585,21 @@ class ResidualControl:
         while True:
             outcome,active=self.update()
             cert=self.candidate()
-            ready=cert is not None and (self.e.capabilities.residual_control or not active)
+            ready=cert is not None and not self.forced_demands and (self.e.capabilities.residual_control or not active)
             semantic=self.state.contract['mode']=='semantic'
             values,_,_=self.state.valid()
             terminal_variables=self.demand_variables(self.e.final_node_id)
-            semantic_ready=(semantic and bool(terminal_variables) and self.reader.semantic_inputs is not None
+            semantic_ready=(semantic and not self.forced_demands and bool(terminal_variables) and self.reader.semantic_inputs is not None
                 and self.reader.semantic_inputs['validation_complete'] and
-                all(v in values and v not in self.state.pending for v in self.semantic_dependencies()))
+                self.semantic_inputs_current())
             if ready or semantic_ready:
+                binding_identity=self.semantic_binding_identity()
                 try:
                     if cert and not self.terminal_format(cert):
                         self.stop_reason='invalid_output_format';break
                     if not self.audit(cert):
+                        if self.recover_after_audit('audit_rejected'):
+                            continue
                         self.stop_reason='audit_incomplete';break
                 except (BudgetExceeded,InputOverflow,ProtocolError,ProgramError) as exc:
                     self.error('audit',exc);self.stop_reason='audit_incomplete';break
@@ -437,14 +609,29 @@ class ResidualControl:
                     if new!=cert:
                         self.e.audit_complete=False
                         self.e.event({'event':'certificate_invalidated_after_audit','old_identity':digest(cert)})
-                        continue
+                        if self.recover_after_audit('certificate_changed'):
+                            continue
+                        self.stop_reason='audit_incomplete';break
                     self.certificate=new;self.stop_reason='certified';break
                 values,_,_=self.state.valid()
-                if not all(v in values for v in self.demand_variables(self.e.final_node_id)):
-                    self.e.audit_complete=False;continue
+                if (binding_identity!=self.semantic_binding_identity() or
+                        not all(v in values for v in self.semantic_dependencies())):
+                    if self.recover_after_audit('semantic_bindings_changed'):
+                        continue
+                    self.stop_reason='audit_incomplete';break
+                self.semantic_audit_identity=self.semantic_publication_identity()
                 self.stop_reason='semantic_assessed';break
             if outcome['status']=='inconsistent':
                 self.stop_reason='inconsistent';break
+            if outcome['status']=='determined' and not semantic and not active and cert is None:
+                self.stop_reason='uncertifiable_output'
+                self.e.event({'event':'determined_output_not_certifiable',
+                    'mode':self.state.contract['mode'],'result_type':self.state.contract['result_type'],
+                    'expression_op':self.state.program['expression']['op'],
+                    'rules_complete':self.state.program.get('rules_complete',True),
+                    'pending_variables':sorted(self.state.pending),
+                    'reason':'No certificate and no remaining admissible evidence action; output is withheld.'})
+                break
             executed=False
             for step in self.e.steps:
                 nid=step['output_slot']
@@ -467,16 +654,34 @@ class ResidualControl:
                     'program_revision':self.state.revision,'program_identity':digest(self.state.program),
                     'initial_dag_identity':digest(self.e.steps),'bindings':{v:self.state.versions[v] for v in parent_vars},
                     'contract_identity':digest(self.state.contract)}
+                if self.audit_feedback is not None:
+                    identity['audit_correction']=digest(self.audit_feedback)
                 key=digest(identity)
                 if key in self.exhausted:
                     continue
+                if (step['execution']=='compose' and
+                        digest([key,self.reader.material_signature()]) in self.compose_exhausted):
+                    continue
                 try:
-                    if self.reader.read(step,query,variables,list(dict.fromkeys(self.local_pools.get(nid,[])+parent_docs)),key,
+                    before_read=self.reader.material_signature()
+                    if self.read_progress(step,query,variables,list(dict.fromkeys(self.local_pools.get(nid,[])+parent_docs)),key,
                             semantic=semantic and nid==self.e.final_node_id and step['execution']=='compose',
-                            terminal_output=nid==self.e.final_node_id and self.e.output_options is not None):
+                            terminal_output=nid==self.e.final_node_id and self.e.output_options is not None,
+                            review_existing_obligations=self.review_existing_obligations(step,variables,key)):
+                        self.forced_demands.discard(nid)
                         self.visited.update([nid] if self.local_complete(nid) else []);executed=True;break
+                    self.forced_demands.discard(nid)
                     if step['execution']=='compose':
-                        self.exhausted.add(key);continue
+                        blocked=digest([key,self.reader.material_signature()])
+                        newly_blocked=blocked not in self.compose_exhausted
+                        self.compose_exhausted.add(blocked)
+                        if newly_blocked and before_read!=self.reader.material_signature():
+                            # This read recreated an old unresolved state. Close
+                            # that composition once, then let its newly pending
+                            # parents advance their still-live bridge frontiers.
+                            # New text/facts may later admit a different attempt.
+                            executed=True;break
+                        continue
                     if self.e.ledger.remaining('llm')<=self.e.s['reserved_audit_calls']:
                         self.exhausted.add(key);continue
                     if self.e.fixed_pool is not None:
@@ -493,8 +698,9 @@ class ResidualControl:
                             self.exhausted.add(key);continue
                     self.local_pools[nid]=list(dict.fromkeys(self.local_pools.get(nid,[])+local))
                     self.e.add_candidates(local)
-                    self.reader.read(step,query,variables,local,key,semantic=semantic and nid==self.e.final_node_id,
-                        terminal_output=nid==self.e.final_node_id and self.e.output_options is not None)
+                    self.read_progress(step,query,variables,local,key,semantic=semantic and nid==self.e.final_node_id,
+                        terminal_output=nid==self.e.final_node_id and self.e.output_options is not None,
+                        review_existing_obligations=False)
                     self.visited.update([nid] if self.local_complete(nid) else []);executed=True;break
                 except RefusalError:
                     raise
@@ -524,6 +730,11 @@ class ResidualControl:
             'navigation_provenance':self.e.navigation_provenance,
             'local_pools':self.local_pools,'exhausted':list(self.exhausted),
             'visited':list(self.visited),'audited':list(self.audited),'last_active':self.last_active,
+            'audit_corrections':self.audit_corrections,'audit_feedback':self.audit_feedback,
+            'audit_replayed':self.audit_replayed,'forced_demands':sorted(self.forced_demands),
+            'read_attempts':sorted(self.read_attempts),'read_effects':sorted(self.read_effects),
+            'compose_exhausted':sorted(self.compose_exhausted),
+            'semantic_audit_identity':self.semantic_audit_identity,
             'reader':{'read_states':[[*k,v] for k,v in self.reader.read_states.items()],
                 **self.reader.obligation_snapshot(),
                 'gaps':[[*k,v] for k,v in self.reader.gaps.items()],'clues':self.reader.clues,
@@ -550,6 +761,14 @@ class ResidualControl:
         self.local_pools=deepcopy(snapshot['local_pools'])
         self.exhausted=set(snapshot['exhausted']);self.visited=set(snapshot['visited'])
         self.audited=set(snapshot['audited']);self.last_active=snapshot['last_active']
+        self.audit_corrections=snapshot.get('audit_corrections',0)
+        self.audit_feedback=deepcopy(snapshot.get('audit_feedback'))
+        self.audit_replayed=snapshot.get('audit_replayed',False)
+        self.semantic_audit_identity=snapshot.get('semantic_audit_identity')
+        self.forced_demands=set(snapshot.get('forced_demands',[]))
+        self.read_attempts=set(snapshot.get('read_attempts',[]))
+        self.read_effects=set(snapshot.get('read_effects',[]))
+        self.compose_exhausted=set(snapshot.get('compose_exhausted',[]))
         r=snapshot['reader']
         self.reader.restore_obligations(r)
         self.reader.read_states={(i,a):v for i,a,v in r['read_states']}
@@ -573,11 +792,15 @@ class ResidualControl:
         sources=local_terminal.provenance(self.e.graph,self.e.final_node_id)
         semantic_valid=(self.stop_reason=='semantic_assessed' and self.reader.semantic_inputs is not None
             and self.reader.semantic_inputs['validation_complete'] and sources is not None
-            and not (self.semantic_dependencies() & self.state.pending))
+            and self.semantic_inputs_current()
+            and self.semantic_audit_identity==self.semantic_publication_identity())
+        if self.stop_reason=='semantic_assessed' and not semantic_valid:
+            self.e.audit_complete=False
+            self.stop_reason='audit_incomplete'
         success=self.e.audit_complete and (self.certificate is not None or semantic_valid)
-        value=self.certificate['output'] if self.certificate else self.e.node_map()[self.e.final_node_id].get('answer')
+        value=self.certificate['output'] if self.certificate else self.typed_terminal_value()
         prediction=display(value) if value is not None else None
-        if success and not self.certificate and self.e.output_options is not None and digest(self.reader.semantic_result)!=digest(value):
+        if success and not self.certificate and digest(self.reader.semantic_result)!=digest(value):
             success=False;self.stop_reason='invalid_output_format'
         if success and self.e.output_options is not None:
             from .personamem import parse_choice
@@ -615,6 +838,7 @@ class ResidualControl:
                 'fact_state':self.state.public_dict(),'joint_reading':self.reader.public_dict(),
                 'bridge_cost':self.e.bridge.public_dict(),'bridge_resume':self.e.bridge.snapshot(),
                 'audit_complete':self.e.audit_complete,'terminal_input':self.format_input or self.reader.semantic_inputs,
+                'audit_corrections':self.audit_corrections,'audit_feedback':self.audit_feedback,
                 'cost':cost,'reasoning_call_count':len(self.e.reasoner.requests),'legacy_reader_metrics':'not_applicable',
                 'reliability':{'cohort':'normal' if success else 'partially_read',
                     'mapping_status':'not_used','mapping_complete':False,'mapping_incomplete':False,

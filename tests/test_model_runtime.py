@@ -181,23 +181,23 @@ def builtin_key_profile(monkeypatch):
     {"llm": {"endpoint": "http://different-service/v1/chat/completions", "api_key": "other-secret"}},
     {"llm": {"endpoint": "http://111.19.156.30:8006/v1/chat/completions", "api_key": ""}},
 ])
-def test_bt_llm_builtin_key_fallback_without_matching_local_key(builtin_key_profile, tmp_path, local_credentials):
+def test_bt_llm_no_builtin_key_without_matching_local_key(builtin_key_profile, tmp_path, local_credentials):
     config = builtin_key_profile
     if local_credentials != "unconfigured":
         path = tmp_path / "credentials.json"
         config["credentials_file"] = str(path)
         if local_credentials != "missing_file":
             path.write_text(json.dumps(local_credentials))
-    assert resolve_api_key(config, "llm") == "Aa@11111"
+    assert resolve_api_key(config, "llm") == ""
 
 
-def test_bt_llm_builtin_key_overrides_stale_file_but_yields_to_environment(builtin_key_profile, tmp_path, monkeypatch):
+def test_bt_llm_local_file_key_yields_to_environment(builtin_key_profile, tmp_path, monkeypatch):
     config = builtin_key_profile
     path = tmp_path / "credentials.json"
     config["credentials_file"] = str(path)
     path.write_text(json.dumps({"llm": {
         "endpoint": "http://111.19.156.30:8006/v1/chat/completions", "api_key": "file-secret"}}))
-    assert resolve_api_key(config, "llm") == "Aa@11111"
+    assert resolve_api_key(config, "llm") == "file-secret"
     monkeypatch.setenv("BRIDGETREE_CHAT_API_KEY", "bt-env-secret")
     assert resolve_api_key(config, "llm") == "bt-env-secret"
     monkeypatch.setenv("DAG_LLM_API_KEY", "dag-env-secret")

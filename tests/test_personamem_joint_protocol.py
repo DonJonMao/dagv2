@@ -262,9 +262,10 @@ def test_read_and_repair_estimate_the_same_document_table_sent_to_the_model(monk
     estimate = engine.reasoner.estimate
 
     def inspect_estimate(operation, system, data, schema=None):
-        assert data["source_documents"]
-        assert all(source["doc_id"] in data["source_documents"] and "time_metadata" not in source
-                   for source in wire_source_rows(data))
+        if operation in ('joint_read', 'joint_read_repair'):
+            assert data["source_documents"]
+            assert all(source["doc_id"] in data["source_documents"] and "time_metadata" not in source
+                       for source in wire_source_rows(data))
         assert system == reader._system(data)
         count = estimate(operation, system, data, schema)
         estimates.append((digest(data), count))

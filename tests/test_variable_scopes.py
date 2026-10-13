@@ -148,6 +148,8 @@ def test_json_schema_applies_the_scope_of_each_requested_slot(stance):
         ("suggestion", FUTURE, suggestion_id, "Try piano"),
     ):
         row = observation(variable, value=value, stance=stance, **scope,
+                          parent_versions={"history": state.versions["history"]}
+                          if variable == "suggestion" and stance == "support" else {},
                           retract_ids=[route] if stance == "contradiction" else [])
         if stance == "contradiction":
             row["value"] = None

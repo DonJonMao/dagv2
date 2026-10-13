@@ -215,7 +215,7 @@ def completeness_plan(mode):
     return {'steps':[demo.step('rules','Find applicable rules'),demo.step('C','Check {rules}',['rules']),
         demo.step('decision','Apply all required conditions',['rules','C'],'compose')],
         'final_node_id':'decision','output_contract':demo.contract(mode,'set' if mode=='all_failures' else 'record'),
-        'program':{'variables':{'rule':{'type':'rule','demand':'rules'},'result':{'type':'record','demand':'decision'}},
+        'program':{'variables':{'rule':{'type':'rule','demand':'rules'},'result':{'type':'set' if mode=='all_failures' else 'record','demand':'decision'}},
             'expression':demo.var('result'),'rules_complete':False,
             'rule_binding':{'variable':'rule','condition_demands':['C']}}}
 
