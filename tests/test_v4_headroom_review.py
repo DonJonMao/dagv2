@@ -32,7 +32,8 @@ def large_personal_history():
     return reader, engine, state, calls
 
 
-def test_smaller_initial_window_admits_real_whole_repair_without_dropping_later_sources():
+@pytest.mark.parametrize('discovery', [False, True])
+def test_smaller_initial_window_admits_real_whole_repair_without_dropping_later_sources(discovery):
     reader, engine, state, calls = large_personal_history()
     aliases = list(engine.mapper.sources)
     groups = [[alias] for alias in aliases]
@@ -68,12 +69,25 @@ def test_smaller_initial_window_admits_real_whole_repair_without_dropping_later_
         return response(*[observation(identifier, cited, value=['piano', 'painting'])
                           for identifier in ('piano-draft', 'painting-draft')])
     calls.respond = answer
-    reader.read(engine.steps[0], 'Review activities', ['history'], list(engine.docs), 'headroom-history')
+    reader.read(engine.steps[0], 'Review activities', ['history'], list(engine.docs), 'headroom-history',
+                **({'discovery_doc_ids': list(engine.docs)} if discovery else {}))
     assert len(calls.requests) == 2 and engine.ledger.used['json_repairs'] == 1
     assert engine.s == fixed_settings and engine.mapper.sources == original_sources
     assert state.valid()[0]['history'] == ['piano', 'painting']
     assert reader.batches[0]['complete'] and reader.batches[0]['valid_rows'] == 2
-    assert reader.unread_obligations and state.pending == {'history'}
+    if discovery:
+        assert not reader.unread_obligations and not state.pending
+        shown = {source['id'] for source in calls.requests[0]['data']['source_spans']}
+        assert set(reader.discovery_frontier) == {('headroom-history', alias)
+                                                 for alias in aliases if alias not in shown}
+        assert all(('headroom-history', alias) not in reader.read_states
+                   for alias in aliases if alias not in shown)
+        assert len(reader.source_exposures) == 2
+        assert all({s['source_alias'] for s in exposure['sources']} == shown
+                   for exposure in reader.source_exposures)
+        assert all(exposure['status'] == 'batch_assessed' for exposure in reader.source_exposures)
+    else:
+        assert reader.unread_obligations and state.pending == {'history'}
     for request in calls.requests:
         data = request['data']
         operation = request['stage'][0]

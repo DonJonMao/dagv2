@@ -674,7 +674,8 @@ class ResidualControl:
                             semantic=semantic and nid==self.e.final_node_id and step['execution']=='compose',
                             terminal_output=nid==self.e.final_node_id and self.e.output_options is not None,
                             review_existing_obligations=self.review_existing_obligations(step,variables,key),
-                            source_scope='mandatory_closure' if compose else 'document_windows'):
+                            source_scope='mandatory_closure' if compose else 'document_windows',
+                            **({} if compose else {'discovery_doc_ids':self.local_pools.get(nid,[])})):
                         self.forced_demands.discard(nid)
                         self.visited.update([nid] if self.local_complete(nid) else []);executed=True;break
                     self.forced_demands.discard(nid)
@@ -711,7 +712,7 @@ class ResidualControl:
                     self.e.add_candidates(local)
                     self.read_progress(step,query,variables,local,key,semantic=semantic and nid==self.e.final_node_id,
                         terminal_output=nid==self.e.final_node_id and self.e.output_options is not None,
-                        review_existing_obligations=False)
+                        review_existing_obligations=False,discovery_doc_ids=local)
                     self.visited.update([nid] if self.local_complete(nid) else []);executed=True;break
                 except RefusalError:
                     raise
@@ -780,8 +781,7 @@ class ResidualControl:
         self.read_attempts=set(snapshot.get('read_attempts',[]))
         self.read_effects=set(snapshot.get('read_effects',[]))
         self.compose_exhausted=set(snapshot.get('compose_exhausted',[]))
-        r=snapshot['reader']
-        self.reader.restore_obligations(r)
+        r=self.reader.restore_obligations(snapshot['reader'])
         self.reader.read_states={(i,a):v for i,a,v in r['read_states']}
         self.reader.gaps={(i,a):v for i,a,v in r['gaps']}
         self.reader.clues=deepcopy(r['clues']);self.reader.batches=deepcopy(r['batches'])

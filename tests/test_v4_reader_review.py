@@ -59,13 +59,28 @@ def test_capacity_to_partial_remains_pending_and_forwards_its_original_text(audi
 def test_successful_empty_read_cannot_clear_another_querys_evidence_obligation():
     reader, engine, state, calls, aliases = capacity_downgrade()
     before = deepcopy(reader.obligation_snapshot())
+    exposures_before = before.pop('source_exposures')
+    calls_before = len(calls.requests)
     calls.respond = lambda index, data: response()
     reader.read(engine.steps[0], 'Recheck only established history', ['history'],
                 [engine.mapper.sources[aliases[0]]['doc_id']], 'unrelated-check')
     assert state.valid()[0]['history'] == ['piano']
     assert 'history' in state.pending
     assert 'history' in reader.pending_variables()
-    assert reader.obligation_snapshot() == before
+    after = reader.obligation_snapshot()
+    exposures_after = after.pop('source_exposures')
+    assert after == before
+    assert len(calls.requests) == calls_before + 1
+    assert exposures_after[:len(exposures_before)] == exposures_before
+    assert len(exposures_after) == len(exposures_before) + 1
+    exposure = exposures_after[-1]
+    assert exposure['query_identity'] == 'unrelated-check'
+    assert exposure['operation'] == 'joint_read' and exposure['request_status'] == 'returned'
+    assert exposure['status'] == 'incomplete' and exposure['variables'] == ['history']
+    # The earlier slot-level unresolved issue has no per-issue citation map:
+    # all originals from that window remain required, not only the partial's citation.
+    assert {source['source_alias'] for source in exposure['sources']} == set(aliases)
+    assert {source['id'] for source in calls.requests[-1]['data']['source_spans']} == set(aliases)
 
 
 def test_evidence_obligation_survives_reader_snapshot_restore_and_new_identity():

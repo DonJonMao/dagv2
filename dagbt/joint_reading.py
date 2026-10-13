@@ -1,7 +1,7 @@
 """Local fact-and-source reading, bounded by the actual reasoning wire input."""
 from copy import copy, deepcopy
 import json
-from .residual import validate_value, possible_outputs, ProgramError, UNITS
+from .residual import validate_value, variable_scope, possible_outputs, ProgramError, UNITS
 from .reasoning import ProtocolError, InputOverflow, RefusalError, OutputTruncated
 from .budget import BudgetExceeded
 from .support import make_span, validate_span
@@ -295,6 +295,12 @@ class JointReader:
         self.failed_obligations = {}
         self.failed_batch_reviews = {}
         self.evidence_obligations = {}
+        # Explicitly discovered, never-offered work is not an assertion about
+        # the evidence. Keep it separate from attempted and required work.
+        self.discovery_frontier = {}
+        self.discovery_contexts = {}
+        self.discovery_promotions = []
+        self.source_exposures = []
         self._fresh_initial_selection = None
 
     def material_signature(self):
@@ -311,16 +317,23 @@ class JointReader:
             routes.append(item)
         terminal=self.semantic_inputs or {}
         obligations=self.obligation_snapshot()
+        for name in ('frontier_policy_version','discovery_frontier','discovery_contexts','discovery_promotions','source_exposures','source_namespace'):
+            obligations.pop(name,None)
         for item in obligations['evidence_obligations']:
             item.pop('origins',None)
         for item in obligations['failed_batch_reviews']:
             item.pop('seen_source_ids',None)
             item.pop('seen_parent_signatures',None)
+        def original(alias):
+            source=self.e.mapper.sources.get(alias)
+            return ['source',source['source_id']] if source is not None else ['unavailable_alias',alias]
+        for item in obligations['unread_obligations']:
+            item[1]=original(item[1])
         return digest({'routes':sorted(routes,key=lambda r:r['id']),
             'program':self.state.program,'pending':sorted(self.state.pending),
-            'read_windows':sorted([*key,value] for key,value in self.read_states.items()),
+            'read_windows':sorted([identity,original(alias),value] for (identity,alias),value in self.read_states.items()),
             'gaps':sorted([*key,sorted(set(value))] for key,value in self.gaps.items() if value),
-            'clues':sorted([key,sorted(set(value))] for key,value in self.clues.items() if value),
+            'clues':sorted([key,sorted(original(alias) for alias in set(value))] for key,value in self.clues.items() if value),
             'obligations':obligations,
             'terminal':[self.semantic_result,self.semantic_prediction,
                         terminal.get('validation_complete'),terminal.get('binding_dependencies')]})
@@ -333,13 +346,261 @@ class JointReader:
         return {**{name:[[i,a,sorted(v)] for (i,a),v in getattr(self,name).items()]
                 for name in ('unread_obligations','failed_obligations')},
                 'evidence_obligations':deepcopy(sorted(self.evidence_obligations.values(),key=lambda x:x['id'])),
-                'failed_batch_reviews':deepcopy(sorted(self.failed_batch_reviews.values(),key=lambda x:x['id']))}
+                'failed_batch_reviews':deepcopy(sorted(self.failed_batch_reviews.values(),key=lambda x:x['id'])),
+                'frontier_policy_version':1,
+                'source_namespace':[self._source_identity(alias) for alias in self.e.mapper.sources],
+                'discovery_frontier':[[i,a,deepcopy(item)] for (i,a),item in self.discovery_frontier.items()],
+                'discovery_contexts':deepcopy(list(self.discovery_contexts.values())),
+                'discovery_promotions':deepcopy(self.discovery_promotions),
+                'source_exposures':deepcopy(self.source_exposures)}
 
     def restore_obligations(self, snapshot):
+        snapshot=self._rebind_snapshot_sources(snapshot)
         for name in ('unread_obligations','failed_obligations'):
             setattr(self,name,{(i,a):set(v) for i,a,v in snapshot.get(name,[])})
         self.evidence_obligations={item['id']:deepcopy(item) for item in snapshot.get('evidence_obligations',[])}
         self.failed_batch_reviews={item['id']:deepcopy(item) for item in snapshot.get('failed_batch_reviews',[])}
+        self.discovery_frontier={}
+        self.discovery_contexts={}
+        self.discovery_promotions=[]
+        self.source_exposures=[]
+        version=snapshot.get('frontier_policy_version')
+        if version is None:
+            if any(snapshot.get(name) for name in ('discovery_frontier','discovery_contexts','discovery_promotions','source_exposures')):
+                raise ProtocolError('Discovery state requires explicit frontier provenance version')
+            # Legacy unread entries retain their original hard meaning.
+            return snapshot
+        if type(version) is not int or version!=1:
+            raise ProtocolError('Unsupported discovery frontier provenance version')
+        for item in snapshot.get('discovery_contexts',[]):
+            self._validate_work_context(item)
+            if item['query_identity'] in self.discovery_contexts:
+                raise ProtocolError('Discovery identity has more than one scope/version context')
+            self.discovery_contexts[item['query_identity']]=deepcopy(item)
+        exposures=snapshot.get('source_exposures',[])
+        if not isinstance(exposures,list):
+            raise ProtocolError('Discovery exposure history must be a list')
+        attempted=set()
+        for record in exposures:
+            self._validate_work_context(record,allow_empty=True)
+            if (record.get('status') not in ('attempted','batch_assessed','incomplete')
+                    or not isinstance(record.get('sources'),list)):
+                raise ProtocolError('Discovery exposure history has an invalid work state')
+            for source in record['sources']:
+                alias=self._bound_source_alias(source)
+                attempted.add((record['query_identity'],alias))
+        completed={(identity,alias) for identity,alias,_ in snapshot.get('read_states',[])}
+        for identity,alias,item in snapshot.get('discovery_frontier',[]):
+            self._validate_work_context(item)
+            if (alias not in self.e.mapper.sources or not isinstance(item,dict)
+                    or item.get('status')!='unoffered'
+                    or item.get('provenance')!='explicit_discovery'
+                    or any(item.get('source',{}).get(k)!=v for k,v in self._source_identity(alias).items())
+                    or item.get('query_identity')!=identity
+                    or {k:v for k,v in item.items() if k not in ('source','provenance','status')}
+                        !=self.discovery_contexts.get(identity)
+                    or (identity,alias) in self.unread_obligations
+                    or (identity,alias) in attempted|completed
+                    or (identity,alias) in self.discovery_frontier):
+                raise ProtocolError('Discovery frontier has invalid or ambiguous provenance')
+            self.discovery_frontier[identity,alias]=deepcopy(item)
+        self.discovery_promotions=deepcopy(snapshot.get('discovery_promotions',[]))
+        for promotion in self.discovery_promotions:
+            if not isinstance(promotion,dict) or promotion.get('status')!='required_evidence':
+                raise ProtocolError('Discovery promotion history has an invalid work state')
+            self._validate_work_context(promotion.get('origin'))
+        self.source_exposures=deepcopy(exposures)
+        return snapshot
+
+    def _bound_source_alias(self, source):
+        """Validate immutable provenance; an old wire alias is not identity."""
+        if not isinstance(source,dict) or not isinstance(source.get('source_alias'),str):
+            raise ProtocolError('Source work has no stable original identity')
+        aliases=[alias for alias,item in self.e.mapper.sources.items()
+                 if item['source_id']==source.get('source_id')]
+        if len(aliases)!=1:
+            raise ProtocolError('Source work references an unavailable or ambiguous original')
+        alias=aliases[0]
+        if any(source.get(key)!=value for key,value in self._source_identity(alias).items()
+               if key!='source_alias'):
+            raise ProtocolError('Source work changed an original source or its metadata')
+        return alias
+
+    def _rebind_snapshot_sources(self, snapshot):
+        """Bind executable indices by stable sources, preserving old wire logs.
+
+        Alias permutation is allowed; different text, role, time, offsets or
+        adjacency is not. Legacy snapshots without stable namespace metadata
+        keep their original hard interpretation rather than guessing a map.
+        """
+        result=deepcopy(snapshot)
+        namespace=result.get('source_namespace')
+        mapping={}
+        if namespace is not None:
+            if not isinstance(namespace,list):
+                raise ProtocolError('Source namespace must contain explicit stable identities')
+            for source in namespace:
+                alias=self._bound_source_alias(source)
+                old=source['source_alias']
+                if old in mapping or alias in mapping.values():
+                    raise ProtocolError('Source namespace has ambiguous alias ownership')
+                mapping[old]=alias
+            result['source_namespace']=[self._source_identity(mapping[source['source_alias']]) for source in namespace]
+
+        def bound(alias):
+            if namespace is None:
+                return alias
+            if alias not in mapping:
+                raise ProtocolError('Source work has no saved stable alias binding')
+            return mapping[alias]
+
+        def active_source(source):
+            alias=self._bound_source_alias(source)
+            old=source['source_alias']
+            history=source.get('source_alias_history',[])
+            if not isinstance(history,list) or any(not isinstance(item,str) for item in history):
+                raise ProtocolError('Discovery source alias history is malformed')
+            if alias!=old:
+                source['source_alias_history']=[*history,old]
+                source['source_alias']=alias
+            return alias
+
+        for entry in result.get('discovery_frontier',[]):
+            identity,old,item=entry
+            if not isinstance(item,dict) or not isinstance(item.get('source'),dict) or item['source'].get('source_alias')!=old:
+                raise ProtocolError('Discovery frontier alias disagrees with its original source record')
+            alias=active_source(item['source'])
+            if namespace is not None and bound(old)!=alias:
+                raise ProtocolError('Discovery frontier changed source ownership')
+            entry[1]=alias
+        # Exposure aliases describe the actual archived request. Never rewrite
+        # them while retaining its old request_identity. The explicit current
+        # binding is only for restoration checks and executable indices.
+        for record in result.get('source_exposures',[]):
+            for source in record.get('sources',[]):
+                alias=self._bound_source_alias(source)
+                if alias!=source['source_alias'] or 'current_source_alias' in source:
+                    source['current_source_alias']=alias
+                if 'discovery_origin' in source:
+                    self._bound_source_alias(source['discovery_origin']['source'])
+        for promotion in result.get('discovery_promotions',[]):
+            source=promotion['origin']['source']
+            alias=self._bound_source_alias(source)
+            if alias!=source['source_alias'] or 'current_source_alias' in source:
+                source['current_source_alias']=alias
+        if namespace is not None:
+            result['unread_obligations']=[[i,bound(alias),variables]
+                for i,alias,variables in result.get('unread_obligations',[])]
+            if 'read_states' in result:
+                result['read_states']=[[i,bound(alias),state] for i,alias,state in result['read_states']]
+            if 'clues' in result:
+                result['clues']={i:[bound(alias) for alias in aliases] for i,aliases in result['clues'].items()}
+        return result
+
+    def _validate_work_context(self, item, *, allow_empty=False):
+        if not isinstance(item,dict):
+            raise ProtocolError('Discovery work requires explicit scope and version provenance')
+        variables=item.get('variables')
+        scopes=item.get('scopes')
+        parents=item.get('parent_versions')
+        program=item.get('program_identity')
+        if (not isinstance(item.get('query_identity'),str) or not item['query_identity']
+                or item.get('task_id') not in {step['output_slot'] for step in self.e.steps}
+                or not isinstance(variables,list) or (not variables and not allow_empty)
+                or any(not isinstance(v,str) or not v for v in variables)
+                or len(set(variables))!=len(variables)
+                or not isinstance(scopes,dict) or set(scopes)!=set(variables)
+                or any(not isinstance(scope,dict) or set(scope)!={'entity_scope','time_scope'}
+                       or any(not isinstance(value,str) for value in scope.values()) for scope in scopes.values())
+                or type(item.get('program_revision')) is not int or item['program_revision']<0
+                or not isinstance(program,str) or len(program)!=64 or any(c not in '0123456789abcdef' for c in program)
+                or not isinstance(parents,dict)
+                or any(not isinstance(v,str) or not v or type(version) is not int or version<0
+                       for v,version in parents.items())):
+            raise ProtocolError('Discovery work has malformed scope or version provenance')
+        programs=[self.state.initial_program,self.state.program,
+                  *(entry['program'] for entry in self.state.instantiations)]
+        original=next((candidate for candidate in programs if digest(candidate)==program),None)
+        if (original is None or item['program_revision']>self.state.revision
+                or not (set(variables)|set(parents))<=set(original['variables'])
+                or any(scopes[v]!=variable_scope(original['variables'][v],self.state.contract) for v in variables)):
+            raise ProtocolError('Discovery work does not match its archived program variables and scopes')
+
+    def _require_frontier_source(self, identity, alias):
+        origin=self.discovery_frontier.pop((identity,alias),None)
+        if origin is not None:
+            self.discovery_promotions.append({'status':'required_evidence','origin':origin})
+
+    def _source_identity(self, alias):
+        source=self.e.mapper.sources[alias]
+        return {'source_alias':alias,'source_id':source['source_id'],'doc_id':source['doc_id'],
+            'source_identity':digest({key:value for key,value in source.items() if key!='id'})}
+
+    def _discovery_context(self, step, variables, identity):
+        return {'query_identity':identity,'task_id':step['output_slot'],
+            'variables':sorted(variables),
+            'scopes':{v:deepcopy(self.state.scope(v)) for v in variables},
+            'program_revision':self.state.revision,'program_identity':digest(self.state.program),
+            'parent_versions':{v:self.state.versions[v] for v,d in self.state.program['variables'].items()
+                if d['demand'] in step['inputs']}}
+
+    def _frontier_entry(self, step, variables, alias, identity):
+        return {**self._discovery_context(step,variables,identity),'source':self._source_identity(alias),
+                'provenance':'explicit_discovery','status':'unoffered'}
+
+    def _record_source_exposure(self, data, identity, operation):
+        """Record the entire original-source scope before entering transport.
+
+        This is an attempted request, not a claim that the model used or even
+        received every source. Transport/preflight failure stays conservative.
+        The wire may include neighbours, parents or failed-review sources that
+        did not appear in the chosen window prefix or the model's citations.
+        """
+        variables=set(data['variables'])
+        sources=[]
+        for source in data['source_spans']:
+            alias=source['id']
+            item=self._source_identity(alias)
+            origin=self.discovery_frontier.pop((identity,alias),None)
+            if origin is not None:
+                item['discovery_origin']=origin
+            sources.append(item)
+            if variables:
+                self.unread_obligations.setdefault((identity,alias),set(variables))
+        record={'query_identity':identity,'operation':operation,'task_id':data['task']['output_slot'],
+            'variables':sorted(variables),'scopes':deepcopy(data['requested_scopes']),
+            'program_revision':data['program_revision'],
+            'program_identity':data['request_context']['program_identity'],
+            'parent_versions':{v:item['version'] for v,item in data['supported_parents'].items()},
+            'phase':self._failed_phase(data),'sources':sources,'status':'attempted',
+            'request_identity':digest(data),'logical_call_index':None}
+        self.source_exposures.append(record)
+        return record
+
+    def _request_with_exposure(self, operation, data, identity, wire, system, **options):
+        record=self._record_source_exposure(data,identity,operation)
+        sequence=self.e.reasoner.sequence
+        try:
+            response=self.e.reasoner.request(operation,system,wire,**options)
+        except BaseException as exc:
+            record['request_status']='failed'
+            record['error_type']=type(exc).__name__
+            for source in data['source_spans']:
+                if data['variables']:
+                    self.unread_obligations.setdefault((identity,source['id']),set()).update(data['variables'])
+            raise
+        else:
+            record['request_status']='returned'
+            return response
+        finally:
+            if self.e.reasoner.sequence>sequence:
+                record['logical_call_index']=self.e.reasoner.sequence
+            else:
+                record['request_status']='not_sent'
+
+    def _unread_after_exposures(self, identity, exposed):
+        return set().union(*(variables-exposed.get(alias,set()) if owner==identity else variables
+            for (owner,alias),variables in self.unread_obligations.items()))
 
     @staticmethod
     def _remap_summary_revision_sources(value, mapping):
@@ -1887,7 +2148,7 @@ class JointReader:
             try:
                 wire,system=self._prepare_wire(repair)
                 schema=self._schema(repair)
-                response=self.e.reasoner.request(operation+'_repair',system,wire,schema=schema)
+                response=self._request_with_exposure(operation+'_repair',repair,identity,wire,system,schema=schema)
                 if (not isinstance(response,dict) or set(response)!={'slots','semantic_answer','final_prediction'}
                         or response['slots']!=[]):
                     raise ProtocolError('Terminal-only repair must preserve validated facts and return slots=[]')
@@ -1927,9 +2188,38 @@ class JointReader:
         return data
 
     def read(self, step, query, variables, doc_ids, identity, *, semantic=False, audit=False,
-             terminal_output=False, review_existing_obligations=True, source_scope='document_windows'):
+             terminal_output=False, review_existing_obligations=True, source_scope='document_windows',
+             discovery_doc_ids=None):
+        hard_before=deepcopy((self.unread_obligations,self.failed_obligations,
+                              self.evidence_obligations,self.failed_batch_reviews))
+        exposure_count=len(self.source_exposures)
+        try:
+            return self._read(step,query,variables,doc_ids,identity,semantic=semantic,audit=audit,
+                terminal_output=terminal_output,review_existing_obligations=review_existing_obligations,
+                source_scope=source_scope,discovery_doc_ids=discovery_doc_ids)
+        except BaseException:
+            # A checkpoint or residual evaluation after an interrupted request
+            # must see its hard work. During an atomic request, temporary
+            # in-flight markers must not masquerade as pre-existing semantic
+            # gaps and enlarge the next mandatory proof projection.
+            hard_after=(self.unread_obligations,self.failed_obligations,
+                        self.evidence_obligations,self.failed_batch_reviews)
+            if hard_after!=hard_before or len(self.source_exposures)!=exposure_count:
+                self.state.pending.update(self.pending_variables())
+            raise
+
+    def _read(self, step, query, variables, doc_ids, identity, *, semantic=False, audit=False,
+              terminal_output=False, review_existing_obligations=True, source_scope='document_windows',
+              discovery_doc_ids=None):
         if source_scope not in ('document_windows','mandatory_closure'):
             raise ProtocolError('Unknown reading source_scope')
+        discovery=discovery_doc_ids is not None
+        if discovery and (source_scope!='document_windows' or audit
+                or not variables
+                or not isinstance(discovery_doc_ids,(list,tuple))
+                or any(not isinstance(d,str) for d in discovery_doc_ids)
+                or not set(discovery_doc_ids)<=set(doc_ids)):
+            raise ProtocolError('Discovery provenance requires ordinary candidate document_windows within doc_ids')
         before=self.material_signature()
         operation = 'audit_joint' if audit else 'semantic_compose' if semantic else 'joint_read'
         # Parent review slots do not turn a failed task output into new work.
@@ -1949,6 +2239,10 @@ class JointReader:
             # New local text can withdraw an actual grounding parent. Never
             # silently discard such a counter because it is outside local outputs.
             variables=list(dict.fromkeys([*variables,*sorted(related)]))
+        if discovery:
+            context=self._discovery_context(step,variables,identity)
+            if identity in self.discovery_contexts and self.discovery_contexts[identity]!=context:
+                raise ProtocolError('An existing discovery query identity cannot change source, scope or parent/program versions')
         if source_scope=='mandatory_closure':
             scope=self._mandatory_scope_payload(step,query,variables,doc_ids,identity,
                 semantic=semantic,audit=audit,terminal_output=terminal_output)
@@ -1982,13 +2276,40 @@ class JointReader:
                 and not recovery_ready and not (relevant_obligations and review_existing_obligations)):
             return False
         external_pending=set(self.state.pending)-self.pending_variables()
+        if discovery:
+            self.discovery_contexts.setdefault(identity,context)
+        queued=[a for i,a in self.discovery_frontier if i==identity and a in aliases]
+        for alias in queued:
+            entry=deepcopy(self.discovery_frontier[identity,alias])
+            entry['source'].pop('source_alias_history',None)
+            if entry!=self._frontier_entry(step,variables,alias,identity):
+                raise ProtocolError('An existing discovery query identity cannot change source, scope or parent/program versions')
+        required=[]
+        if discovery:
+            # The same candidate may already be a joint premise, an actual
+            # parent/rule source, a counter, or a sourced/failed obligation.
+            # Never classify these required relationships as pure discovery.
+            required=[s['id'] for s in self._payload(
+                step,query,variables,[],semantic,audit=audit)['source_spans']]
+            for alias in required:
+                self._require_frontier_source(identity,alias)
+                self.unread_obligations.setdefault((identity,alias),set()).update(variables)
         for alias in aliases:
-            if source_scope=='mandatory_closure':
+            key=(identity,alias)
+            if (discovery and self.e.mapper.sources[alias]['doc_id'] in discovery_doc_ids
+                    and alias not in required and key not in self.unread_obligations):
+                self.discovery_frontier.setdefault(key,self._frontier_entry(step,variables,alias,identity))
+            elif source_scope=='mandatory_closure':
                 # Preflight established full requested coverage; preserve the
                 # exact ownership of existing work, including on overflow.
-                self.unread_obligations.setdefault((identity,alias),set(variables))
+                self.unread_obligations.setdefault(key,set(variables))
             else:
-                self.unread_obligations[identity,alias]=set(variables)
+                self._require_frontier_source(identity,alias)
+                self.unread_obligations.setdefault(key,set()).update(variables)
+        if discovery:
+            # Resume this scope's ordered frontier before newly registered
+            # candidates. Source aliases/ownership are never renamed to fit.
+            aliases=list(dict.fromkeys([*queued,*aliases]))
         # Retrieval partitions document windows with neighbours. Compose/audit
         # consumes its exact mandatory original-source closure in one batch.
         groups = []
@@ -2046,6 +2367,8 @@ class JointReader:
             source_feedback={}
             obligation_feedback={}
             offered_frozen={}
+            exposure_start=len(self.source_exposures)
+            exposed={}
             current=deepcopy(data)
             prediction=None
             semantic_result=None
@@ -2067,8 +2390,11 @@ class JointReader:
                     wire,system=self._prepare_wire(current)
                     cap_options=({'output_token_cap':initial_cap}
                         if attempt==0 and not durable_reviews and initial_cap is not None else {})
-                    response=self.e.reasoner.request(operation if attempt==0 and not durable_reviews else operation+'_repair',
-                        system,wire,schema=self._schema(current),reserve=0 if audit else None,**cap_options)
+                    request_operation=operation if attempt==0 and not durable_reviews else operation+'_repair'
+                    for source in current['source_spans']:
+                        exposed.setdefault(source['id'],set()).update(current['variables'])
+                    response=self._request_with_exposure(request_operation,current,identity,wire,system,
+                        schema=self._schema(current),reserve=0 if audit else None,**cap_options)
                     if isinstance(response,dict) and isinstance(response.get('slots'),list):
                         # Repeating an identical draft is idempotent. Different
                         # drafts sharing an ID remain explicit repair obligations.
@@ -2298,8 +2624,7 @@ class JointReader:
                 recovered={rid for rid in recovered if not any(
                     key[0]==self.failed_batch_reviews[rid]['variable'] for key in next_failures)}
                 prospective_pending=(external_pending
-                    |set().union(*[v for (i,a),v in self.unread_obligations.items() if i!=identity or a not in batch],
-                                 self._failed_pending_after(recovered))
+                    |self._unread_after_exposures(identity,exposed)|self._failed_pending_after(recovered)
                     |{item['variable'] for item in self.evidence_obligations.values()}
                     |{key[0] for key in next_failures})
                 rejected=self._handoff_failures(valid,frozen-prior_frozen,prediction,semantic_result,
@@ -2405,8 +2730,12 @@ class JointReader:
                     'unresolved':['Complete-value disagreement remains unresolved; review the original scoped evidence without discarding conflicts.']}
                     for v in unresolved_whole},[],data,failures,identity)
             # Unrelated successful reads never erase another batch's marker.
-            for alias in batch:
-                self.unread_obligations.pop((identity,alias),None)
+            for alias,assessed_variables in exposed.items():
+                remaining=self.unread_obligations.get((identity,alias),set())-assessed_variables
+                if remaining:
+                    self.unread_obligations[identity,alias]=remaining
+                else:
+                    self.unread_obligations.pop((identity,alias),None)
             if related:
                 self._store_failed_reviews(step,identity,batch,data,current,failures,
                     observed_rows,observed_slots,duplicate_rows,protected_counters,whole_value_reviews,valid,frozen,source_feedback,
@@ -2433,9 +2762,14 @@ class JointReader:
                 diagnostic['audit_complete'] = not failures and audit_verdict=='supported' and not any(
                     self.gaps.get((identity,v)) for v in variables)
             self.batches.append(diagnostic);self.e.event({'event':'joint_read_completed',**diagnostic})
-            for alias in batch:
-                self.read_states[identity,alias]='invalid' if failures else ('irrelevant' if valid and all(
-                    r['stance']=='irrelevant' for r in valid) else 'read')
+            for alias in exposed:
+                # Successful required-slot validation assesses the whole wire
+                # scope conditionally. Uncited text is never called irrelevant.
+                self.read_states[identity,alias]='invalid' if failures else ('irrelevant' if not discovery
+                    and alias in batch and valid and all(r['stance']=='irrelevant' for r in valid) else 'read')
+            for exposure in self.source_exposures[exposure_start:]:
+                hard=set(exposure['variables']) & self.pending_variables()
+                exposure['status']='incomplete' if hard or failures or (audit and audit_verdict!='supported') else 'batch_assessed'
             if semantic or terminal_output:
                 self.semantic_inputs={'doc_ids':list(dict.fromkeys(s['doc_id'] for s in visible.values())),
                     'validation_complete':not failures,'response_ref':(self.e.reasoner.last_response or {}).get('response_ref'),
@@ -2453,7 +2787,7 @@ class JointReader:
                     'identity':digest(values[v])} for v in sorted(dependencies) if v in values}
                 self.semantic_prediction=prediction
                 self.semantic_result=semantic_result
-            if failures:
+            if failures or discovery:
                 break
         return before!=self.material_signature()
 

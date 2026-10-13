@@ -409,7 +409,9 @@ def test_audit_eliminated_pending_terminal_sibling_does_not_protect_parent_alter
     state.integrate([], reader.pending_variables())
     assert state.pending == {'sibling'}
     assert controller.candidate() == certificate
-    before = canonical((state.routes, state.versions, state.program, reader.obligation_snapshot()))
+    obligations_before = reader.obligation_snapshot()
+    exposures_before = obligations_before.pop('source_exposures')
+    before = canonical((state.routes, state.versions, state.program, obligations_before))
     assert controller.audit(certificate)
     assert len(calls.requests) == 1
     data = calls.requests[0]['data']
@@ -417,7 +419,16 @@ def test_audit_eliminated_pending_terminal_sibling_does_not_protect_parent_alter
     assert chosen in known_ids(data) and alternative not in known_ids(data)
     assert source_ids(data) == {'s1', 's2'}
     assert not data.get('evidence_obligations')
-    assert canonical((state.routes, state.versions, state.program, reader.obligation_snapshot())) == before
+    obligations_after = reader.obligation_snapshot()
+    exposures_after = obligations_after.pop('source_exposures')
+    assert canonical((state.routes, state.versions, state.program, obligations_after)) == before
+    assert exposures_after[:len(exposures_before)] == exposures_before
+    assert len(exposures_after) == len(exposures_before) + 1
+    exposure = exposures_after[-1]
+    assert exposure['operation'] == 'audit_joint' and exposure['request_status'] == 'returned'
+    assert exposure['status'] == 'batch_assessed'
+    assert set(exposure['variables']) == {'decisive', 'history'}
+    assert {s['source_alias'] for s in exposure['sources']} == {'s1', 's2'}
     assert state.pending == {'sibling'}
     assert alternative in state.routes and controller.candidate() == certificate
 

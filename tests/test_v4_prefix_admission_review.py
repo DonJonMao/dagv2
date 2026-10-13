@@ -5,7 +5,7 @@ import pytest
 
 from dagbt.reasoning import InputOverflow
 from test_v4_adaptive_initial_cap_review import (
-    ExactAdmissionCounts, adaptive_fixture, choose, read_all,
+    ExactAdmissionCounts, adaptive_fixture, choose, read_all, assert_unattempted_history_scope,
 )
 
 
@@ -161,7 +161,8 @@ def test_nonfresh_phase_keeps_full_output_admission(mode):
     assert not calls.requests
 
 
-def test_rebuilt_payload_order_change_rejects_before_generation(monkeypatch):
+@pytest.mark.parametrize('discovery', [False, True])
+def test_rebuilt_payload_order_change_rejects_before_generation(monkeypatch, discovery):
     reader, engine, _, calls, _ = adaptive_fixture()
     original_payload, original_prefix = reader._payload, reader._fitting_prefix
     chosen = False
@@ -184,7 +185,7 @@ def test_rebuilt_payload_order_change_rejects_before_generation(monkeypatch):
     monkeypatch.setattr(reader, '_payload', payload)
     monkeypatch.setattr(reader, '_fitting_prefix', prefix)
     with pytest.raises(InputOverflow, match='does not match'):
-        read_all(reader, engine)
+        read_all(reader, engine, discovery=discovery)
     assert not calls.requests and not engine.reasoner.requests
     assert engine.ledger.used['llm'] == engine.ledger.used['json_repairs'] == 0
-    assert set(reader.unread_obligations) == {('adaptive-history', alias) for alias in engine.mapper.sources}
+    assert_unattempted_history_scope(reader, engine, discovery)

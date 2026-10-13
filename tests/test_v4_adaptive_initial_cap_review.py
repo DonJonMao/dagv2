@@ -74,9 +74,19 @@ def adaptive_fixture(counter=None, **settings):
     return reader, engine, state, calls, counter
 
 
-def read_all(reader, engine, identity='adaptive-history'):
+def read_all(reader, engine, identity='adaptive-history', *, discovery=False):
     return reader.read(engine.steps[0], 'Review all recorded activities', ['history'],
-                       list(engine.docs), identity)
+                       list(engine.docs), identity,
+                       **({'discovery_doc_ids': list(engine.docs)} if discovery else {}))
+
+
+def assert_unattempted_history_scope(reader, engine, discovery):
+    """The existing OLD binding really requires s1 even before any new call."""
+    keys = {('adaptive-history', alias) for alias in engine.mapper.sources}
+    required = {('adaptive-history', 's1')} if discovery else keys
+    assert set(reader.unread_obligations) == required
+    assert set(reader.discovery_frontier) == keys - required
+    assert not reader.source_exposures and not reader.read_states
 
 
 def choose(reader, engine):
@@ -144,25 +154,28 @@ def test_largest_fallback_window_below_structure_floor_is_skipped_without_genera
 
 
 @pytest.mark.parametrize('floor,exact', [(300, True), (300, False), (0, True), (True, True)])
-def test_impossible_or_unverified_structure_floor_keeps_every_source_pending_without_paid_calls(floor, exact):
+@pytest.mark.parametrize('discovery', [False, True])
+def test_impossible_or_unverified_structure_floor_keeps_every_source_pending_without_paid_calls(floor, exact, discovery):
     counter = ExactAdmissionCounts({1: 11725, 2: 11725, 3: 11725}, floor=floor, exact_floor=exact)
     reader, engine, state, calls, counter = adaptive_fixture(counter)
     originals = deepcopy(engine.mapper.sources)
     with pytest.raises(InputOverflow):
-        read_all(reader, engine)
+        read_all(reader, engine, discovery=discovery)
     assert not calls.requests and not engine.reasoner.requests and engine.reasoner.sequence == 0
     assert engine.ledger.used['llm'] == engine.ledger.used['json_repairs'] == 0
-    assert set(reader.unread_obligations) == {('adaptive-history', alias) for alias in originals}
+    assert_unattempted_history_scope(reader, engine, discovery)
     assert state.pending == {'history'} and state.valid()[0]['history'] == OLD
     assert not reader.failed_batch_reviews and engine.mapper.sources == originals
 
 
-def test_adaptive_headroom_does_not_rescue_a_request_failing_ordinary_full_repair_capacity():
+@pytest.mark.parametrize('discovery', [False, True])
+def test_adaptive_headroom_does_not_rescue_a_request_failing_ordinary_full_repair_capacity(discovery):
     reader, engine, state, calls, _ = adaptive_fixture(ExactAdmissionCounts(ordinary_repair=12500))
     with pytest.raises(InputOverflow):
-        read_all(reader, engine)
+        read_all(reader, engine, discovery=discovery)
     assert not calls.requests and state.pending == {'history'}
     assert engine.ledger.used['llm'] == engine.ledger.used['json_repairs'] == 0
+    assert_unattempted_history_scope(reader, engine, discovery)
 
 
 @pytest.mark.parametrize('case', [
@@ -263,7 +276,8 @@ def test_actual_repair_overflow_cannot_lower_repair_cap_or_remove_originals_to_f
     assert engine.mapper.sources == originals
 
 
-def test_later_capacity_failure_retains_unread_suffix_and_already_accepted_history():
+@pytest.mark.parametrize('discovery', [False, True])
+def test_later_capacity_failure_retains_unread_suffix_and_already_accepted_history(discovery):
     reader, engine, state, calls, counter = adaptive_fixture(
         ExactAdmissionCounts({1: 10500, 2: 11000, 3: 11725}))
     originals = deepcopy(engine.mapper.sources)
@@ -273,16 +287,29 @@ def test_later_capacity_failure_retains_unread_suffix_and_already_accepted_histo
         counter.floor = 10000  # A later window is unavailable; no current source is removed.
         return response(observation('accepted-first-window', ['s1']))
     calls.respond = first_window
-    with pytest.raises(InputOverflow):
-        read_all(reader, engine)
+    if discovery:
+        assert read_all(reader, engine, discovery=True)
+    else:
+        with pytest.raises(InputOverflow):
+            read_all(reader, engine)
     assert len(calls.requests) == 1 and calls.requests[0]['payload']['max_tokens'] == 1024
-    assert state.valid()[0]['history'] == OLD and state.pending == {'history'}
-    assert set(reader.unread_obligations) == {('adaptive-history', 's3')}
+    assert state.valid()[0]['history'] == OLD
+    if discovery:
+        assert not state.pending and not reader.unread_obligations
+        assert set(reader.discovery_frontier) == {('adaptive-history', 's3')}
+        assert ('adaptive-history', 's3') not in reader.read_states
+        assert reader.read_states['adaptive-history', 's2'] == 'read'
+        assert {s['source_alias'] for s in reader.source_exposures[0]['sources']} == {'s1', 's2'}
+        assert reader.source_exposures[0]['status'] == 'batch_assessed'
+    else:
+        assert state.pending == {'history'}
+        assert set(reader.unread_obligations) == {('adaptive-history', 's3')}
     assert engine.mapper.sources == originals
     assert not reader.failed_batch_reviews
 
 
-def test_changed_payload_after_selection_rejects_before_generation_and_keeps_original_obligations(monkeypatch):
+@pytest.mark.parametrize('discovery', [False, True])
+def test_changed_payload_after_selection_rejects_before_generation_and_keeps_original_obligations(monkeypatch, discovery):
     reader, engine, _, calls, _ = adaptive_fixture()
     original_payload, original_prefix = reader._payload, reader._fitting_prefix
     selected = False
@@ -299,7 +326,7 @@ def test_changed_payload_after_selection_rejects_before_generation_and_keeps_ori
     monkeypatch.setattr(reader, '_payload', payload)
     monkeypatch.setattr(reader, '_fitting_prefix', prefix)
     with pytest.raises(InputOverflow, match='does not match'):
-        read_all(reader, engine)
+        read_all(reader, engine, discovery=discovery)
     assert not calls.requests and not engine.reasoner.requests
     assert engine.ledger.used['llm'] == engine.ledger.used['json_repairs'] == 0
-    assert set(reader.unread_obligations) == {('adaptive-history', alias) for alias in engine.mapper.sources}
+    assert_unattempted_history_scope(reader, engine, discovery)
