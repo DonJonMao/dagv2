@@ -41,6 +41,142 @@ def compose(reader):
                        ["piano"], "terminal", semantic=True, terminal_output=True)
 
 
+@pytest.mark.parametrize('field,value',[
+    ('final_prediction',None),('final_prediction','B'),
+    ('semantic_answer',None),('semantic_answer','That sounds wonderful!'),
+    ('audit_verdict',None),('audit_verdict','supported')])
+def test_personal_history_plain_response_repairs_terminal_fields_before_any_fact_integration(field,value):
+    reader,engine,state,calls=fixture(max_repairs_per_request=1)
+    engine.personal_response_selection=True
+
+    def respond(index,data):
+        assert data['phase']=='history_evidence'
+        assert 'public_options' not in data and 'terminal_candidate' not in data
+        assert set(reader._schema(data)['properties'])=={'slots'}
+        assert state.valid()[0]=={} and state.routes=={}
+        if index==1:
+            return {**response(observation()),field:value}
+        assert any('history_evidence' in row['feedback'] for row in data['repair_scope']['failed'])
+        return response(observation())
+
+    calls.respond=respond
+    reader.read(engine.steps[0],'Read historical activity',['history'],['piano'],'phase-check')
+    assert len(calls.requests)==2 and 'response_format' not in calls.requests[0]['payload']
+    assert state.valid()[0]['history']==['piano'] and not state.pending
+    assert reader.semantic_inputs is None and reader.semantic_prediction is None
+
+
+def test_unrepaired_personal_history_terminal_fields_never_bind_a_value():
+    reader,engine,state,calls=fixture(max_repairs_per_request=0)
+    engine.personal_response_selection=True
+    calls.respond=lambda index,data:{**response(observation()),'final_prediction':None}
+    reader.read(engine.steps[0],'Read historical activity',['history'],['piano'],'phase-check')
+    assert len(calls.requests)==1 and state.routes=={} and state.pending=={'history'}
+    assert not reader.batches[-1]['complete']
+
+
+def test_history_envelope_repair_cannot_drop_a_counter_draft():
+    reader,engine,state,calls=fixture(max_repairs_per_request=1)
+    engine.personal_response_selection=True
+    state.integrate([reader._observation(observation(), 'history',visible(reader),engine.steps[0])])
+    route=next(iter(state.routes))
+    counter=observation('counter',['s2'],stance='contradiction',retract_ids=[route])
+    counter['value']=None
+    calls.respond=lambda index,data:({**response(counter),'semantic_answer':None}
+                                     if index==1 else response())
+    reader.read(engine.steps[0],'Check historical evidence',['history'],['painting'],'counter-review')
+    assert state.pending=={'history'} and not reader.batches[-1]['complete']
+    drafts=[item.get('observation') for item in calls.requests[1]['data']['repair_scope']['failed']]
+    assert counter in drafts
+
+
+@pytest.mark.parametrize('change',['irrelevant','support','source','target'])
+def test_history_envelope_repair_cannot_change_a_source_validated_counter(change):
+    reader,engine,state,calls=fixture(max_repairs_per_request=1)
+    engine.personal_response_selection=True
+    state.integrate([reader._observation(observation('first',['s1']), 'history',visible(reader),engine.steps[0]),
+                     reader._observation(observation('other',['s3']), 'history',visible(reader,['s3']),engine.steps[0])])
+    routes=list(state.routes)
+    counter=observation('counter',['s2'],stance='contradiction',retract_ids=[routes[0]])
+    counter['value']=None
+
+    def respond(index,data):
+        if index==1:return {**response(counter),'semantic_answer':None}
+        obligation=next(item for item in data['repair_scope']['failed'] if item['id']=='counter')
+        assert obligation['required_counter_observations']==[counter]
+        altered=deepcopy(counter)
+        if change=='irrelevant':altered.update(stance='irrelevant',retract_ids=[])
+        elif change=='support':altered.update(stance='support',value=['piano'],retract_ids=[])
+        elif change=='source':altered['source_ids']=['s1']
+        else:altered['retract_ids']=[routes[1]]
+        return response(altered)
+
+    calls.respond=respond
+    reader.read(engine.steps[0],'Check historical evidence',['history'],['painting'],'counter-review')
+    assert len(calls.requests)==2 and state.pending=={'history'}
+    assert not reader.batches[-1]['complete']
+    assert all(not route['revoked'] for route in state.routes.values())
+
+
+def test_history_envelope_repair_preserves_the_counter_and_can_complete_within_existing_budget():
+    reader,engine,state,calls=fixture(max_repairs_per_request=1)
+    engine.personal_response_selection=True
+    state.integrate([reader._observation(observation(), 'history',visible(reader),engine.steps[0])])
+    route=next(iter(state.routes))
+    counter=observation('counter',['s2'],stance='contradiction',retract_ids=[route])
+    counter['value']=None
+
+    def respond(index,data):
+        assert not state.routes[route]['revoked']
+        return {**response(counter),'semantic_answer':None} if index==1 else response(counter)
+
+    calls.respond=respond
+    reader.read(engine.steps[0],'Check historical evidence',['history'],['painting'],'counter-review')
+    assert len(calls.requests)==2 and state.routes[route]['revoked'] and not state.pending
+    assert reader.batches[-1]['complete'] and 'history' not in state.valid()[0]
+
+
+def test_history_envelope_repair_can_rewrite_a_misplaced_support_value():
+    reader,engine,state,calls=fixture(max_repairs_per_request=1)
+    engine.personal_response_selection=True
+    state.program['variables']['history']['type']='text'
+    state.initial_program['variables']['history']['type']='text'
+    calls.respond=lambda index,data:(
+        {**response(observation(value='That sounds amazing! Try a piano duet.')),'final_prediction':'B'}
+        if index==1 else response(observation(value='The user played piano last year.')))
+    reader.read(engine.steps[0],'Summarize historical activity',['history'],['piano'],'history-repair')
+    assert len(calls.requests)==2 and not state.pending
+    assert state.valid()[0]['history']=='The user played piano last year.'
+
+
+def test_personal_phase_contracts_keep_final_choice_and_audit_fields_only_at_their_stages():
+    from dagbt.personal_task import PERSONAL_HISTORY_GUIDANCE, PERSONAL_READING_GUIDANCE, PERSONAL_AUDIT_GUIDANCE
+    reader,engine,state,calls=prepare_terminal(personal=True)
+    reader.current_terminal_output=False
+    history=reader._payload(engine.steps[0],'Read history',['history'],['s1'])
+    assert history['phase']=='history_evidence'
+    assert history['personal_task_instruction']==PERSONAL_HISTORY_GUIDANCE
+    assert PERSONAL_HISTORY_GUIDANCE in reader._system(reader._wire_data(history))
+    assert PERSONAL_READING_GUIDANCE not in reader._system(reader._wire_data(history))
+    calls.respond=lambda index,data:terminal_response(data,engine.output_options[0])
+    compose(reader)
+    assert calls.requests[0]['data']['phase']=='response_selection'
+    assert calls.requests[0]['data']['personal_task_instruction']==PERSONAL_READING_GUIDANCE
+    assert reader.semantic_prediction=='a' and reader.semantic_inputs['validation_complete']
+    data=reader._payload(engine.steps[1],engine.q['question'],['history','suggestion'],[],audit=True)
+    assert data['phase']=='response_audit' and data['personal_task_instruction']==PERSONAL_AUDIT_GUIDANCE
+    assert 'audit_verdict' in reader._schema(data)['properties']
+    assert data['terminal_candidate']['final_prediction']=='a'
+
+
+def test_generic_non_personal_history_preserves_existing_response_envelope():
+    reader,engine,state,calls=fixture(max_repairs_per_request=0)
+    calls.respond=lambda index,data:{**response(observation()),'final_prediction':None,'audit_verdict':'unknown'}
+    reader.read(engine.steps[0],'Read historical activity',['history'],['piano'],'generic')
+    assert 'phase' not in calls.requests[0]['data']
+    assert state.valid()[0]['history']==['piano'] and not state.pending
+
+
 def test_grounded_parent_requirements_are_explicit_in_schema_and_scoped_repair():
     reader,engine,state,calls=prepare_terminal(personal=True)
     selected=engine.output_options[0]

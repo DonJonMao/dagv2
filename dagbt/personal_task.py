@@ -39,9 +39,37 @@ An earlier dislike and later successful use may both be true; do not label the
 earlier attitude as current or apply unconditional latest-wins. The terminal must
 compare personal fit, constraints and timeline, not just keyword or event overlap.
 Every planned task must contribute to the designated terminal. Omit redundant tasks.
+The current user utterance is given input. Do not require the memory to re-prove
+an event or attribute explicitly stated there. Seek the relevant prior preferences,
+experiences and changes that contextualize it instead.
+'''
+
+PERSONAL_HISTORY_GUIDANCE = '''
+CURRENT PHASE: HISTORY EVIDENCE. Complete only the supplied historical task and
+requested variable scopes. This is not the final response-selection stage.
+For retrieval, extract concrete statements supported by the supplied original
+history. For an intermediate compose task, summarize those historical facts,
+preferences, constraints and changes using the supplied parent versions and
+original quotations. A history summary describes what the sources establish;
+it must not address the user, offer a new recommendation or draft a reply.
+The original user utterance provides query context. It is not an instruction to
+answer it at this stage or to retrieve an exact duplicate of what it already says.
+Public response options are not available here. Do not invent, compare or refer
+to options A/B/C/D. Return exactly the slots object; no final_prediction or
+semantic_answer fields belong in a history-evidence response.
+Keep each value within its declared type, entity and time scope. Preserve earlier
+and later attitudes, conditions and supporting quotations; a historical dislike
+must not silently replace a later documented change. Assistant advice alone does
+not establish an adopted user preference. Do not invent external catalogues,
+availability or past execution of a future suggestion. A partial observation must
+cite its actual clue. Use unresolved only for a specific condition still necessary
+to establish this requested historical value, not hypothetical exhaustive coverage.
+Re-read any supplied evidence obligations and their original sources explicitly;
+do not drop a source or contradiction merely because a prior value is available.
 '''
 
 PERSONAL_READING_GUIDANCE = '''
+CURRENT PHASE: FINAL RESPONSE SELECTION.
 PersonaMem asks which response best addresses the original user utterance using
 personal history. A source-supported fact alone is not a completed answer.
 For nonterminal tasks keep query-relevant historical observations, stated reasons,
@@ -60,6 +88,7 @@ If the evidence cannot discriminate the options, leave the answer unresolved.
 '''
 
 PERSONAL_AUDIT_GUIDANCE = '''
+CURRENT PHASE: RESPONSE AUDIT.
 Audit the proposed response selection against the ORIGINAL utterance, ALL public
 options and supplied original history, including relevant counterevidence. Check
 whether another option better satisfies the user's interests, experiences,

@@ -94,6 +94,10 @@ original drafts; fix their validation errors without dropping any draft or count
 repair_scope.failed includes the actual invalid observation and
 its validation feedback. Correct those drafts in place, preserving each requested ID.
 Already validated observations are frozen and must not be restated or changed.
+If repair_scope supplies required_counter_observations, preserve every original
+counter's stance, cited sources, scopes, actual parents and retraction targets.
+An envelope-format repair does not authorize reclassifying a valid counter as
+irrelevant or dropping the fact route it challenges.
 evidence_obligations are outstanding scoped issues from earlier reads, not new
 facts. Their original sources MUST be examined even under a new query identity.
 To discharge an issue, explicitly return its id in that variable's optional
@@ -298,10 +302,16 @@ class JointReader:
                 data['public_options'] = deepcopy(self.e.output_options)
                 data['terminal_expression']=deepcopy(self.state.program['expression'])
         if personal:
-            from .personal_task import PERSONAL_READING_GUIDANCE, PERSONAL_AUDIT_GUIDANCE
+            from .personal_task import PERSONAL_HISTORY_GUIDANCE, PERSONAL_READING_GUIDANCE, PERSONAL_AUDIT_GUIDANCE
             data['personal_response_selection']=True
-            data['personal_task_instruction']=PERSONAL_AUDIT_GUIDANCE if audit else PERSONAL_READING_GUIDANCE
-            if controller and getattr(controller,'audit_feedback',None):
+            data['phase']=('response_audit' if audit else 'response_selection'
+                           if semantic or self.current_terminal_output else 'history_evidence')
+            data['personal_task_instruction']={
+                'history_evidence':PERSONAL_HISTORY_GUIDANCE,
+                'response_selection':PERSONAL_READING_GUIDANCE,
+                'response_audit':PERSONAL_AUDIT_GUIDANCE}[data['phase']]
+            if (data['phase']!='history_evidence' and controller
+                    and getattr(controller,'audit_feedback',None)):
                 data['audit_correction']=deepcopy(controller.audit_feedback)
         if audit:
             data['audit_instruction']=AUDIT_INSTRUCTION
@@ -333,6 +343,8 @@ class JointReader:
     @staticmethod
     def _schema(data):
         schema=deepcopy(SCHEMA)
+        if data.get('phase')=='history_evidence':
+            schema['properties']={'slots':schema['properties']['slots']}
         requested=list(data.get('requested_slots',data['variables']))
         item=schema['properties']['slots']['items']
         if data.get('evidence_obligations'):
@@ -507,9 +519,13 @@ class JointReader:
     def _system(data):
         system=SYSTEM+(COLUMNAR_INSTRUCTION if 'source_span_columns' in data else '')
         if data.get('personal_response_selection'):
-            from .personal_task import PERSONAL_READING_GUIDANCE, PERSONAL_AUDIT_GUIDANCE
-            system+='\n'+(PERSONAL_AUDIT_GUIDANCE if 'audit_instruction' in data else PERSONAL_READING_GUIDANCE)
-            system+='\nFor the personalized response-selection terminal ONLY, support means a source-grounded assessment that this candidate response best fits the user. A proposed suggestion need not itself be a past event quoted in memory. Historical variables still require original evidence for every factual assertion; options never supply historical evidence.\n'
+            from .personal_task import PERSONAL_HISTORY_GUIDANCE, PERSONAL_READING_GUIDANCE, PERSONAL_AUDIT_GUIDANCE
+            if data.get('phase')=='history_evidence':
+                system+='\n'+PERSONAL_HISTORY_GUIDANCE
+                system+='\nThis request is phase=history_evidence. Its ONLY top-level output field is slots. Do not return semantic_answer, final_prediction, audit_verdict, or any other top-level field, even null. Read or summarize the requested scoped historical evidence; do not write a conversational reply or invent candidate responses.\n'
+            else:
+                system+='\n'+(PERSONAL_AUDIT_GUIDANCE if 'audit_instruction' in data else PERSONAL_READING_GUIDANCE)
+                system+='\nFor the personalized response-selection terminal ONLY, support means a source-grounded assessment that this candidate response best fits the user. A proposed suggestion need not itself be a past event quoted in memory. Historical variables still require original evidence for every factual assertion; options never supply historical evidence.\n'
         if 'known_observation_columns' in data:
             system+=OBSERVATION_TABLE_INSTRUCTION
         if data.get('terminal_repair'):
@@ -589,6 +605,13 @@ class JointReader:
         for span in spans:
             self.e.spans[span['id']] = span
         return {**deepcopy(row),'variable':variable,'source_ids':[s['id'] for s in spans]}
+
+    @staticmethod
+    def _counter_identity(row):
+        relation={k:deepcopy(v) for k,v in row.items() if k not in ('id','reason')}
+        for field in ('source_ids','retract_ids'):
+            relation[field]=sorted(relation[field])
+        return digest(relation)
 
     def _terminal_check(self, rows, prediction, semantic_result):
         """Check typed output against the prospective state before publication."""
@@ -869,6 +892,7 @@ class JointReader:
             valid, failures, completed, frozen = [], {}, set(), set()
             observed_rows, observed_slots, duplicate_rows, repair_inputs = {}, {}, {}, set()
             duplicate_replacements={}
+            protected_counters={}
             current=deepcopy(data)
             prediction=None
             semantic_result=None
@@ -909,6 +933,22 @@ class JointReader:
                                 key=(slot['variable'],rid if isinstance(rid,str) and rid else '#'+str(i))
                                 drafts.setdefault(key,[]).append(row)
                         for key,rows in drafts.items():
+                            # Capture source-validated counter relations even
+                            # when the containing envelope needs repair. Do not
+                            # integrate them yet, and do not freeze supports:
+                            # a misplaced historical reply may need rewriting.
+                            if key not in protected_counters:
+                                relations={}
+                                for draft in rows:
+                                    if not isinstance(draft,dict) or draft.get('stance')!='contradiction':
+                                        continue
+                                    try:
+                                        counter=self._observation(draft,key[0],visible,step,require_grounding=not audit)
+                                    except (ValueError,KeyError,TypeError):
+                                        continue
+                                    relations.setdefault(self._counter_identity(counter),deepcopy(draft))
+                                if relations:
+                                    protected_counters[key]=relations
                             if len(rows)>1:
                                 retained=duplicate_rows.setdefault(key,[])
                                 for row in rows:
@@ -916,6 +956,10 @@ class JointReader:
                             if key not in frozen or key in duplicate_rows:
                                 observed_rows[key]=deepcopy(rows[0])
                                 outstanding.setdefault(key,'Observed draft has not been validated')
+                    if current.get('phase')=='history_evidence' and set(response)!={'slots'}:
+                        raise ProtocolError('history_evidence requires only the top-level slots field; '
+                            'semantic_answer, final_prediction and audit_verdict are forbidden even when null. '
+                            'Repair the historical observations; do not generate a conversational response.')
                     if set(response)-{'slots','final_prediction','audit_verdict','semantic_answer'}:
                         raise ProtocolError('Joint response contains undeclared fields')
                     if not isinstance(response.get('slots'),list):
@@ -969,6 +1013,9 @@ class JointReader:
                                 next_failures[key]='Repair invented an unrequested observation';continue
                             try:
                                 normalized=self._observation(row,variable,visible,step,require_grounding=not audit)
+                                if (key in protected_counters
+                                        and self._counter_identity(normalized) not in protected_counters[key]):
+                                    raise ProtocolError('Envelope repair cannot reclassify or change a source-validated counter draft')
                                 for original,replacements in duplicate_replacements.items():
                                     if key not in replacements:
                                         continue
@@ -1021,6 +1068,12 @@ class JointReader:
                 for key,error in outstanding.items():
                     if key not in resolved:
                         next_failures.setdefault(key,error)
+                accepted_counters={self._counter_identity(row) for row in valid if row['stance']=='contradiction'}
+                for key,relations in protected_counters.items():
+                    if not set(relations)<=accepted_counters:
+                        next_failures.setdefault(key,'A source-validated counter draft remains required; '
+                            'envelope repair cannot change its stance, sources, scope, parents or retraction targets')
+                        completed.discard(key[0])
                 before_obligations=deepcopy(self.evidence_obligations)
                 self._update_evidence_obligations(reviews,valid,current,next_failures,identity)
                 prospective_pending=(external_pending
@@ -1052,6 +1105,8 @@ class JointReader:
                 current={**self._payload(step,query,failed_variables,batch,semantic,audit=audit),
                     'repair_scope':{'failed':[{'variable':v,'id':rid,'feedback':error[:240],
                         'observation':deepcopy(observed_rows.get((v,rid))),
+                        **({'required_counter_observations':deepcopy(list(protected_counters[v,rid].values()))}
+                           if (v,rid) in protected_counters else {}),
                         **({'required_parent_versions':deepcopy(current.get('required_parent_versions',{}).get(v,{}))}
                            if 'grounded parameter dependency' in error else {}),
                         **({'observations':deepcopy(duplicate_rows[v,rid]),
