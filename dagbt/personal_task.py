@@ -49,12 +49,18 @@ of every past event, preference or experience. For open-ended background, ask fo
 a concise sourced text summary of relevant examples and changes. Use a set variable
 only when its task explicitly defines a bounded whole set that can be established
 from the available history; a single witnessed member does not establish that whole.
-For such an open-ended historical summary, explicitly declare
-evidence_semantics="personal_history_summary" on its unrestricted text variable,
-with its historical scope. This declares a revisable representation of sourced
-history, not a unique scalar fact or an exhaustive inventory. Do not attach this
-marker to a name, date, number, rule, bounded domain, deterministic task expression
-or the final response. Ordinary text variables do not acquire revision permission.
+Every nonterminal unrestricted text variable without a deterministic task expression
+MUST explicitly declare one of these evidence_semantics values:
+- "personal_history_summary": an open account of historical events, preferences,
+  experiences or changes that compatible evidence can extend. Declare this on each
+  such retrieval variable, not only on an optional later summary node. It is a
+  revisable sourced representation, not an exhaustive inventory or a unique scalar fact.
+- "personal_atomic_fact": one scoped atomic fact, such as a single name or date.
+  It keeps ordinary whole-value consistency and cannot use summary revision.
+Do not omit this choice or label multiple event examples or a preference trajectory
+as an atomic fact. The code will not infer a choice from the variable's name.
+Neither marker applies to numeric/rule variables, bounded domains, deterministic
+task expressions or the final response. Each marked variable still needs its scope.
 For an utterance such as "I tried X", do not make listing everything the user has
 ever tried a prerequisite. Retrieve the prior attitudes or experiences needed to
 understand X in context. A separate history-summary node is optional, not mandatory.
@@ -101,6 +107,9 @@ This retires an old summary representation without asserting that its historical
 facts were false. A genuine factual refutation remains a contradiction with its
 own sources and targets. Never use summary revision to hide or discard a counter,
 change scope, choose an arbitrary latest value, or revise the terminal response.
+A personal_atomic_fact variable keeps one scoped factual value. Different sources
+may independently support that same value; separate compatible events are not
+alternative whole values of an atomic fact. This declaration does not permit summary_revision.
 '''
 
 PERSONAL_READING_GUIDANCE = '''
@@ -174,4 +183,11 @@ def validate_personal_plan(plan, question):
         if declaration['demand'] != final and 'scope' not in declaration:
             raise ProtocolError('PersonaMem history variable ' + variable
                                 + ' needs an explicit evidence scope')
+        if (declaration['demand'] != final and declaration['type'] == 'text'
+                and 'domain' not in declaration and variable not in program.get('task_expressions', {})
+                and 'evidence_semantics' not in declaration):
+            raise ProtocolError('PersonaMem unrestricted history text variable ' + variable
+                                + ' must explicitly choose evidence_semantics=personal_history_summary for an '
+                                + 'open account of events/preferences/changes, or personal_atomic_fact for one '
+                                + 'scoped atomic fact; each retrieval variable needs its own declaration')
     return plan

@@ -98,8 +98,8 @@ def planner_contract(legacy_schema, *, personal_history=False):
         'required':['type','demand'], 'additionalProperties':False}
     if personal_history:
         declaration['properties']['evidence_semantics'] = {
-            'enum':['personal_history_summary'],
-            'description':'Only an unrestricted text summary of personal history before the terminal; never a scalar fact, rule, deterministic binding or final response.'}
+            'enum':['personal_history_summary','personal_atomic_fact'],
+            'description':'Every nonterminal unrestricted text evidence variable without a deterministic task expression must explicitly choose: personal_history_summary for an open history account that compatible evidence can extend; personal_atomic_fact for one scoped atomic fact. Neither marker belongs to a bounded domain, rule, deterministic binding or final response.'}
     program = {'type':'object', 'properties': {
         'variables': {'type':'object','additionalProperties':declaration},
         'expression': {'type':'object'},
@@ -131,7 +131,7 @@ def validate_plan(value, legacy_validate, *, personal_history=False):
         contract = validate_output_contract(value['output_contract'])
         program = validate_program(value['program'])
         if not personal_history and any('evidence_semantics' in d for d in program['variables'].values()):
-            raise ProgramError('Personal history summary declarations require the explicit PersonaMem task')
+            raise ProgramError('Personal evidence declarations require the explicit PersonaMem task')
         validate_bindings(program, plan['steps'], plan['final_node_id'], contract=contract)
     except ProgramError as exc:
         raise ProtocolError(str(exc)) from exc
@@ -151,7 +151,7 @@ def validate_bindings(program, steps, final_node_id, *, contract=None,
             raise ProgramError('Variable demand must belong to the preplanned DAG')
         if ('evidence_semantics' in declaration and
                 (declaration['demand'] == final_node_id or 'scope' not in declaration)):
-            raise ProgramError('Personal history summary requires an explicit nonterminal evidence scope')
+            raise ProgramError('Personal evidence semantics requires an explicit nonterminal evidence scope')
         if (contract is not None and declaration['demand'] == final_node_id
                 and variable_scope(declaration, contract) != {
                     key: contract[key] for key in ('entity_scope','time_scope')}):

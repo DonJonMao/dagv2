@@ -25,6 +25,7 @@ def plan():
                                 'entity_scope': 'user', 'time_scope': 'reply now'},
             'program': {'variables': {
                 'history': {'type': 'text', 'demand': 'history',
+                            'evidence_semantics': 'personal_history_summary',
                             'scope': {'entity_scope': 'user', 'time_scope': 'recorded history'}},
                 'response': {'type': 'text', 'demand': 'response'}},
                 'expression': {'op': 'var', 'id': 'response'}}}
@@ -32,7 +33,7 @@ def plan():
 
 def validate(value):
     _, repair, _ = legacy_modules()
-    return validate_personal_plan(validate_plan(value, repair.validate_plan), QUESTION)
+    return validate_personal_plan(validate_plan(value, repair.validate_plan, personal_history=True), QUESTION)
 
 
 def test_personal_contract_accepts_evidence_then_response_without_mutation():
@@ -81,7 +82,7 @@ def test_personal_engine_rejects_old_symbolic_objective_before_retrieval():
 def test_history_cannot_silently_inherit_response_scope():
     value = plan()
     del value['program']['variables']['history']['scope']
-    with pytest.raises(ProtocolError, match='explicit evidence scope'):
+    with pytest.raises(ProtocolError, match='explicit.*evidence scope'):
         validate(value)
 
 

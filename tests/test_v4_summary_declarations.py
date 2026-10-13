@@ -24,13 +24,20 @@ def personal_validate(value):
         validate_plan(value, repair.validate_plan, personal_history=True), QUESTION)
 
 
-def test_declared_summary_roundtrips_without_granting_plain_text_permission():
+def test_declared_summary_roundtrips_without_granting_missing_or_atomic_permission():
     value = summary_plan()
     before = deepcopy(value)
     accepted = personal_validate(value)
     assert accepted == before == value
     assert 'evidence_semantics' not in accepted['program']['variables']['response']
-    assert 'evidence_semantics' not in personal_validate(plan())['program']['variables']['history']
+    atomic = plan()
+    atomic['program']['variables']['history']['evidence_semantics'] = 'personal_atomic_fact'
+    assert personal_validate(atomic)['program']['variables']['history']['evidence_semantics'] == 'personal_atomic_fact'
+    missing = plan()
+    del missing['program']['variables']['history']['evidence_semantics']
+    with pytest.raises(ProtocolError, match='must explicitly choose'):
+        personal_validate(missing)
+    assert 'evidence_semantics' not in missing['program']['variables']['history']
 
 
 def test_generic_planner_neither_offers_nor_accepts_personal_summary_marker():
@@ -39,7 +46,7 @@ def test_generic_planner_neither_offers_nor_accepts_personal_summary_marker():
     personal = planner_contract(legacy.PLAN_SCHEMA, personal_history=True)
     declaration = lambda schema: schema['properties']['program']['properties']['variables']['additionalProperties']
     assert 'evidence_semantics' not in declaration(generic)['properties']
-    assert declaration(personal)['properties']['evidence_semantics']['enum'] == ['personal_history_summary']
+    assert declaration(personal)['properties']['evidence_semantics']['enum'] == ['personal_history_summary', 'personal_atomic_fact']
     with pytest.raises(ProtocolError, match='explicit PersonaMem task'):
         validate_plan(summary_plan(), repair.validate_plan)
 
@@ -72,7 +79,7 @@ def test_summary_marker_cannot_relax_other_frozen_contracts(mutation):
         del history['scope']
     else:
         history['evidence_semantics'] = 'overwrite_anything'
-    with pytest.raises(ProtocolError, match='[Pp]ersonal history summary'):
+    with pytest.raises(ProtocolError, match='[Pp]ersonal evidence semantics'):
         personal_validate(value)
 
 

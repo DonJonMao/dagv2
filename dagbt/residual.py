@@ -222,10 +222,10 @@ def validate_program(program):
         if 'scope' in declaration:
             validate_scope(declaration['scope'])
         if 'evidence_semantics' in declaration:
-            if (declaration['evidence_semantics'] != 'personal_history_summary'
+            if (declaration['evidence_semantics'] not in ('personal_history_summary', 'personal_atomic_fact')
                     or declaration['type'] != 'text' or 'domain' in declaration
                     or declaration.get('unit') is not None):
-                raise ProgramError('Personal history summary requires unrestricted text and its explicit evidence_semantics')
+                raise ProgramError('Personal evidence semantics requires unrestricted text and its explicit evidence_semantics')
         if 'domain' in declaration:
             domain = declaration['domain']
             if not isinstance(domain, (dict, list)):
@@ -257,7 +257,7 @@ def validate_program(program):
         if variable not in variables or check(expression)!=variables[variable]['type']:
             raise ProgramError('Deterministic task expression type differs from its binding')
         if 'evidence_semantics' in variables[variable]:
-            raise ProgramError('Personal history summary cannot be a deterministic task expression')
+            raise ProgramError('Personal evidence semantics cannot be a deterministic task expression')
     if not isinstance(program.get('constraints', []), list):
         raise ProgramError('Joint constraints must be an array of expressions')
     for constraint in program.get('constraints', []):
