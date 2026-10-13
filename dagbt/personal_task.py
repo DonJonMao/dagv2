@@ -17,12 +17,14 @@ The terminal question MUST be the exact original user utterance, unchanged. Its
 execution is compose, with the needed history tasks as inputs. Its ONLY variable
 has type=text; program.expression MUST reference that terminal variable. The
 output_contract MUST be mode=semantic, result_type=text, explanation=semantic.
-The terminal represents a response now; give it a response scope distinct from
-the scopes of the historical facts. No symbolic certificate establishes which
+The terminal represents the response selection, not a historical fact. No symbolic certificate establishes which
 personalized response is best. Do not use rule_binding or a deterministic
 task_expression to replace this response selection.
 Every nonterminal variable MUST have an explicit scope with entity_scope and
-time_scope; its history/evidence scope must differ from the terminal response scope.
+time_scope. Scope states whose evidence applies and when; it is not a task-role
+label. A source-grounded current constraint may share the response's entity and
+time scope. Their separate variables, demands and execution phases still distinguish
+historical evidence from the response. Do not rename a scope merely to make it different.
 All retrieval tasks obtain evidence in this user's conversation before the cutoff.
 Never require retrieval of external new-book catalogues, current event listings,
 new workshop availability, or a previously executed future recommendation. Retrieve
@@ -168,10 +170,8 @@ def validate_personal_plan(plan, question):
     demands = {declaration['demand'] for declaration in variables.values()}
     if demands != set(tasks):
         raise ProtocolError('Every PersonaMem task needs an explicit typed evidence or response variable')
-    response_scope = {key: contract[key] for key in ('entity_scope', 'time_scope')}
     for variable, declaration in variables.items():
-        if declaration['demand'] != final and (
-                'scope' not in declaration or declaration['scope'] == response_scope):
+        if declaration['demand'] != final and 'scope' not in declaration:
             raise ProtocolError('PersonaMem history variable ' + variable
-                                + ' needs an explicit evidence scope distinct from the response scope')
+                                + ' needs an explicit evidence scope')
     return plan

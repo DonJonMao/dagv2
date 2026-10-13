@@ -12,13 +12,11 @@ from test_v4_summary_revision_review import (
 )
 
 
-@pytest.mark.parametrize('mistake', ['identical_proof', 'bool_version', 'null_revision'])
-def test_revision_cannot_create_empty_version_progress_or_use_invalid_metadata(mistake):
+@pytest.mark.parametrize('mistake', ['bool_version', 'null_revision'])
+def test_revision_cannot_use_invalid_metadata(mistake):
     reader,engine,state,calls,original=summary_fixture()
     draft=revised(original,state.versions['history'])
-    if mistake=='identical_proof':
-        draft.update(value=OLD,source_ids=['s1'])
-    elif mistake=='bool_version':
+    if mistake=='bool_version':
         draft['summary_revision']['previous_version']=True
     else:
         draft['summary_revision']=None

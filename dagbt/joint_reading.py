@@ -154,6 +154,11 @@ sourced history. Compatible additional facts do not contradict the older facts.
 Only summary_revision_contracts authorizes this request to revise such a summary:
 return a support observation with summary_revision={supersedes_route_ids,
 previous_version,reason}, using exact offered route IDs and the current version.
+This capability is optional, not a requirement to revise an unchanged summary.
+With no new observation, return observations=[] unless an outstanding review
+requires its original draft IDs and sources. For such an unchanged draft, the
+same sourced support with a valid summary_revision is an idempotent recheck: it
+keeps the existing routes, ancestry and version, and does not assert new evidence.
 Re-read ALL old and new original premises and relevant counterevidence; retain
 them in the new support's source_ids and preserve their factual content, negative
 experiences, conditions and temporal qualifications in the revised whole summary.

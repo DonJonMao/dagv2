@@ -24,13 +24,18 @@ class FactState:
         return variable_scope(self.program['variables'][variable], self.contract)
 
     @staticmethod
-    def support_identity(row):
+    def support_base_identity(row):
         """A proof's source set has no model-selected citation order."""
         proof={k:row[k] for k in ('variable','value','entity_scope','time_scope','parent_versions')}
         proof['source_ids']=sorted(set(row['source_ids']))
         identity=digest(proof)
         if 'binding_derivation' in row:
             identity=digest([identity,row['binding_derivation']])
+        return identity
+
+    @staticmethod
+    def support_identity(row):
+        identity=FactState.support_base_identity(row)
         if 'summary_revision' in row:
             revision=row['summary_revision']
             identity=digest([identity,{'supersedes_route_ids':sorted(revision['supersedes_route_ids']),
@@ -100,12 +105,21 @@ class FactState:
             if not historical and (not self.is_active_route(old) or any(
                     p not in values or self.versions[p]!=version for p,version in old['parent_versions'].items())):
                 raise ProgramError('Summary revision cannot supersede revoked, retired or stale routes')
-        if not historical and all(digest(self.routes[rid]['value'])==digest(row['value'])
-                and set(self.routes[rid]['source_ids'])==set(row['source_ids']) for rid in targets):
-            raise ProgramError('Summary revision cannot create a new version from an identical whole value and proof')
         required=self.summary_revision_sources(variable,targets,historical=historical)
         if not required<=set(row['source_ids']):
             raise ProgramError('Summary revision must retain every original premise and relevant counter source')
+
+    def summary_revision_is_noop(self, row):
+        """Classify only after the full revision/provenance validation succeeds.
+
+        An unchanged explicit review is not a new ordinary support: its current
+        routes may inherit earlier revisions and counters. Keep those exact
+        routes and their ancestry instead of rebuilding a source-equivalent one.
+        """
+        revision=row.get('summary_revision')
+        return bool(revision) and all(digest(self.routes[rid]['value'])==digest(row['value'])
+            and set(self.routes[rid]['source_ids'])==set(row['source_ids'])
+            for rid in revision['supersedes_route_ids'])
 
     def valid(self):
         # Resolve parent routes in DAG order, never accept unsupported guesses.
@@ -170,6 +184,14 @@ class FactState:
                 inherited=set(targets)|{rid for target in targets for rid in self.summary_ancestors(self.routes[target])}
                 if inherited & countered:
                     raise ProgramError('Summary revision cannot conceal a counter to inherited evidence in the same batch')
+        noops={self.support_identity(row) for row in rows
+               if 'summary_revision' in row and self.summary_revision_is_noop(row)}
+        # Replaying an exact revised proof without revision metadata must not
+        # create an independent OR route that loses its inherited counters.
+        # Include retired/revoked history and this validated batch so neither
+        # later replay nor within-batch order can resurrect the same proof.
+        revised_proofs={self.support_base_identity(row)
+                        for row in [*self.routes.values(), *rows] if 'summary_revision' in row}
         revisions=[]
         for row in rows:
             if row['stance'] in ('unknown','partial','irrelevant'):
@@ -180,6 +202,14 @@ class FactState:
                         self.routes[rid]['revoked'].append({'source_ids':row['source_ids'], 'reason':row['reason']})
                 continue
             identity = self.support_identity(row)
+            if identity in noops:
+                # Full validation and same-batch counter checks already passed.
+                # Preserve every existing route/version/ancestry; only explicit
+                # obligation handling outside FactState may count this review as
+                # progress. Never strip summary_revision and reinsert the row.
+                continue
+            if 'summary_revision' not in row and self.support_base_identity(row) in revised_proofs:
+                continue
             # Older checkpoints retain their original route IDs. Replaying
             # their source set in another order must neither create another
             # route nor resurrect a route that a sourced counter revoked.

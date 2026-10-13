@@ -78,15 +78,20 @@ def test_personal_engine_rejects_old_symbolic_objective_before_retrieval():
     assert OPTIONS[0] not in str(services.requests)
 
 
-@pytest.mark.parametrize('scope', [None, {'entity_scope':'user', 'time_scope':'reply now'}])
-def test_history_cannot_silently_inherit_or_claim_response_scope(scope):
+def test_history_cannot_silently_inherit_response_scope():
     value = plan()
-    if scope is None:
-        del value['program']['variables']['history']['scope']
-    else:
-        value['program']['variables']['history']['scope'] = scope
+    del value['program']['variables']['history']['scope']
     with pytest.raises(ProtocolError, match='explicit evidence scope'):
         validate(value)
+
+
+def test_current_evidence_and_response_may_explicitly_share_entity_and_time():
+    value = plan()
+    value['output_contract']['time_scope'] = 'current'
+    value['program']['variables']['history']['scope'] = {'entity_scope':'user', 'time_scope':'current'}
+    expected = deepcopy(value)
+    assert validate(value) == expected
+    assert value == expected
 
 
 def test_explicit_smoke_ids_are_public_and_cover_seven_types():
@@ -109,8 +114,9 @@ def test_bad_explicit_scope_rejected(tmp_path, monkeypatch, ids):
 
 class PersonalServices:
     """Transport fixture checks every actual request boundary, no remote calls."""
-    def __init__(self):
+    def __init__(self, shared_scope=False):
         self.requests = []
+        self.shared_scope = shared_scope
 
     def get(self, stage, url, payload):
         import json
@@ -121,6 +127,9 @@ class PersonalServices:
         if stage[0] == 'planner':
             assert data == QUESTION and OPTIONS[0] not in str(payload)
             value = plan()
+            if self.shared_scope:
+                value['output_contract']['time_scope'] = 'current'
+                value['program']['variables']['history']['scope']['time_scope'] = 'current'
         else:
             if 'source_span_columns' in data:
                 columns = data.pop('source_span_columns')
@@ -151,11 +160,12 @@ class PersonalServices:
             {'finish_reason': 'stop', 'message': {'content': json.dumps(value)}}]}}
 
 
-def test_actual_engine_personal_task_ends_in_audited_response_not_fact_certificate():
+@pytest.mark.parametrize('shared_scope', [False, True])
+def test_actual_engine_personal_task_ends_in_audited_response_not_fact_certificate(shared_scope):
     text = 'I enjoy hands-on DIY projects, including making furniture from reclaimed wood.'
     doc = SimpleNamespace(doc_id='diy', passage=text, metadata={'source_segments': [
         {'role': 'user', 'start': 0, 'end': len(text), 'source_message_indices': [0]}]})
-    services = PersonalServices()
+    services = PersonalServices(shared_scope=shared_scope)
     config = {'_test_transport': True, 'llm_base_url': 'http://synthetic/v1', 'llm_model': 'script',
               'embedding_base_url': 'http://synthetic/v1', 'embedding_model': 'script',
               'fusion': {'initial_width': 1, 'proposal_width': 1}}
@@ -170,6 +180,8 @@ def test_actual_engine_personal_task_ends_in_audited_response_not_fact_certifica
     assert row['answer']['completion_kind'] == 'semantic_assessment'
     assert row['answer']['certificate'] is None
     assert row['diagnostics']['audit_complete']
-    assert engine.fact_state.scope('history')['time_scope'] == 'recorded history'
-    assert engine.fact_state.scope('response')['time_scope'] == 'reply now'
+    assert engine.fact_state.scope('history')['time_scope'] == ('current' if shared_scope else 'recorded history')
+    assert engine.fact_state.scope('response')['time_scope'] == ('current' if shared_scope else 'reply now')
+    values = engine.fact_state.valid()[0]
+    assert values['history'] != values['response'] == OPTIONS[0]
     assert not any(r['stage'][0] in ('reader', 'select') for r in services.requests)
