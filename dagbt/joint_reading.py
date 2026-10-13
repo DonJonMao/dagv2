@@ -107,6 +107,11 @@ facts. Their original sources MUST be examined even under a new query identity.
 To discharge an issue, explicitly return its id in that variable's optional
 resolved_obligation_ids, leave no unresolved issue in the slot, and provide
 supported/corrective/irrelevant observations reviewing its cited original sources.
+The union of those settled observations' source_ids must cover EVERY source_ids
+entry of the offered obligation. Review coverage is not a claim that every source
+is a premise of a support: genuinely irrelevant or corrective original text may
+have a separate sourced review. Never add unsupported citations, classify text
+automatically, or label supporting evidence irrelevant merely to satisfy coverage.
 An empty slot does not resolve an earlier issue. Do not assert hypothetical
 whole-corpus exhaustiveness requirements; scoped sufficient evidence may resolve
 a missing-evidence issue without having read every memory.
@@ -127,6 +132,27 @@ Review all required_source_ids. Existing known_observations are already integrat
 routes: only explicit sourced contradictions naming their real route IDs can
 retract them, never an implicit union or overwrite. If the issue cannot be settled,
 preserve it in slot.unresolved with its original evidence. Agreement is not required.
+'''
+
+OBLIGATION_REVIEW_INSTRUCTION = '''
+Controller-owned obligation_review_sources in a failed slot reports the exact
+required, covered and missing original sources for that attempted resolution.
+The missing set describes that failed slot, not permission to add citations or
+classify text automatically. Re-read the originals. A genuine independent
+irrelevant or corrective review may cover a missing source without adding it to
+a support's premises. Do not call supporting evidence irrelevant just to pass
+coverage. Keep partial/unknown evidence and unresolved issues when appropriate.
+For this bounded repair only, frozen_observation_reviews offers unchanged,
+already validated observations from this same paid batch. slot_observation_ids
+refers to complete matching observations in this failed entry's slot;
+observations supplies any other offered complete original rows. To explicitly
+count one toward this slot's evidence review, return its ID in the optional
+reviewed_observation_ids. Do not restate or edit a frozen observation. Only the
+currently offered IDs are legal: known routes, older windows, other variables,
+and retained failed-batch drafts do not authorize references. References do not
+resolve an obligation by themselves: explicitly name resolved_obligation_ids,
+review all required sources, and retain every counter, partial or unresolved
+issue. Referenced observations remain unchanged and do not become new facts.
 '''
 
 WHOLE_VALUE_REFERENCE_INSTRUCTION = '''
@@ -313,6 +339,38 @@ class JointReader:
         return {key:[mapping[s] for s in ids] for key,ids in value.items()}
 
     @staticmethod
+    def _remap_obligation_review_sources(value, mapping):
+        """Only controller-owned coverage metadata receives strict remapping."""
+        fields={'required_source_ids','covered_source_ids','missing_source_ids'}
+        if not isinstance(value,list):
+            raise ProtocolError('Obligation review source feedback is malformed')
+        result=[]
+        seen=set()
+        translated={}
+        for item in value:
+            if (not isinstance(item,dict) or set(item)!=fields|{'obligation_id'}
+                    or not isinstance(item['obligation_id'],str) or not item['obligation_id']
+                    or item['obligation_id'] in seen
+                    or any(not isinstance(item[key],list)
+                        or any(not isinstance(source,str) or source not in mapping for source in item[key])
+                        or len(set(item[key]))!=len(item[key]) for key in fields)
+                    or not item['missing_source_ids']
+                    or set(item['missing_source_ids'])!=set(item['required_source_ids'])-set(item['covered_source_ids'])):
+                raise ProtocolError('Obligation review source feedback references invalid or unavailable original sources')
+            seen.add(item['obligation_id'])
+            originals=set().union(*(set(item[key]) for key in fields))
+            for source in originals:
+                alias=mapping[source]
+                if (not isinstance(alias,str) or not alias
+                        or alias in translated and translated[alias]!=source):
+                    raise ProtocolError('Obligation review source feedback has ambiguous original-source aliases')
+                translated[alias]=source
+            result.append({'obligation_id':item['obligation_id'],
+                **{key:[mapping[source] for source in item[key]] for key in
+                   ('required_source_ids','covered_source_ids','missing_source_ids')}})
+        return result
+
+    @staticmethod
     def _remap_review_sources(value, mapping):
         """Remap vetted aliases without interpreting typed values or bad drafts."""
         if isinstance(value,dict):
@@ -333,6 +391,9 @@ class JointReader:
         if 'summary_revision_sources' in entry:
             result['summary_revision_sources']=JointReader._remap_summary_revision_sources(
                 entry['summary_revision_sources'],mapping)
+        if 'obligation_review_sources' in entry:
+            result['obligation_review_sources']=JointReader._remap_obligation_review_sources(
+                entry['obligation_review_sources'],mapping)
         return result
 
     def _failed_parent_signature(self, variable):
@@ -560,6 +621,14 @@ class JointReader:
             item['properties']['resolved_obligation_ids']={'type':'array','items':{'type':'string'},'uniqueItems':True}
         if data.get('failed_batch_reviews'):
             item['properties']['resolved_failed_batch_ids']={'type':'array','items':{'type':'string'},'uniqueItems':True}
+        frozen_reviews={}
+        for entry in data.get('repair_scope',{}).get('failed',[]):
+            offer=entry.get('frozen_observation_reviews')
+            if offer:
+                frozen_reviews[entry['variable']]=[*offer['slot_observation_ids'],
+                    *[row['id'] for row in offer['observations']]]
+        if frozen_reviews:
+            item['properties']['reviewed_observation_ids']={'type':'array','items':{'type':'string'},'uniqueItems':True}
         if requested:
             item['properties']['variable']['enum']=requested
             targets_by_variable={v:[r['id'] for r in data.get('known_observations',[]) if r['variable']==v]
@@ -610,6 +679,9 @@ class JointReader:
                                if record['variable']==variable and record['review_allowed']]
                     properties['resolved_failed_batch_ids']=({'items':{'enum':batch_ids}}
                         if batch_ids else {'maxItems':0})
+                if frozen_reviews:
+                    ids=frozen_reviews.get(variable,[])
+                    properties['reviewed_observation_ids']=({'items':{'enum':ids}} if ids else {'maxItems':0})
                 branches.append({'properties':properties})
             item['oneOf']=branches
         schema['properties']['slots'].update(minItems=len(requested),maxItems=len(requested))
@@ -759,10 +831,20 @@ class JointReader:
         variables=data['variables']
         feedback=('whole_value_disagreement: review all scoped drafts and known routes; '
                   'compatible fragments need a sourced complete value, genuine conflict stays unresolved')
+        failed=[{'variable':v,'id':'*','feedback':feedback,'observation':None,
+                 'slot':{'variable':v,'observations':[],'unresolved':[]}}
+                for v in variables]
+        # Count the predictable controller metadata as well as the unknown
+        # draft reserve. This is a forecast, never an offered authorization.
+        for entry in failed:
+            obligations=[item for item in data.get('evidence_obligations',[]) if item['variable']==entry['variable']]
+            if obligations:
+                entry['obligation_review_sources']=[{'obligation_id':item['id'],
+                    'required_source_ids':list(item['source_ids']),'covered_source_ids':[],
+                    'missing_source_ids':list(item['source_ids'])} for item in obligations]
+                entry['frozen_observation_reviews']={'slot_observation_ids':[],'observations':[]}
         return {**data,'repair_scope':{
-            'failed':[{'variable':v,'id':'*','feedback':feedback,'observation':None,
-                       'slot':{'variable':v,'observations':[],'unresolved':[]}}
-                      for v in variables],
+            'failed':failed,
             'whole_value_reviews':[{'variable':v,'scope':data['requested_scopes'][v],
                 'draft_observations':[],
                 'known_observations':[row for row in data.get('known_observations',[])
@@ -1007,6 +1089,9 @@ class JointReader:
     @staticmethod
     def _system(data):
         system=SYSTEM+(COLUMNAR_INSTRUCTION if 'source_span_columns' in data else '')
+        if any('obligation_review_sources' in entry or 'frozen_observation_reviews' in entry
+                for entry in data.get('repair_scope',{}).get('failed',[])):
+            system+=OBLIGATION_REVIEW_INSTRUCTION
         if data.get('repair_scope',{}).get('whole_value_reviews'):
             system+=WHOLE_VALUE_REVIEW_INSTRUCTION
             if any('known_observation_ids' in group for group in data['repair_scope']['whole_value_reviews']):
@@ -1351,7 +1436,8 @@ class JointReader:
                 del self.failed_obligations[key]
 
     def _store_failed_reviews(self, step, identity, batch, data, current, failures,
-                              observed, slots, duplicates, protected, whole, valid, frozen, source_feedback):
+                              observed, slots, duplicates, protected, whole, valid, frozen, source_feedback,
+                              obligation_feedback=None):
         mapping={a:s['source_id'] for a,s in self.e.mapper.sources.items()}
         sources=sorted({mapping[s['id']] for s in data['source_spans']}|
                        {mapping[s['id']] for s in current['source_spans']})
@@ -1367,6 +1453,8 @@ class JointReader:
                       'observation':deepcopy(observed.get((v,key)))}
                 if (v,key) in source_feedback:
                     item['summary_revision_sources']=deepcopy(source_feedback[v,key]['sources'])
+                if key=='*' and v in (obligation_feedback or {}):
+                    item['obligation_review_sources']=deepcopy(obligation_feedback[v]['sources'])
                 if key=='*':item['slot']=deepcopy(slots.get(v))
                 if (v,key) in protected:
                     item['required_counter_observations']=deepcopy(list(protected[v,key].values()))
@@ -1404,13 +1492,109 @@ class JointReader:
             key=(record['query_identity'],record['batch_identity'])
             self.failed_obligations.setdefault(key,set()).add(variable)
 
-    def _update_evidence_obligations(self, reviews, rows, data, failures, identity):
+    def _frozen_review_wire(self, row, visible):
+        """A complete unchanged local observation, using this wire's aliases."""
+        if any(any(source.get(key)!=self.e.mapper.sources[alias].get(key) for key in
+                   ('doc_id','start','end','text','source_role','source_message_indices','time_metadata'))
+               for alias,source in visible.items()):
+            return None
+        mapping={self.e.mapper.sources[alias]['source_id']:alias for alias in visible}
+        if (len(mapping)!=len(visible) or row['stance'] not in ('support','contradiction','irrelevant')
+                or not row['source_ids'] or not set(row['source_ids'])<=set(mapping)
+                or any(row.get(key)!=value for key,value in self.state.scope(row['variable']).items())):
+            return None
+        wire={key:deepcopy(row[key]) for key in OBSERVATION_SCHEMA['required']}
+        wire['source_ids']=[mapping[source] for source in row['source_ids']]
+        if 'summary_revision' in row:
+            wire['summary_revision']=deepcopy(row['summary_revision'])
+        return wire
+
+    def _offer_frozen_reviews(self, current, valid, frozen, feedback):
+        """Offer only this batch's validated rows; durable records grant nothing."""
+        offered={}
+        visible={source['id']:source for source in current['source_spans']}
+        for entry in current['repair_scope']['failed']:
+            variable=entry['variable']
+            if entry['id']!='*' or variable not in feedback:
+                continue
+            originals=entry.get('slot',{}).get('observations',[])
+            references=[];complete=[]
+            for row in valid:
+                key=(variable,row['id'])
+                if row['variable']!=variable or key not in frozen:
+                    continue
+                wire=self._frozen_review_wire(row,visible)
+                if wire is None:
+                    continue
+                matching=[item for item in originals if isinstance(item,dict) and item.get('id')==row['id']]
+                if len(matching)==1 and digest(matching[0])==digest(wire):
+                    references.append(row['id'])
+                else:
+                    complete.append(wire)
+                offered[key]=deepcopy(row)
+            if references or complete:
+                entry['frozen_observation_reviews']={'slot_observation_ids':references,'observations':complete}
+        return offered
+
+    def _reviewed_frozen_rows(self, slot, current, offered, valid, frozen, visible):
+        ids=slot.get('reviewed_observation_ids',[])
+        if (not isinstance(ids,list) or any(not isinstance(identifier,str) for identifier in ids)
+                or len(set(ids))!=len(ids)):
+            raise ProtocolError('Frozen observation references must be unique offered IDs')
+        result=[];variable=slot['variable']
+        for identifier in ids:
+            if any(isinstance(item,dict) and item.get('id')==identifier for item in slot['observations']):
+                raise ProtocolError('A referenced frozen observation must not be restated or changed')
+            key=(variable,identifier)
+            row=offered.get(key)
+            candidates=[item for item in valid if (item['variable'],item['id'])==key]
+            if (row is None or key not in frozen or len(candidates)!=1
+                    or digest(row)!=digest(candidates[0])):
+                raise ProtocolError('Frozen observation reference is not a current same-batch validated offer')
+            wire=self._frozen_review_wire(row,visible)
+            entries=[entry for entry in current.get('repair_scope',{}).get('failed',[])
+                     if entry['variable']==variable and entry['id']=='*']
+            transmitted=[]
+            for entry in entries:
+                offer=entry.get('frozen_observation_reviews',{})
+                if identifier in offer.get('slot_observation_ids',[]):
+                    transmitted.extend(item for item in entry.get('slot',{}).get('observations',[])
+                                       if isinstance(item,dict) and item.get('id')==identifier)
+                transmitted.extend(item for item in offer.get('observations',[]) if item.get('id')==identifier)
+            if wire is None or len(transmitted)!=1 or digest(transmitted[0])!=digest(wire):
+                raise ProtocolError('Frozen observation reference lacks an unchanged visible complete observation')
+            result.append(row)
+        return result
+
+    def _current_obligation_feedback(self, feedback, reviews, failures):
+        result={}
+        for variable,item in feedback.items():
+            if (failures.get((variable,'*'))!=item['error']
+                    or digest(reviews.get(variable))!=item['slot_identity']):
+                continue
+            if all(digest(self.evidence_obligations.get(oid))==identity
+                   for oid,identity in item['obligation_identities'].items()):
+                result[variable]=item
+        return result
+
+    def _refresh_reviewed_frozen(self, reviews, current, offered, valid, frozen, visible, failures):
+        result={}
+        for variable,slot in reviews.items():
+            try:
+                result[variable]=self._reviewed_frozen_rows(slot,current,offered,valid,frozen,visible)
+            except ProtocolError as exc:
+                failures[variable,'*']=str(exc)
+        return result
+
+    def _update_evidence_obligations(self, reviews, rows, data, failures, identity, *, reviewed_rows=None):
         """Carry unresolved evidence until an explicit, sourced scoped review."""
         offered={item['id'] for item in data.get('evidence_obligations',[])}
         visible={self.e.mapper.sources[s['id']]['source_id'] for s in data['source_spans']}
+        feedback={}
         for variable,slot in reviews.items():
             reported={r.get('id') for r in slot['observations'] if isinstance(r,dict)}
             reviewed=[r for r in rows if r['variable']==variable and r['id'] in reported]
+            reviewed=list({row['id']:row for row in [*reviewed,*(reviewed_rows or {}).get(variable,[])]}.values())
             unresolved=slot['unresolved']
             partial=[r for r in reviewed if r['stance'] in ('partial','unknown') and r['source_ids']]
             settled=[r for r in reviewed if r['stance'] in ('support','contradiction','irrelevant') and r['source_ids']]
@@ -1423,8 +1607,10 @@ class JointReader:
                     if (item['variable']==variable and not item['source_ids']
                             and oid not in slot.get('resolved_obligation_ids',[])):
                         del self.evidence_obligations[oid]
+            preexisting_failure=any(key[0]==variable for key in failures)
+            noncoverage_failure=False
             for oid in slot.get('resolved_obligation_ids',[]):
-                if any(key[0]==variable for key in failures):
+                if preexisting_failure:
                     # A rejected revision/draft cannot discharge the issue;
                     # keep its specific cause instead of relabeling it as a
                     # missing obligation ID or missing original text.
@@ -1432,12 +1618,27 @@ class JointReader:
                 obligation=self.evidence_obligations.get(oid)
                 covered={sid for r in settled for sid in r['source_ids']}
                 required=set(obligation['source_ids']) if obligation else set()
-                if (oid not in offered or obligation is None or obligation['variable']!=variable
-                        or unresolved or partial or any(key[0]==variable for key in failures)
-                        or not settled or not required<=visible or not required<=covered):
-                    failures[variable,'*']='Evidence obligation resolution requires its offered ID, original sources, a sourced scoped review, and no unresolved issue'
+                other_failure=(oid not in offered or obligation is None or obligation['variable']!=variable
+                               or unresolved or partial or not settled or not required<=visible)
+                if other_failure or not required<=covered:
+                    error='Evidence obligation resolution requires its offered ID, original sources, a sourced scoped review, and no unresolved issue'
+                    noncoverage_failure=noncoverage_failure or bool(other_failure)
+                    if not other_failure and not required<=covered:
+                        mapping={self.e.mapper.sources[alias]['source_id']:alias for alias in
+                                 (source['id'] for source in data['source_spans'])}
+                        sources=self._remap_obligation_review_sources([{'obligation_id':oid,
+                            'required_source_ids':sorted(required),'covered_source_ids':sorted(covered),
+                            'missing_source_ids':sorted(required-covered)}],mapping)
+                        item=feedback.setdefault(variable,{'error':error,'slot_identity':digest(slot),
+                            'obligation_identities':{},'sources':[]})
+                        item['obligation_identities'][oid]=digest(obligation)
+                        item['sources'].extend(sources)
+                    failures[variable,'*']=error
                     continue
-                del self.evidence_obligations[oid]
+                if not any(key[0]==variable for key in failures):
+                    del self.evidence_obligations[oid]
+            if noncoverage_failure:
+                feedback.pop(variable,None)
             if not unresolved and not partial:
                 continue
             sources=sorted({sid for r in (partial or reviewed) for sid in r['source_ids']})
@@ -1454,6 +1655,7 @@ class JointReader:
             self.evidence_obligations[oid]={'id':oid,'variable':variable,**scope,
                 'source_ids':sources,'descriptions':sorted(set(previous.get('descriptions',[]))|set(descriptions)),
                 'origins':sorted(set(previous.get('origins',[]))|{identity})}
+        return feedback
 
     def _handoff_failures(self, rows, rejectable, prediction=None, semantic_result=None, *, pending=None,
                           resolved_failed=()):
@@ -1698,6 +1900,8 @@ class JointReader:
             protected_counters={}
             whole_value_reviews={}
             source_feedback={}
+            obligation_feedback={}
+            offered_frozen={}
             current=deepcopy(data)
             prediction=None
             semantic_result=None
@@ -1711,6 +1915,7 @@ class JointReader:
                 resolved=set()
                 next_failures={}
                 next_source_feedback={}
+                reviewed_frozen={}
                 visible={s['id']:s for s in current['source_spans']}
                 try:
                     wire=self._wire_data(current)
@@ -1781,7 +1986,7 @@ class JointReader:
                             raise ProtocolError('Duplicate/unrequested reading slot')
                         seen.add(variable)
                         observed_slots[variable]=deepcopy(slot)
-                        if (set(slot)-{'variable','observations','unresolved','resolved_obligation_ids','resolved_failed_batch_ids'}
+                        if (set(slot)-{'variable','observations','unresolved','resolved_obligation_ids','resolved_failed_batch_ids','reviewed_observation_ids'}
                                 or not {'variable','observations','unresolved'}<=set(slot)
                                 or not isinstance(slot['observations'],list) or not isinstance(slot['unresolved'],list)
                                 or any(not isinstance(g,str) for g in slot['unresolved'])
@@ -1793,6 +1998,12 @@ class JointReader:
                                 or len(set(slot.get('resolved_failed_batch_ids',[])))!=len(slot.get('resolved_failed_batch_ids',[]))):
                             next_failures[variable,'*']='Malformed slot';continue
                         reviews[variable]=slot
+                        try:
+                            reviewed_frozen[variable]=self._reviewed_frozen_rows(
+                                slot,current,offered_frozen,valid,frozen,visible)
+                        except ProtocolError as exc:
+                            next_failures[variable,'*']=str(exc)
+                            continue
                         self.gaps[identity,variable]=list(slot['unresolved'])
                         groups={}
                         for i,row in enumerate(slot['observations']):
@@ -1924,7 +2135,10 @@ class JointReader:
                         next_failures[key]=error
                 before_obligations=deepcopy(self.evidence_obligations)
                 recovered=self._failed_review_candidates(observed_slots,valid,data,next_failures)
-                self._update_evidence_obligations(reviews,valid,current,next_failures,identity)
+                reviewed_frozen=self._refresh_reviewed_frozen(
+                    reviews,current,offered_frozen,valid,frozen,visible,next_failures)
+                obligation_feedback=self._update_evidence_obligations(
+                    reviews,valid,current,next_failures,identity,reviewed_rows=reviewed_frozen)
                 recovered={rid for rid in recovered if not any(
                     key[0]==self.failed_batch_reviews[rid]['variable'] for key in next_failures)}
                 prospective_pending=(external_pending
@@ -1940,11 +2154,15 @@ class JointReader:
                     for key,error in rejected.items():
                         frozen.discard(key);resolved.discard(key);completed.discard(key[0])
                         next_failures[key]=error
-                    self._update_evidence_obligations(reviews,valid,current,next_failures,identity)
+                    reviewed_frozen=self._refresh_reviewed_frozen(
+                        reviews,current,offered_frozen,valid,frozen,visible,next_failures)
+                    obligation_feedback=self._update_evidence_obligations(
+                        reviews,valid,current,next_failures,identity,reviewed_rows=reviewed_frozen)
                 failures=next_failures
                 source_feedback={key:item for key,item in next_source_feedback.items()
                                  if failures.get(key)==item['error']
                                  and digest(observed_rows.get(key))==item['observation_identity']}
+                obligation_feedback=self._current_obligation_feedback(obligation_feedback,reviews,failures)
                 if not failures:
                     break
                 if attempt==max_repairs or not self.e.ledger.remaining('json_repairs'):
@@ -1961,6 +2179,8 @@ class JointReader:
                         'observation':deepcopy(observed_rows.get((v,rid))),
                         **({'summary_revision_sources':deepcopy(source_feedback[v,rid]['sources'])}
                            if (v,rid) in source_feedback else {}),
+                        **({'obligation_review_sources':deepcopy(obligation_feedback[v]['sources'])}
+                           if rid=='*' and v in obligation_feedback else {}),
                         **({'required_counter_observations':deepcopy(list(protected_counters[v,rid].values()))}
                            if (v,rid) in protected_counters else {}),
                         **({'required_parent_versions':deepcopy(current.get('required_parent_versions',{}).get(v,{}))}
@@ -1987,6 +2207,7 @@ class JointReader:
                     # serialized size is subject to the same input limit.
                     current['repair_scope']['invalid_response']=deepcopy(
                         (self.e.reasoner.last_response or {}).get('raw_output'))
+                offered_frozen=self._offer_frozen_reviews(current,valid,frozen,obligation_feedback)
                 semantic_repair=deepcopy(current)
                 semantic_repair['repair_scope'].pop('attempt')
                 semantic_repair['repair_scope'].pop('previous_response_identity')
@@ -2026,7 +2247,8 @@ class JointReader:
                 self.unread_obligations.pop((identity,alias),None)
             if related:
                 self._store_failed_reviews(step,identity,batch,data,current,failures,
-                    observed_rows,observed_slots,duplicate_rows,protected_counters,whole_value_reviews,valid,frozen,source_feedback)
+                    observed_rows,observed_slots,duplicate_rows,protected_counters,whole_value_reviews,valid,frozen,source_feedback,
+                    obligation_feedback)
             # Apply all valid facts AND all counters before any residual check.
             self.clues.setdefault(identity, [])
             for row in valid:

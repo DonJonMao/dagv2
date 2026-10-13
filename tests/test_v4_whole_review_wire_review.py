@@ -130,19 +130,22 @@ def test_json_type_difference_does_not_match_by_python_boolean_numeric_equality(
     assert expand_all_wire(wire) == before
 
 
-def long_summary_reader():
+def long_summary_reader(*, repetitions=18):
     _, engine, old_state, calls, _ = summary_fixture()
     engine.s.update(max_repairs_per_request=1, reasoning_output_tokens=4096, context_tokens=16384)
     state = FactState(old_state.initial_program, old_state.contract, engine.steps, 'suggestion')
     reader = JointReader(engine, state)
-    value = 'The user played piano last year, enjoying its creative and social aspects. ' * 18
+    value = 'The user played piano last year, enjoying its creative and social aspects. ' * repetitions
     row = observation('old-long-summary', ['s1'], value=value)
     state.integrate([reader._observation(row, 'history', visible(reader), engine.steps[0])])
     return reader, engine, state, calls, next(iter(state.routes)), value
 
 
 def test_real_whole_repair_request_uses_references_and_preserves_original_review_semantics():
-    reader, engine, state, calls, original, value = long_summary_reader()
+    # Exercise real reference encoding and semantic repair without coupling
+    # admission to unrelated SYSTEM prose. The exact 16k threshold is tested
+    # separately below, with both configured 4096 output reserves unchanged.
+    reader, engine, state, calls, original, value = long_summary_reader(repetitions=8)
     expanded = value + ' The user also enjoyed painting last spring.'
     def reply(index, data):
         if index == 1:
