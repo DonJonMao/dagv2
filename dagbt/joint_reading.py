@@ -590,6 +590,48 @@ class JointReader:
         repair_count = self._estimate(operation+'_repair',repair_data)
         return max(count,repair_count) + self.e.s['reasoning_output_tokens'] + self.e.s['input_margin'] + 8 <= self.e.s['context_tokens']
 
+    def _fresh_window_fits(self, operation, data, *, fresh_sources=True):
+        """Admit a new personal-history window with room for one unknown draft.
+
+        A nearly full initial request can strand its complete original window
+        when validation adds the generated draft and whole-value review metadata.
+        Before reading new text, leave one *existing* output allowance as repair
+        workspace, above an exactly counted empty whole-review envelope. This is
+        a forecast, not a guarantee: duplicated/invalid drafts can grow further,
+        so every actual repair still passes its own exact wire check.
+
+        Do not impose this unknown-draft forecast on mandatory downstream reads
+        or durable recovery requests whose original drafts are already present.
+        No output/call budget is increased and no source is removed after reading.
+        """
+        if not self._fits(operation,data):
+            return False
+        if (not fresh_sources or not data.get('personal_response_selection')
+                or data.get('phase')!='history_evidence' or data.get('repair_scope')
+                or data.get('task',{}).get('execution')!='retrieval'
+                or data.get('failed_batch_reviews')
+                or self.e.s['max_repairs_per_request']<=0
+                or not self.e.ledger.remaining('json_repairs')
+                or self.e.ledger.remaining('llm')<self.e.s['reserved_audit_calls']+2):
+            return True
+        variables=data['variables']
+        feedback=('whole_value_disagreement: review all scoped drafts and known routes; '
+                  'compatible fragments need a sourced complete value, genuine conflict stays unresolved')
+        repair={**data,'repair_scope':{
+            'failed':[{'variable':v,'id':'*','feedback':feedback,'observation':None,
+                       'slot':{'variable':v,'observations':[],'unresolved':[]}}
+                      for v in variables],
+            'whole_value_reviews':[{'variable':v,'scope':data['requested_scopes'][v],
+                'draft_observations':[],
+                'known_observations':[row for row in data.get('known_observations',[])
+                                      if row['variable']==v],
+                'required_source_ids':[source['id'] for source in data['source_spans']]}
+                for v in variables],
+            'attempt':1,'previous_response_identity':'0'*64}}
+        repair_input=self._estimate(operation+'_repair',repair)
+        output=self.e.s['reasoning_output_tokens']
+        return repair_input+output+output+self.e.s['input_margin']+8<=self.e.s['context_tokens']
+
     def _repair_fits(self, operation, data, step, identity, attempt):
         count=self._estimate(operation,data)
         total=count+self.e.s['reasoning_output_tokens']+self.e.s['input_margin']+8
@@ -615,7 +657,7 @@ class JointReader:
             if size not in tested:
                 aliases=list(dict.fromkeys(a for group in pending[:size] for a in group))
                 data=self._payload(step,query,variables,aliases,semantic,audit=audit)
-                tested[size]=(self._fits(operation,data),aliases)
+                tested[size]=(self._fresh_window_fits(operation,data,fresh_sources=bool(aliases)),aliases)
             return tested[size][0]
         length=len(pending)
         if trial(length):

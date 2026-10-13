@@ -72,6 +72,11 @@ not establish an adopted user preference. Do not invent external catalogues,
 availability or past execution of a future suggestion. A partial observation must
 cite its actual clue. Use unresolved only for a specific condition still necessary
 to establish this requested historical value, not hypothetical exhaustive coverage.
+For one text-summary variable, synthesize compatible query-relevant facts into one
+sufficient source-grounded whole summary; do not report each event as a different
+complete value of that variable. Multiple supports must be alternative sufficient
+proofs of the same whole value. Keep partial evidence, negative experiences and
+valid counters explicit when a complete scoped summary is not established.
 Positive and negative experiences can both support a historical summary. A sourced
 dislike is useful history, not automatically a contradiction observation: that
 stance is reserved for challenging an identified existing fact route. Preserve
