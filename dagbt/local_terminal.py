@@ -15,6 +15,12 @@ def planner_contract(base_schema):
     item = schema['properties']['steps']['items']
     item['properties']['execution'] = {'enum': ['retrieval', 'compose']}
     item['required'].append('execution')
+    # Mirror the existing validator: a retrieval leaf is legal, but a compose
+    # task must have at least one explicit parent before placeholder expansion.
+    item['anyOf'] = [
+        {'properties': {'execution': {'enum': ['retrieval']}}},
+        {'properties': {'execution': {'enum': ['compose']}, 'inputs': {'minItems': 1}}},
+    ]
     return schema
 
 

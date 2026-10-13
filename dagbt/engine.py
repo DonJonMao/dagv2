@@ -106,6 +106,7 @@ class Engine:
                 out.write(json.dumps(event,ensure_ascii=False)+'\n');out.flush()
 
     def plan(self):
+        repair_options = {}
         system = local_terminal.PLAN_SYSTEM if self.local_terminal else self.e.PLAN_SYSTEM
         schema = local_terminal.planner_contract(self.e.PLAN_SCHEMA) if self.local_terminal else self.e.PLAN_SCHEMA
         validate = (lambda value: local_terminal.validate_plan(value, self.repair.validate_plan)) if self.local_terminal else self.repair.validate_plan
@@ -120,7 +121,9 @@ class Engine:
                 schema = residual_plan.planner_contract(self.e.PLAN_SCHEMA, personal_history=True)
                 validate = lambda value: validate_personal_plan(
                     residual_plan.validate_plan(value, self.repair.validate_plan, personal_history=True), self.q['question'])
-        plan=self.reasoner.json('planner',prompts.plan_system(system,self.personal),self.q['question'],validate,schema)
+                repair_options['repair_builder'] = residual_plan.personal_repair_builder(self.reasoner)
+        plan=self.reasoner.json('planner',prompts.plan_system(system,self.personal),self.q['question'],validate,schema,
+                                **repair_options)
         if len(plan['steps'])>self.s['max_initial_nodes']:raise ProtocolError('Initial node cap exceeded')
         self.steps=deepcopy(plan['steps'])
         parents={p for st in self.steps for p in st['inputs']}

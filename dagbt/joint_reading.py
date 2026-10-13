@@ -211,6 +211,9 @@ With no new observation, return observations=[] unless an outstanding review
 requires its original draft IDs and sources. For such an unchanged draft, the
 same sourced support with a valid summary_revision is an idempotent recheck: it
 keeps the existing routes, ancestry and version, and does not assert new evidence.
+This does not authorize restating an already validated, frozen row from the current
+paid batch. Such rows may only be referenced through currently offered
+reviewed_observation_ids; a wildcard slot failure does not unfreeze them.
 Re-read ALL old and new original premises and relevant counterevidence; retain
 them in the new support's source_ids and preserve their factual content, negative
 experiences, conditions and temporal qualifications in the revised whole summary.
@@ -953,6 +956,13 @@ class JointReader:
                 'required':['supersedes_route_ids','previous_version','reason'],'additionalProperties':False}
         if data.get('evidence_obligations'):
             item['properties']['resolved_obligation_ids']={'type':'array','items':{'type':'string'},'uniqueItems':True}
+            # Mirror the existing obligation guard. A failed-format draft may
+            # be repaired while a semantic gap remains, so this condition must
+            # not apply to resolved_failed_batch_ids.
+            item.setdefault('allOf',[]).append({
+                'if':{'required':['resolved_obligation_ids'],
+                      'properties':{'resolved_obligation_ids':{'minItems':1}}},
+                'then':{'properties':{'unresolved':{'maxItems':0}}}})
         if data.get('failed_batch_reviews'):
             item['properties']['resolved_failed_batch_ids']={'type':'array','items':{'type':'string'},'uniqueItems':True}
         frozen_reviews={}
@@ -1016,6 +1026,10 @@ class JointReader:
                 if frozen_reviews:
                     ids=frozen_reviews.get(variable,[])
                     properties['reviewed_observation_ids']=({'items':{'enum':ids}} if ids else {'maxItems':0})
+                    if ids:
+                        # IDs offered here identify immutable rows from this
+                        # batch, not ordinary known routes or other variables.
+                        observation.setdefault('properties',{})['id']={'not':{'enum':ids}}
                 branches.append({'properties':properties})
             item['oneOf']=branches
         schema['properties']['slots'].update(minItems=len(requested),maxItems=len(requested))
@@ -2006,12 +2020,15 @@ class JointReader:
 
     def _handoff_failures(self, rows, rejectable, prediction=None, semantic_result=None, *, pending=None,
                           resolved_failed=()):
-        """Admit a new proof only if its mandatory next use can actually fit.
+        """Admit a new proof only if its currently mandatory next use can fit.
 
         This is a wire-capacity check, not a claim of semantic sufficiency. No
         source is sliced or deleted. A rejected draft remains a scoped repair
         obligation, and valid counters still enter the state. Existing published
-        routes are never rewritten to make room for a new route.
+        routes are never rewritten to make room for a new route. A future target
+        with unbound parents is advisory; its provisional footprint cannot
+        invalidate a locally validated observation. Current conflict rechecks
+        and actual compose/audit/format operations retain their strict gate.
         """
         existing={self.state.support_identity(route) for route in self.state.routes.values() if self.state.is_active_route(route)}
         supports=[r for r in rows if r['stance']=='support' and (r['variable'],r['id']) in rejectable
@@ -2074,9 +2091,20 @@ class JointReader:
             variables=set(controller.demand_variables(target['output_slot']))|related
             variables-=set(proposed.program.get('task_expressions',{}))
             query=controller.grounded(target)
+            deferred=None
             if query is None:
-                # Still check the current mandatory footprint; do not invent
-                # values or source obligations for an as-yet unbound parent.
+                # Count the same provisional footprint without inventing an
+                # unbound parent's value or sources. Only a current conflict
+                # recheck can reject this draft before the target is grounded.
+                if not conflict_recheck:
+                    missing={parent:controller.demand_variables(parent) for parent in target['inputs']
+                             if controller.task_projection(parent) is None}
+                    missing={parent:variables for parent,variables in missing.items()
+                             if not variables or any(v not in values for v in variables)}
+                    deferred={'missing_parent_demands':sorted(missing),
+                        'missing_parent_variables':sorted({v for group in missing.values() for v in group
+                                                           if v not in values}),
+                        'parent_versions':{v:proposed.versions[v] for v in sorted(related)}}
                 query=target['question']
                 for parent in target['inputs']:
                     known={v:values[v] for v in controller.demand_variables(parent) if v in values}
@@ -2084,7 +2112,7 @@ class JointReader:
                         query+='\nEstablished '+parent+': '+json.dumps(known,ensure_ascii=False,sort_keys=True)
             terminal=target['output_slot']==proposed.final_node_id
             semantic=terminal and proposed.contract['mode']=='semantic'
-            checks.append(('semantic_compose' if semantic else 'joint_read',target,query,variables,semantic,False))
+            checks.append(('semantic_compose' if semantic else 'joint_read',target,query,variables,semantic,False,deferred))
         terminal_variables=controller.demand_variables(proposed.final_node_id)
         audit_variables=None
         if ready:
@@ -2092,9 +2120,9 @@ class JointReader:
         elif terminal_variables and all(v in values for v in terminal_variables):
             audit_target,audit_variables=controller.audit_scope()
         if audit_variables:
-            checks.append(('audit_joint',audit_target,self.e.q['question'],audit_variables,False,True))
+            checks.append(('audit_joint',audit_target,self.e.q['question'],audit_variables,False,True,None))
         failures={}
-        for operation,target,query,variables,semantic,audit in checks:
+        for operation,target,query,variables,semantic,audit,deferred in checks:
             probe.current_identity=digest(['mandatory_handoff',target['output_slot'],proposed.revision,proposed.versions])
             probe.current_terminal_output=not audit and target['output_slot']==proposed.final_node_id and self.e.output_options is not None
             data=probe._payload(target,query,variables,[],semantic,audit=audit,
@@ -2102,6 +2130,18 @@ class JointReader:
             if probe._fits(operation,data):
                 continue
             implicated=[r for r in supports if r['variable'] in variables]
+            if deferred is not None:
+                self.e.event({'event':'joint_support_handoff_deferred','next_operation':operation,
+                    'next_node_id':target['output_slot'],'reason':'ungrounded_future_target',
+                    'executable':False,'capacity_fits':False,'provisional':True,
+                    'source_spans':len(data['source_spans']),
+                    'source_set_identity':digest(sorted({self.e.mapper.sources[s['id']]['source_id']
+                                                        for s in data['source_spans']})),
+                    'support_draft_ids':[r['id'] for r in implicated],
+                    'source_ids_preserved':True,'context_tokens':self.e.s['context_tokens'],
+                    'program_revision':proposed.revision,'program_identity':digest(proposed.program),
+                    **deferred})
+                continue
             for row in implicated:
                 failures[row['variable'],row['id']]=(
                     'citation_capacity: mandatory '+operation+' at '+target['output_slot']+
