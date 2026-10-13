@@ -5,6 +5,14 @@ from .residual_plan import validate_bindings
 from .transport import digest
 
 
+class SummaryRevisionSourcesMissing(ProgramError):
+    """An otherwise valid revision omitted specific inherited source identities."""
+    def __init__(self, required, provided):
+        super().__init__('Summary revision must retain every original premise and relevant counter source')
+        self.required_source_ids=tuple(sorted(required))
+        self.missing_source_ids=tuple(sorted(set(required)-set(provided)))
+
+
 class FactState:
     def __init__(self, program, contract, steps, final_node_id):
         validate_bindings(program, steps, final_node_id, contract=contract)
@@ -107,7 +115,7 @@ class FactState:
                 raise ProgramError('Summary revision cannot supersede revoked, retired or stale routes')
         required=self.summary_revision_sources(variable,targets,historical=historical)
         if not required<=set(row['source_ids']):
-            raise ProgramError('Summary revision must retain every original premise and relevant counter source')
+            raise SummaryRevisionSourcesMissing(required,row['source_ids'])
 
     def summary_revision_is_noop(self, row):
         """Classify only after the full revision/provenance validation succeeds.
