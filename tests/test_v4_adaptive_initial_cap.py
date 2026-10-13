@@ -2,6 +2,7 @@
 import json
 
 from test_v4_reconcile_review import personal_reader
+from test_v4_summary_revision_review import summary_fixture, OLD
 
 
 def history(reader, engine):
@@ -10,7 +11,7 @@ def history(reader, engine):
 
 
 def test_structure_floor_counts_the_complete_assistant_envelope_without_a_request_or_answer(monkeypatch):
-    reader,engine,state,calls=personal_reader(reasoning_output_tokens=4096,max_repairs_per_request=1)
+    reader,engine,state,calls,original=summary_fixture(reasoning_output_tokens=4096)
     data=history(reader,engine)
     before=state.public_dict()
     used=dict(engine.ledger.used)
@@ -21,8 +22,12 @@ def test_structure_floor_counts_the_complete_assistant_envelope_without_a_reques
         assert len(payload['messages'])==1
         message=payload['messages'][0]
         assert message['role']=='assistant'
-        assert json.loads(message['content'])=={'slots':[
-            {'variable':'history','observations':[],'unresolved':[]}]}
+        slots=json.loads(message['content'])['slots']
+        assert len(slots)==1 and slots[0]['variable']=='history' and slots[0]['unresolved']==[]
+        observation=slots[0]['observations'][0]
+        assert observation['value']==OLD and observation['source_ids']==['s1']
+        assert observation['summary_revision']['supersedes_route_ids']==[original]
+        assert observation['summary_revision']['previous_version']==state.versions['history']
         return {'count':57,'token_count_is_estimate':False}
     monkeypatch.setattr(engine.reasoner,'_count_payload',count)
     assert reader._fresh_structure_floor('joint_read',data,output_token_cap=1234)==57

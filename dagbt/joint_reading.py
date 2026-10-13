@@ -771,19 +771,130 @@ class JointReader:
                 for v in variables],
             'attempt':1,'previous_response_identity':'0'*64}}
 
-    def _fresh_structure_floor(self, operation, data, *, output_token_cap=None):
-        """Policy allowance for a minimal complete slots envelope, not an answer.
+    def _fresh_structure_response(self, data):
+        """Measure preservation of known state, never manufacture a response.
 
-        Count the entire assistant chat wrapper through the production counter.
-        Its overhead is deliberately retained: this is a structural allowance
-        policy, not an exact raw-completion lower bound or a promise that useful
-        semantic content will fit. Never send or integrate this empty skeleton.
-        A regex estimate cannot authorize the adaptive fallback.
+        A selected sufficient OR route is enough; joining every alternative
+        would invent an AND requirement. Outstanding issues remain separate
+        unknown rows, with their complete originals and unresolved descriptions.
+        This template is only counted: it neither resolves those issues nor
+        represents a successful completion of the reading task.
         """
-        slots=list(data.get('requested_slots',data['variables']))
-        if not slots:
+        try:
+            slots=list(data.get('requested_slots',data['variables']))
+            if not slots or len(set(slots))!=len(slots) or set(slots)!=set(data['variables']):
+                return None
+            values,_,selected=self.state.valid()
+            mapping={}
+            visible={}
+            for source in data['source_spans']:
+                alias=source['id']
+                original=self.e.mapper.sources[alias]
+                stable=original['source_id']
+                if (alias in visible or stable in mapping or any(source.get(k)!=original.get(k)
+                        for k in ('doc_id','start','end','text','source_role','source_message_indices','time_metadata'))):
+                    return None
+                visible[alias]=source
+                mapping[stable]=alias
+            def mapped(value):
+                if isinstance(value,dict):
+                    return {k:[mapping[s] for s in item] if k=='source_ids'
+                        else deepcopy(item) if k in ('value','output') else mapped(item)
+                        for k,item in value.items()}
+                if isinstance(value,list):
+                    return [mapped(item) for item in value]
+                return deepcopy(value)
+            known={}
+            for row in data.get('known_observations',[]):
+                if row['id'] in known:
+                    return None
+                known[row['id']]=row
+            offered=data.get('evidence_obligations',[])
+            expected=[item for item in self.evidence_obligations.values() if item['variable'] in slots]
+            if (len({item['id'] for item in offered})!=len(offered)
+                    or {item['id']:item for item in offered}!={item['id']:mapped(item) for item in expected}):
+                return None
+            result=[]
+            for variable in slots:
+                declaration=self.state.program['variables'][variable]
+                scope=self.state.scope(variable)
+                route_ids=selected.get(variable,[])
+                if (variable not in values or len(route_ids)!=1
+                        or variable in self.state.program.get('task_expressions',{})
+                        or declaration['demand']==self.state.final_node_id
+                        or digest(declaration)!=digest(data['variables'][variable])
+                        or scope!=data['requested_scopes'][variable]):
+                    return None
+                route=self.state.routes[route_ids[0]]
+                parents=route['parent_versions']
+                step=next(s for s in self.e.steps if s['output_slot']==declaration['demand'])
+                required_parents={v:self.state.versions[v] for v in values
+                                  if self.state.program['variables'][v]['demand'] in step['inputs']}
+                if (route['stance']!='support' or not self.state.is_active_route(route)
+                        or digest(route['value'])!=digest(values[variable])
+                        or any(route[k]!=v for k,v in scope.items())
+                        or any(p==variable or p not in values or type(version) is not int
+                               or self.state.versions[p]!=version
+                               or self.state.program['variables'][p]['demand'] not in step['inputs']
+                               for p,version in parents.items())
+                        or any(parents.get(p)!=version for p,version in required_parents.items())
+                        or digest(mapped(route))!=digest(known.get(route['id']))):
+                    return None
+                validate_value(values[variable],declaration)
+                observation={k:deepcopy(route[k]) for k in OBSERVATION_SCHEMA['required']}
+                observation['source_ids']=[mapping[s] for s in route['source_ids']]
+                if not observation['source_ids']:
+                    return None
+                if declaration.get('evidence_semantics')=='personal_history_summary':
+                    contract=data.get('summary_revision_contracts',{}).get(variable)
+                    if (not contract or route['id'] not in contract['eligible_route_ids']
+                            or contract['previous_version']!=self.state.versions[variable]):
+                        return None
+                    sources=self.state.summary_revision_sources(variable,route_ids)
+                    observation['source_ids']=[mapping[s] for s in sorted(sources)]
+                    observation['summary_revision']={
+                        'supersedes_route_ids':list(route_ids),'previous_version':self.state.versions[variable],
+                        'reason':'Preserve the current supported summary and all inherited evidence; pending issues remain unresolved.'}
+                    self.state.validate_summary_revision({**deepcopy(observation),'variable':variable,
+                        'source_ids':sorted(sources)})
+                slot={'variable':variable,'observations':[observation],'unresolved':[]}
+                if offered:
+                    slot['resolved_obligation_ids']=[]
+                for item in offered:
+                    if item['variable']!=variable:
+                        continue
+                    if (set(item)!={'id','variable','entity_scope','time_scope','source_ids','descriptions','origins'}
+                            or not isinstance(item['id'],str) or not item['id']
+                            or item['id']==observation['id']
+                            or any(item[k]!=v for k,v in scope.items())
+                            or not isinstance(item['source_ids'],list)
+                            or len(set(item['source_ids']))!=len(item['source_ids'])
+                            or any(s not in visible for s in item['source_ids'])
+                            or not isinstance(item['descriptions'],list) or not item['descriptions']
+                            or any(not isinstance(d,str) or not d.strip() for d in item['descriptions'])
+                            or not isinstance(item['origins'],list)
+                            or any(not isinstance(origin,str) or not origin for origin in item['origins'])):
+                        return None
+                    slot['observations'].append({'id':item['id'],'stance':'unknown','value':None,
+                        'source_ids':list(item['source_ids']),**scope,'parent_versions':deepcopy(parents),
+                        'retract_ids':[],'reason':'\n'.join(item['descriptions'])})
+                    slot['unresolved'].extend(item['descriptions'])
+                result.append(slot)
+            return {'slots':result}
+        except (KeyError,TypeError,ValueError,AttributeError,StopIteration):
+            # Missing or stale state is not license to invent a small template.
             return None
-        skeleton={'slots':[{'variable':v,'observations':[],'unresolved':[]} for v in slots]}
+
+    def _fresh_structure_floor(self, operation, data, *, output_token_cap=None):
+        """Count a nonempty state-preserving template inside its chat wrapper.
+
+        This policy allowance is not a raw-completion lower bound, a successful
+        response, or a guarantee of new semantic work. The template never enters
+        a generation prompt or state. Regex estimates cannot authorize fallback.
+        """
+        skeleton=self._fresh_structure_response(data)
+        if skeleton is None:
+            return None
         payload=self.e.reasoner._payload(operation,'',{},output_token_cap=output_token_cap)
         payload['messages']=[{'role':'assistant','content':json.dumps(
             skeleton,ensure_ascii=False,separators=(',',':'),allow_nan=False)}]
@@ -886,7 +997,7 @@ class JointReader:
                         'data_identity':self._selection_data_identity(data)}
                     self.e.event({'event':'joint_fresh_output_cap_selected','operation':operation,
                         'node_id':step['output_slot'],'prefix_groups':size,**selection,
-                        'structure_floor_policy':'complete assistant-chat wrapper of minimal slots JSON; not a raw completion lower bound or semantic sufficiency guarantee'})
+                        'structure_floor_policy':'complete assistant-chat wrapper preserving current selected facts and separate unresolved obligations; only a measurement template, not a successful response or semantic sufficiency guarantee'})
                     return aliases,size
         return [],0
 

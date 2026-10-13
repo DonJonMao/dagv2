@@ -10,8 +10,13 @@ import pytest
 
 from dagbt.reasoning import InputOverflow
 from dagbt.transport import digest
-from test_personamem_joint_protocol import observation, response, expand_wire_data
-from test_v4_reconcile_review import personal_reader
+from test_personamem_joint_protocol import observation as base_observation, response, expand_wire_data
+from test_v4_summary_revision_review import OLD, summary_fixture
+
+
+def observation(*args, **kwargs):
+    kwargs.setdefault("value", OLD)
+    return base_observation(*args, **kwargs)
 
 
 @pytest.fixture(autouse=True)
@@ -59,8 +64,10 @@ class ExactAdmissionCounts:
 
 
 def adaptive_fixture(counter=None, **settings):
-    reader, engine, state, calls = personal_reader(
-        context_tokens=16384, reasoning_output_tokens=4096, max_repairs_per_request=1, **settings)
+    reader, engine, state, calls, _ = summary_fixture(
+        context_tokens=16384, reasoning_output_tokens=4096, **settings)
+    engine.s["max_repairs_per_request"] = 1
+    calls.respond = lambda index, data: response(observation())
     counter = counter or ExactAdmissionCounts()
     calls.count_reasoning_tokens = counter
     reader.current_identity = 'adaptive-history'
@@ -105,7 +112,7 @@ def test_fallback_uses_largest_window_and_actual_cap_reaches_preflight_request_a
     assert selected['whole_review_forecast_input_tokens'] == 9500
     assert selected['repair_output_reserve'] == 4096
     assert selected['forecast_total_tokens'] == 9500 + cap + 4096 + 264 == 16384
-    assert state.valid()[0]['history'] == ['piano'] and not state.pending
+    assert state.valid()[0]['history'] == OLD and not state.pending
     assert engine.s == settings and engine.ledger.limits == limits and engine.mapper.sources == originals
 
 
@@ -144,7 +151,7 @@ def test_impossible_or_unverified_structure_floor_keeps_every_source_pending_wit
     assert not calls.requests and not engine.reasoner.requests and engine.reasoner.sequence == 0
     assert engine.ledger.used['llm'] == engine.ledger.used['json_repairs'] == 0
     assert set(reader.unread_obligations) == {('adaptive-history', alias) for alias in originals}
-    assert state.pending == {'history'} and not state.valid()[0]
+    assert state.pending == {'history'} and state.valid()[0]['history'] == OLD
     assert not reader.failed_batch_reviews and engine.mapper.sources == originals
 
 
@@ -209,7 +216,7 @@ def test_repair_restores_full_4096_and_keeps_the_exact_initial_source_window():
     assert [request['payload']['max_tokens'] for request in calls.requests] == [2524, 4096]
     assert [record['output_token_reserve'] for record in engine.reasoner.requests] == [2524, 4096]
     assert engine.ledger.used['llm'] == 2 and engine.ledger.used['json_repairs'] == 1
-    assert not state.pending and state.valid()[0]['history'] == ['piano']
+    assert not state.pending and state.valid()[0]['history'] == OLD
 
 
 def test_length_with_valid_json_never_publishes_and_same_originals_do_not_buy_new_attempts(monkeypatch):
@@ -224,7 +231,7 @@ def test_length_with_valid_json_never_publishes_and_same_originals_do_not_buy_ne
     read_all(reader, engine)
     assert len(calls.requests) == 2
     assert [request['payload']['max_tokens'] for request in calls.requests] == [2524, 4096]
-    assert not state.valid()[0] and state.pending == {'history'}
+    assert state.valid()[0]['history'] == OLD and state.pending == {'history'}
     assert reader.failed_batch_reviews
     held = {source for review in reader.failed_batch_reviews.values() for source in review['source_ids']}
     assert held == {source['source_id'] for source in originals.values()}
@@ -245,7 +252,7 @@ def test_actual_repair_overflow_cannot_lower_repair_cap_or_remove_originals_to_f
     read_all(reader, engine)
     assert len(calls.requests) == 1 and calls.requests[0]['payload']['max_tokens'] == 2524
     assert engine.ledger.used['llm'] == 1 and engine.ledger.used['json_repairs'] == 0
-    assert state.pending == {'history'} and not state.valid()[0]
+    assert state.pending == {'history'} and state.valid()[0]['history'] == OLD
     held = {source for review in reader.failed_batch_reviews.values() for source in review['source_ids']}
     assert held == {source['source_id'] for source in originals.values()}
     denial = next(event for event in engine.events if event['event'] == 'joint_repair_input_unavailable')
@@ -267,7 +274,7 @@ def test_later_capacity_failure_retains_unread_suffix_and_already_accepted_histo
     with pytest.raises(InputOverflow):
         read_all(reader, engine)
     assert len(calls.requests) == 1 and calls.requests[0]['payload']['max_tokens'] == 1024
-    assert state.valid()[0]['history'] == ['piano'] and state.pending == {'history'}
+    assert state.valid()[0]['history'] == OLD and state.pending == {'history'}
     assert set(reader.unread_obligations) == {('adaptive-history', 's3')}
     assert engine.mapper.sources == originals
     assert not reader.failed_batch_reviews
