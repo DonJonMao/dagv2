@@ -618,11 +618,17 @@ class JointReader:
 
     @staticmethod
     def _schema(data):
+        terminal_repair='terminal_repair' in data
+        if terminal_repair and (data.get('phase') in ('history_evidence','response_audit')
+                                or 'audit_instruction' in data):
+            raise ProtocolError('Terminal-only repair cannot use a history or audit phase')
         schema=deepcopy(SCHEMA)
         if data.get('phase')=='history_evidence':
             schema['properties']={'slots':schema['properties']['slots']}
         if 'audit_instruction' in data:
             schema['required'].append('audit_verdict')
+        if terminal_repair:
+            schema['required']=['slots','semantic_answer','final_prediction']
         requested=list(data.get('requested_slots',data['variables']))
         item=schema['properties']['slots']['items']
         summary_contracts=data.get('summary_revision_contracts',{})
@@ -794,10 +800,21 @@ class JointReader:
         from .personal_wire import deduplicate_personal_instruction
         return deduplicate_personal_instruction(packed)
 
+    def _prepare_wire(self, data):
+        """Prepare the same input and decoding system for count and generation.
+
+        The old packing boundary remains available independently. Shared text
+        is a final reversible candidate, and only an actually applied encoding
+        authorizes its instruction; preexisting reserved fields do not.
+        """
+        from .history_wire import INSTRUCTION, pack_with_status
+        wire,applied=pack_with_status(self._wire_data(data))
+        return wire,self._system(wire)+(INSTRUCTION if applied else '')
+
     def _estimate(self, operation, data, *, output_token_cap=None):
-        wire=self._wire_data(data)
+        wire,system=self._prepare_wire(data)
         options={} if output_token_cap is None else {'output_token_cap':output_token_cap}
-        return self.e.reasoner.estimate(operation,self._system(wire),wire,self._schema(data),**options)
+        return self.e.reasoner.estimate(operation,system,wire,self._schema(data),**options)
 
     def _fits(self, operation, data):
         count = self._estimate(operation,data)
@@ -1818,10 +1835,9 @@ class JointReader:
             self.e.ledger.reserve('json_repairs',operation+'_repair')
             attempts_used+=1
             try:
-                wire=self._wire_data(repair)
+                wire,system=self._prepare_wire(repair)
                 schema=self._schema(repair)
-                schema['required']=['slots','semantic_answer','final_prediction']
-                response=self.e.reasoner.request(operation+'_repair',self._system(wire),wire,schema=schema)
+                response=self.e.reasoner.request(operation+'_repair',system,wire,schema=schema)
                 if (not isinstance(response,dict) or set(response)!={'slots','semantic_answer','final_prediction'}
                         or response['slots']!=[]):
                     raise ProtocolError('Terminal-only repair must preserve validated facts and return slots=[]')
@@ -1996,11 +2012,11 @@ class JointReader:
                 frozen_restatements=set()
                 visible={s['id']:s for s in current['source_spans']}
                 try:
-                    wire=self._wire_data(current)
+                    wire,system=self._prepare_wire(current)
                     cap_options=({'output_token_cap':initial_cap}
                         if attempt==0 and not durable_reviews and initial_cap is not None else {})
                     response=self.e.reasoner.request(operation if attempt==0 and not durable_reviews else operation+'_repair',
-                        self._system(wire),wire,schema=self._schema(current),reserve=0 if audit else None,**cap_options)
+                        system,wire,schema=self._schema(current),reserve=0 if audit else None,**cap_options)
                     if isinstance(response,dict) and isinstance(response.get('slots'),list):
                         # Repeating an identical draft is idempotent. Different
                         # drafts sharing an ID remain explicit repair obligations.
