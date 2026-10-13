@@ -73,3 +73,26 @@ def test_no_positive_capacity_cannot_be_forced_to_a_one_token_draft(monkeypatch)
         raise AssertionError('No capacity should be coerced into a minimal draft')
     monkeypatch.setattr(reader,'_fresh_structure_floor',forbidden_floor)
     assert reader._adaptive_fresh_cap('joint_read',data) is None
+
+
+def test_larger_admitted_history_window_avoids_an_extra_call_without_losing_read_sources(monkeypatch):
+    """Exercise the actual read loop; only token counts and replies are doubles."""
+    from test_v4_adaptive_initial_cap_review import (
+        ExactAdmissionCounts, adaptive_fixture, read_all,
+    )
+    observations=[]
+    for adaptive in (False, True):
+        reader,engine,state,calls,_=adaptive_fixture(
+            ExactAdmissionCounts({1:7000,2:7500,3:9500}))
+        originals=dict(engine.mapper.sources)
+        if not adaptive:
+            monkeypatch.setattr(reader,'_adaptive_fresh_cap',lambda operation,data:None)
+        read_all(reader,engine)
+        assert state.valid()[0]['history']==OLD and not state.pending
+        assert not reader.unread_obligations and not reader.failed_batch_reviews
+        assert engine.mapper.sources==originals
+        assert {alias for identity,alias in reader.read_states}==set(originals)
+        assert all(batch['complete'] for batch in reader.batches)
+        observations.append((len(calls.requests),engine.ledger.used['llm'],
+            [request['payload']['max_tokens'] for request in calls.requests]))
+    assert observations==[(2,2,[4096,4096]),(1,1,[2524])]

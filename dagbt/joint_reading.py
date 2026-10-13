@@ -956,7 +956,10 @@ class JointReader:
         Packing can make token size nonmonotone. Binary search only proposes a
         prefix; every accepted one is verified. If no tested prefix fits, check
         remaining prefixes before declaring capacity unavailable. Unconsumed
-        source groups remain pending in their original order.
+        source groups remain pending in their original order. Each candidate
+        first tries the full output allowance, then its eligible fresh-history
+        cap. A smaller full-output window does not preempt a checked larger
+        capped window; this search does not claim a global nonmonotone maximum.
         """
         self._fresh_initial_selection=None
         tested={}
@@ -964,11 +967,28 @@ class JointReader:
             if size not in tested:
                 aliases=list(dict.fromkeys(a for group in pending[:size] for a in group))
                 data=self._payload(step,query,variables,aliases,semantic,audit=audit)
-                tested[size]=(self._fresh_window_fits(operation,data,fresh_sources=bool(aliases)),aliases)
-            return tested[size][0]
+                full=self._fresh_window_fits(operation,data,fresh_sources=bool(aliases))
+                selection=None
+                if not full and aliases and operation=='joint_read' and not semantic and not audit:
+                    selection=self._adaptive_fresh_cap(operation,data)
+                tested[size]={'fits':full or selection is not None,'aliases':aliases,
+                    'selection':selection,'data_identity':self._selection_data_identity(data)}
+            return tested[size]['fits']
+        def choose(size):
+            candidate=tested[size]
+            selection=candidate['selection']
+            # Candidate trials are measurements only. Install and announce only
+            # the selection whose unchanged payload will actually be requested.
+            self._fresh_initial_selection=None
+            if selection is not None:
+                self._fresh_initial_selection={**selection,'data_identity':candidate['data_identity']}
+                self.e.event({'event':'joint_fresh_output_cap_selected','operation':operation,
+                    'node_id':step['output_slot'],'prefix_groups':size,**selection,
+                    'structure_floor_policy':'complete assistant-chat wrapper preserving current selected facts and separate unresolved obligations; only a measurement template, not a successful response or semantic sufficiency guarantee'})
+            return candidate['aliases'],size
         length=len(pending)
         if trial(length):
-            return tested[length][1],length
+            return choose(length)
         lo,hi,best=1,length-1,0
         while lo<=hi:
             middle=(lo+hi)//2
@@ -981,24 +1001,7 @@ class JointReader:
                 if trial(size):
                     best=size;break
         if best:
-            return tested[best][1],best
-        # Keep the full-output search above unchanged. Only after every prefix
-        # was rejected may a fresh history read reduce its actual first output.
-        # Prefer the largest eligible prefix, never a tiny output forced to 1.
-        if operation=='joint_read' and not semantic and not audit:
-            for size in range(length,0,-1):
-                aliases=tested[size][1]
-                if not aliases:
-                    continue
-                data=self._payload(step,query,variables,aliases,semantic,audit=audit)
-                selection=self._adaptive_fresh_cap(operation,data)
-                if selection is not None:
-                    self._fresh_initial_selection={**selection,
-                        'data_identity':self._selection_data_identity(data)}
-                    self.e.event({'event':'joint_fresh_output_cap_selected','operation':operation,
-                        'node_id':step['output_slot'],'prefix_groups':size,**selection,
-                        'structure_floor_policy':'complete assistant-chat wrapper preserving current selected facts and separate unresolved obligations; only a measurement template, not a successful response or semantic sufficiency guarantee'})
-                    return aliases,size
+            return choose(best)
         return [],0
 
     @staticmethod

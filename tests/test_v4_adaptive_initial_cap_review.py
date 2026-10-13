@@ -116,12 +116,14 @@ def test_fallback_uses_largest_window_and_actual_cap_reaches_preflight_request_a
     assert engine.s == settings and engine.ledger.limits == limits and engine.mapper.sources == originals
 
 
-def test_existing_full_output_prefix_wins_over_larger_adaptive_window():
+def test_larger_adaptive_window_wins_before_smaller_full_output_prefix():
     reader, engine, _, calls, counter = adaptive_fixture(ExactAdmissionCounts({1: 7900, 2: 9000, 3: 9500}))
     aliases, consumed = choose(reader, engine)
-    assert aliases == ['s1'] and consumed == 1
-    assert not calls.requests and not any(record['kind'] == 'floor' for record in counter.records)
-    assert not getattr(reader, '_fresh_initial_selection', None)
+    assert aliases == ['s1', 's2', 's3'] and consumed == 3
+    assert not calls.requests and any(record['kind'] == 'floor' for record in counter.records)
+    assert reader._fresh_initial_selection['output_token_cap'] == 2524
+    assert {len(record['data']['source_spans']) for record in counter.records
+            if record['kind'] == 'forecast'} == {3}
 
 
 def test_cap_equal_to_structure_floor_is_admitted_without_rounding_or_empirical_buffer():
