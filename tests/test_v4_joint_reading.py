@@ -547,22 +547,28 @@ def test_actual_handoff_capacity_requires_explicit_sufficient_citation_repair():
     assert reader.batches[-1]["complete"]
 
 
-def test_infeasible_citation_proof_stays_pending_without_slicing_or_overwriting_prior_fact():
+def test_larger_same_value_or_proof_is_archived_without_expanding_selected_handoff():
     reader,engine,state,calls,aliases,_=capacity_fixture()
     validated=reader._observation(observation("existing",[aliases[0]]),"history",
                                   {a:engine.mapper.sources[a] for a in aliases},engine.steps[0])
     state.integrate([validated]);prior=deepcopy(state.routes)
-    # Reading with the already-known parent needs a little more space. The
-    # actual candidate join remains oversized after that envelope is admitted.
+    # Both routes independently establish the same complete value. The larger
+    # alternative is retained in full, but does not become a mandatory premise
+    # of the next operation while the original sufficient route remains valid.
     reader._fits=lambda operation,data: (True if data["task"]["output_slot"]=="history"
                                          else JointReader._fits(reader,operation,data))
     engine.s["max_repairs_per_request"]=1
     calls.respond=lambda index,data: response(observation("proof",aliases))
     reader.read(engine.steps[0],"Read past creative activities",["history"],list(engine.docs),"read")
-    assert state.routes==prior and state.valid()[0]["history"]==["piano"]
-    assert state.pending=={"history"} and not reader.batches[-1]["complete"]
+    assert all(state.routes[rid]==route for rid,route in prior.items())
+    added=[route for rid,route in state.routes.items() if rid not in prior]
+    assert len(added)==1
+    assert set(added[0]["source_ids"])=={engine.mapper.sources[a]["source_id"] for a in aliases}
+    assert state.valid()[0]["history"]==["piano"]
+    assert state.valid()[2]["history"]==list(prior)
+    assert not state.pending and reader.batches[-1]["complete"]
     assert len(engine.mapper.sources)==len(aliases)
-    assert calls.requests[1]["data"]["repair_scope"]["failed"][0]["observation"]["source_ids"]==aliases
+    assert len(calls.requests)==1 and not reader.failed_batch_reviews
 
 
 def test_rejected_large_support_cannot_discard_a_valid_counter_in_same_batch():

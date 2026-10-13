@@ -474,10 +474,39 @@ class JointReader:
             source_segments=source['source_segments'], evidence_kind='joint_original_source')
         return span
 
-    def _payload(self, step, query, variables, aliases, semantic=False, *, audit=False):
+    def _proof_known(self, known, values, selected, protected):
+        """Omit only independently interchangeable positive OR alternatives.
+
+        This projects one request; it never edits the fact graph. Ambiguity,
+        stale bindings, revision ancestry, counters and open reviews retain
+        their original scope. A selected proof's own source set is indivisible.
+        """
+        result=[]
+        for route in known:
+            variable=route['variable']
+            ordinary_alternative=(variable in values and variable not in protected
+                and route['id'] not in selected.get(variable,[])
+                and self.state.is_active_route(route)
+                and not any(route.get(k) for k in ('revoked','summary_revision','superseded_by','binding_derivation'))
+                and all(route.get(k)==v for k,v in self.state.scope(variable).items())
+                and all(p in values and self.state.versions[p]==version
+                        for p,version in route['parent_versions'].items())
+                and digest(route['value'])==digest(values[variable]))
+            if not ordinary_alternative:
+                result.append(route)
+        return result
+
+    def _payload(self, step, query, variables, aliases, semantic=False, *, audit=False,
+                 proof_projection=False):
         variables=[v for v in self.state.program['variables'] if v in variables]
         values, sources, ids = self.state.valid()
-        related={v for v,d in self.state.program['variables'].items() if v in values and d['demand'] in step['inputs']}
+        # Historical extraction and intermediate history compose keep every
+        # offered candidate for whole-value/summary review. Only terminal use
+        # and audit may distinguish current proof inputs from archival proofs.
+        project=proof_projection and (audit or semantic or self.current_terminal_output)
+        related={v for v,d in self.state.program['variables'].items()
+                 if v in values and d['demand'] in step['inputs']
+                 and (not (project and audit) or v in variables)}
         frontier=list(related|({*variables}&set(values)))
         while frontier:
             variable=frontier.pop()
@@ -493,9 +522,31 @@ class JointReader:
         obligations=[item for item in self.evidence_obligations.values() if item['variable'] in set(variables)|related]
         failed_reviews=[item for item in self.failed_batch_reviews.values()
                         if item['variable'] in set(variables)|related]
+        if project:
+            protected=set(self.state.pending)|{item['variable'] for item in
+                [*self.evidence_obligations.values(),*self.failed_batch_reviews.values()]}
+            # Consult the task's outputs even when a bounded repair requests
+            # only a failed parent slot; its original review scope must survive.
+            own={v for v,d in self.state.program['variables'].items() if d['demand']==step['output_slot']}
+            if audit:
+                own&=set(variables)|related
+            if own & protected:
+                # A failed/unresolved output can require reinterpreting its
+                # parents' original text. Equal typed parent values alone do
+                # not prove those alternative sources irrelevant to that gap.
+                protected|=related
+            known=self._proof_known(known,values,ids,protected)
         controller=getattr(self.e,'residual_control',None)
         task_outputs={p:certificate for p in step['inputs']
                       if (certificate:=controller.task_projection(p)) is not None} if controller else {}
+        if project and audit:
+            # A projected task can itself depend on a different sibling field.
+            # Its certificate is not an extra premise of this audit frontier.
+            frontier=set(variables)|related
+            task_outputs={p:certificate for p,certificate in task_outputs.items()
+                if set(certificate['fact_versions'])<=frontier
+                and (not certificate.get('rule_assumptions')
+                     or certificate['rule_assumptions']['variable'] in frontier)}
         # Reproduce actual prior sources and counters within this local scope.
         required_ids=set()
         def collect(value):
@@ -1153,7 +1204,7 @@ class JointReader:
         return system
 
     def _observation(self, row, variable, visible, step, *, require_grounding=True,
-                     allow_summary_revision=False):
+                     allow_summary_revision=False, offered_route_ids=None):
         step=next(s for s in self.e.steps if s['output_slot']==self.state.program['variables'][variable]['demand'])
         fields = {'id','stance','value','source_ids','entity_scope','time_scope','parent_versions','retract_ids','reason'}
         if (not isinstance(row,dict) or not fields<=set(row) or set(row)-fields-{'summary_revision'}
@@ -1205,7 +1256,8 @@ class JointReader:
         if row['stance']!='contradiction' and row['retract_ids']:
             raise ProtocolError('Only sourced contradiction can retract facts')
         if row['stance']=='contradiction':
-            targets=[rid for rid,r in self.state.routes.items() if r['variable']==variable]
+            targets=[rid for rid,r in self.state.routes.items() if r['variable']==variable
+                     and (offered_route_ids is None or rid in offered_route_ids)]
             if not targets:
                 raise ProtocolError('Contradiction for '+variable+' has no existing fact route to retract; '
                                     'preserve its cited evidence and correct the stance without inventing a target')
@@ -1390,7 +1442,7 @@ class JointReader:
                     'counters':failure.get('required_counter_observations',[])}
         return required
 
-    def _failed_row_guard(self, row, record, visible, step):
+    def _failed_row_guard(self, row, record, visible, step, *, offered_route_ids=None):
         item=self._failed_required_rows(record).get(row['id'])
         if item:
             counters=item.get('counters',[])
@@ -1400,7 +1452,8 @@ class JointReader:
             if item.get('duplicate'):
                 try:
                     old=self._observation(item['draft'],row['variable'],visible,step,
-                                          allow_summary_revision=record['phase']=='history_evidence')
+                        allow_summary_revision=record['phase']=='history_evidence',
+                        offered_route_ids=offered_route_ids)
                 except (ValueError,KeyError,TypeError):
                     old=None
                 if old and any(row[k]!=old[k] for k in set(old)-{'id','reason'}):
@@ -1774,20 +1827,17 @@ class JointReader:
         terminal_variables=controller.demand_variables(proposed.final_node_id)
         audit_variables=None
         if ready:
-            audit_variables=set(certificate['binding_dependencies'])-set(proposed.program.get('task_expressions',{}))
-            if certificate.get('rule_assumptions'):
-                audit_variables.add(certificate['rule_assumptions']['variable'])
+            audit_target,audit_variables=controller.audit_scope(certificate)
         elif terminal_variables and all(v in values for v in terminal_variables):
-            audit_variables=controller.semantic_dependencies()-set(proposed.program.get('task_expressions',{}))
+            audit_target,audit_variables=controller.audit_scope()
         if audit_variables:
-            target={**next(s for s in self.e.steps if s['output_slot']==proposed.final_node_id),
-                    'inputs':[s['output_slot'] for s in self.e.steps if s['output_slot']!=proposed.final_node_id]}
-            checks.append(('audit_joint',target,self.e.q['question'],audit_variables,False,True))
+            checks.append(('audit_joint',audit_target,self.e.q['question'],audit_variables,False,True))
         failures={}
         for operation,target,query,variables,semantic,audit in checks:
             probe.current_identity=digest(['mandatory_handoff',target['output_slot'],proposed.revision,proposed.versions])
             probe.current_terminal_output=not audit and target['output_slot']==proposed.final_node_id and self.e.output_options is not None
-            data=probe._payload(target,query,variables,[],semantic,audit=audit)
+            data=probe._payload(target,query,variables,[],semantic,audit=audit,
+                proof_projection=audit or target.get('execution')=='compose')
             if probe._fits(operation,data):
                 continue
             implicated=[r for r in supports if r['variable'] in variables]
@@ -1866,7 +1916,7 @@ class JointReader:
         probe=copy(self)
         probe.current_identity=identity
         probe.current_terminal_output=terminal_output
-        data=probe._payload(step,query,variables,[],semantic,audit=audit)
+        data=probe._payload(step,query,variables,[],semantic,audit=audit,proof_projection=True)
         aliases=[source['id'] for source in data['source_spans']]
         requested=set(variables)
         for (owner,alias),pending in self.unread_obligations.items():
@@ -1956,7 +2006,7 @@ class JointReader:
             if source_scope=='mandatory_closure':
                 batch=list(pending[0])
                 self._fresh_initial_selection=None
-                trial=self._payload(step,query,variables,batch,semantic,audit=audit)
+                trial=self._payload(step,query,variables,batch,semantic,audit=audit,proof_projection=True)
                 consumed=1 if self._fits(operation,trial) else 0
             else:
                 batch,consumed=self._fitting_prefix(operation,step,query,variables,pending,semantic,audit)
@@ -1966,7 +2016,8 @@ class JointReader:
                 self.state.integrate([],external_pending|self.pending_variables())
                 raise InputOverflow('Local sources/parents/counters exceed real wire capacity')
             del pending[:consumed]
-            data=self._payload(step,query,variables,batch,semantic,audit=audit)
+            data=self._payload(step,query,variables,batch,semantic,audit=audit,
+                proof_projection=source_scope=='mandatory_closure')
             initial_cap=None
             selection=self._fresh_initial_selection
             if selection is not None:
@@ -2011,6 +2062,7 @@ class JointReader:
                 reviewed_frozen={}
                 frozen_restatements=set()
                 visible={s['id']:s for s in current['source_spans']}
+                offered_route_ids={route['id'] for route in current['known_observations']}
                 try:
                     wire,system=self._prepare_wire(current)
                     cap_options=({'output_token_cap':initial_cap}
@@ -2050,7 +2102,8 @@ class JointReader:
                                     if not isinstance(draft,dict) or draft.get('stance')!='contradiction':
                                         continue
                                     try:
-                                        counter=self._observation(draft,key[0],visible,step,require_grounding=not audit)
+                                        counter=self._observation(draft,key[0],visible,step,require_grounding=not audit,
+                                            offered_route_ids=offered_route_ids)
                                     except (ValueError,KeyError,TypeError):
                                         continue
                                     relations.setdefault(self._counter_identity(counter),deepcopy(draft))
@@ -2135,12 +2188,14 @@ class JointReader:
                                     'failed draft. Preserve and correct it in the next repair; do not delete it.');continue
                             try:
                                 normalized=self._observation(row,variable,visible,step,require_grounding=not audit,
-                                    allow_summary_revision=not audit and current.get('phase')=='history_evidence')
+                                    allow_summary_revision=not audit and current.get('phase')=='history_evidence',
+                                    offered_route_ids=offered_route_ids)
                                 for offered in data.get('failed_batch_reviews',[]):
                                     if (offered['review_allowed'] and offered['variable']==variable
                                             and offered['id'] in slot.get('resolved_failed_batch_ids',[])):
                                         self._failed_row_guard(normalized,
-                                            self.failed_batch_reviews[offered['id']],visible,step)
+                                            self.failed_batch_reviews[offered['id']],visible,step,
+                                            offered_route_ids=offered_route_ids)
                                 if (key in protected_counters
                                         and self._counter_identity(normalized) not in protected_counters[key]):
                                     raise ProtocolError('Envelope repair cannot reclassify or change a source-validated counter draft')
@@ -2158,7 +2213,8 @@ class JointReader:
                                     draft=duplicate_rows[original][replacements.index(key)]
                                     try:
                                         unchanged=self._observation(draft,variable,visible,step,require_grounding=not audit,
-                                            allow_summary_revision=not audit and current.get('phase')=='history_evidence')
+                                            allow_summary_revision=not audit and current.get('phase')=='history_evidence',
+                                            offered_route_ids=offered_route_ids)
                                     except (ValueError,KeyError,TypeError):
                                         # Invalid original fields remain editable;
                                         # a valid counter only needed a unique ID.
@@ -2274,7 +2330,8 @@ class JointReader:
                 # remain frozen locally; do not silently replace failed counters.
                 # Missing rows retain their last observed draft across repairs.
                 previous=response if response is not None else self.e.reasoner.last_response
-                current={**self._payload(step,query,failed_variables,batch,semantic,audit=audit),
+                current={**self._payload(step,query,failed_variables,batch,semantic,audit=audit,
+                    proof_projection=source_scope=='mandatory_closure'),
                     'repair_scope':{'failed':[{'variable':v,'id':rid,'feedback':error[:240],
                         'observation':deepcopy(observed_rows.get((v,rid))),
                         **({'summary_revision_sources':deepcopy(source_feedback[v,rid]['sources'])}

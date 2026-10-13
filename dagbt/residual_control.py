@@ -422,13 +422,27 @@ class ResidualControl:
         self.sync_nodes()
         return outcome,active
 
-    def audit(self,certificate=None):
+    def audit_scope(self,certificate=None):
+        """The actual proof frontier, shared by admission and paid audit.
+
+        Planned tasks and archived sibling bindings are not automatically
+        premises of a certified output. The reader also applies this frontier
+        at variable level when a task declares several independent variables.
+        """
         if certificate:
             variables=set(certificate['binding_dependencies'])-set(self.state.program.get('task_expressions',{}))
             if certificate.get('rule_assumptions'):
                 variables.add(certificate['rule_assumptions']['variable'])
         else:
             variables=self.semantic_dependencies()-set(self.state.program.get('task_expressions',{}))
+        demands={self.state.program['variables'][v]['demand'] for v in variables}
+        step={**next(s for s in self.e.steps if s['output_slot']==self.e.final_node_id),
+              'inputs':[s['output_slot'] for s in self.e.steps
+                        if s['output_slot'] in demands and s['output_slot']!=self.e.final_node_id]}
+        return step,variables
+
+    def audit(self,certificate=None):
+        step,variables=self.audit_scope(certificate)
         # Call counters/history and duplicate counter records do not constitute
         # new evidence. A changed answer, real route or counter does.
         routes=[]
@@ -449,11 +463,8 @@ class ResidualControl:
             self.audit_replayed=True
             return False
         self.audited.add(key)
-        step={**next(s for s in self.e.steps if s['output_slot']==self.e.final_node_id),
-              'inputs':[s['output_slot'] for s in self.e.steps if s['output_slot']!=self.e.final_node_id]}
-        # Reproduce the full reader closure, including every relevant route,
-        # revoked-route counter, obligation and the existing audit parents.
-        # A proof span does not select every other span in its source document.
+        # Reproduce selected sufficient proofs and their relevant review
+        # context. Archived alternatives and unrelated tasks remain in state.
         self.reader.read(step,self.e.q['question'],sorted(variables),[],key,audit=True,
             source_scope='mandatory_closure')
         relevant=[b for b in self.reader.batches if b['identity']==key and b['operation']=='audit_joint']
