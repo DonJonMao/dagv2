@@ -221,6 +221,11 @@ def validate_program(program):
             raise ProgramError('Unsupported variable type')
         if 'scope' in declaration:
             validate_scope(declaration['scope'])
+        if 'evidence_semantics' in declaration:
+            if (declaration['evidence_semantics'] != 'personal_history_summary'
+                    or declaration['type'] != 'text' or 'domain' in declaration
+                    or declaration.get('unit') is not None):
+                raise ProgramError('Personal history summary requires unrestricted text and its explicit evidence_semantics')
         if 'domain' in declaration:
             domain = declaration['domain']
             if not isinstance(domain, (dict, list)):
@@ -251,6 +256,8 @@ def validate_program(program):
     for variable,expression in definitions.items():
         if variable not in variables or check(expression)!=variables[variable]['type']:
             raise ProgramError('Deterministic task expression type differs from its binding')
+        if 'evidence_semantics' in variables[variable]:
+            raise ProgramError('Personal history summary cannot be a deterministic task expression')
     if not isinstance(program.get('constraints', []), list):
         raise ProgramError('Joint constraints must be an array of expressions')
     for constraint in program.get('constraints', []):

@@ -368,7 +368,8 @@ class ResidualControl:
                     variable=next(iter(bound))
                     alternatives=[]
                     for route in self.state.routes.values():
-                        if route['variable']!=variable or route['revoked'] or digest(route['value'])!=digest(bound[variable]):
+                        if (route['variable']!=variable or not self.state.is_active_route(route)
+                                or digest(route['value'])!=digest(bound[variable])):
                             continue
                         if any(route.get(k)!=v for k,v in self.state.scope(variable).items()):
                             continue

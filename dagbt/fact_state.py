@@ -1,5 +1,5 @@
 """Versioned typed observations; provenance routes are OR alternatives."""
-from copy import deepcopy
+from copy import copy, deepcopy
 from .residual import validate_value, validate_program, variable_scope, ProgramError
 from .residual_plan import validate_bindings
 from .transport import digest
@@ -31,7 +31,81 @@ class FactState:
         identity=digest(proof)
         if 'binding_derivation' in row:
             identity=digest([identity,row['binding_derivation']])
+        if 'summary_revision' in row:
+            revision=row['summary_revision']
+            identity=digest([identity,{'supersedes_route_ids':sorted(revision['supersedes_route_ids']),
+                                       'previous_version':revision['previous_version']}])
         return identity
+
+    def summary_ancestors(self, route):
+        """Representation ancestry is separate from factual counterevidence."""
+        ancestors=set()
+        def visit(current, path):
+            for rid in current.get('summary_revision',{}).get('supersedes_route_ids',[]):
+                if rid not in self.routes or rid in path:
+                    raise ProgramError('Summary revision ancestry is missing or cyclic')
+                ancestors.add(rid)
+                visit(self.routes[rid],path|{rid})
+        visit(route,{route['id']})
+        return ancestors
+
+    def is_active_route(self, route):
+        if route['revoked'] or route.get('superseded_by'):
+            return False
+        # A compatible revision inherits the old evidence. A later real counter
+        # to that inherited content cannot be laundered through a new summary.
+        return not any(self.routes[rid]['revoked'] for rid in self.summary_ancestors(route))
+
+    def summary_revision_sources(self, variable, targets, *, historical=False):
+        required={s for rid in targets for s in self.routes[rid]['source_ids']}
+        if not historical:
+            _,sources,_=self.valid()
+            for rid in targets:
+                required.update(s for p in self.routes[rid]['parent_versions'] for s in sources.get(p,[]))
+            # Counter records remain independent evidence, even on retired
+            # routes. A new compatible account must explicitly retain them.
+            required.update(s for route in self.routes.values() if route['variable']==variable
+                            for counter in route['revoked'] for s in counter['source_ids'])
+        return required
+
+    def validate_summary_revision(self, row, *, historical=False):
+        revision=row.get('summary_revision')
+        if 'summary_revision' not in row:
+            return
+        variable=row['variable']
+        declaration=self.program['variables'][variable]
+        if (row['stance']!='support' or row['retract_ids']
+                or declaration.get('evidence_semantics')!='personal_history_summary'
+                or declaration['type']!='text' or 'domain' in declaration
+                or declaration['demand']==self.final_node_id
+                or variable in self.program.get('task_expressions',{})):
+            raise ProgramError('Summary revision requires an explicitly declared personal historical text summary')
+        if (not isinstance(revision,dict)
+                or set(revision)!={'supersedes_route_ids','previous_version','reason'}
+                or type(revision['previous_version']) is not int or revision['previous_version']<0
+                or not isinstance(revision['reason'],str) or not revision['reason'].strip()):
+            raise ProgramError('Summary revision fields/version/reason malformed')
+        targets=revision['supersedes_route_ids']
+        if (not isinstance(targets,list) or not targets
+                or any(not isinstance(rid,str) for rid in targets) or len(set(targets))!=len(targets)):
+            raise ProgramError('Summary revision needs unique current route IDs')
+        if not historical and revision['previous_version']!=self.versions[variable]:
+            raise ProgramError('Summary revision previous_version is stale')
+        values=self.valid()[0] if not historical else {}
+        for rid in targets:
+            old=self.routes.get(rid)
+            if (old is None or old['variable']!=variable
+                    or any(old[k]!=row[k] for k in ('entity_scope','time_scope','parent_versions'))):
+                raise ProgramError('Summary revision target must retain the same variable, scope and actual parents')
+            if not historical and (not self.is_active_route(old) or any(
+                    p not in values or self.versions[p]!=version for p,version in old['parent_versions'].items())):
+                raise ProgramError('Summary revision cannot supersede revoked, retired or stale routes')
+        if not historical and all(digest(self.routes[rid]['value'])==digest(row['value'])
+                and set(self.routes[rid]['source_ids'])==set(row['source_ids']) for rid in targets):
+            raise ProgramError('Summary revision cannot create a new version from an identical whole value and proof')
+        required=self.summary_revision_sources(variable,targets,historical=historical)
+        if not required<=set(row['source_ids']):
+            raise ProgramError('Summary revision must retain every original premise and relevant counter source')
 
     def valid(self):
         # Resolve parent routes in DAG order, never accept unsupported guesses.
@@ -40,7 +114,7 @@ class FactState:
             for variable, declaration in self.program['variables'].items():
                 if declaration['demand'] != task['output_slot']:
                     continue
-                routes = [r for r in self.routes.values() if r['variable']==variable and not r['revoked']
+                routes = [r for r in self.routes.values() if r['variable']==variable and self.is_active_route(r)
                           and all(r.get(k)==v for k,v in self.scope(variable).items())
                           and ('binding_derivation' not in r or r['binding_derivation']['program_revision']==self.revision)
                           and all(p in values and self.versions[p]==ver for p,ver in r['parent_versions'].items())]
@@ -79,6 +153,7 @@ class FactState:
         rows=[{**r,'value':validate_value(r['value'],self.program['variables'][r['variable']])}
               if r['stance']=='support' else r for r in rows]
         existing={self.support_identity(route):rid for rid,route in self.routes.items()}
+        countered={rid for row in rows if row['stance']=='contradiction' for rid in row['retract_ids']}
         for row in rows:
             if row['stance'] in ('support','contradiction') and any(
                     row.get(key) != value for key,value in self.scope(row['variable']).items()):
@@ -89,6 +164,13 @@ class FactState:
                 # Reject impossible rule programs before adopting any routes
                 # or contradictions from this batch.
                 self._validated_rule_program(row['value'])
+            if 'summary_revision' in row:
+                self.validate_summary_revision(row)
+                targets=row['summary_revision']['supersedes_route_ids']
+                inherited=set(targets)|{rid for target in targets for rid in self.summary_ancestors(self.routes[target])}
+                if inherited & countered:
+                    raise ProgramError('Summary revision cannot conceal a counter to inherited evidence in the same batch')
+        revisions=[]
         for row in rows:
             if row['stance'] in ('unknown','partial','irrelevant'):
                 continue
@@ -106,6 +188,15 @@ class FactState:
                 self.routes[rid] = {**deepcopy(row),'source_ids':sorted(set(row['source_ids'])),
                     'id':rid,'revoked':[], 'semantic_status':'model_judgment'}
                 existing[identity]=rid
+            if 'summary_revision' in row:
+                revisions.append((rid,row['summary_revision']))
+        # All candidates were validated against the unchanged state. Retiring a
+        # representation and installing its replacement is one atomic batch.
+        for replacement,revision in revisions:
+            for previous in revision['supersedes_route_ids']:
+                retired=self.routes[previous].setdefault('superseded_by',[])
+                if replacement not in retired:
+                    retired.append(replacement)
         self.pending = set(pending)
         self._refresh_versions()
         self._check_rule_revision()
@@ -207,6 +298,27 @@ class FactState:
             binding = self.initial_program.get('rule_binding')
             if binding and route.get('variable') == binding['variable']:
                 self._validated_rule_program(route['value'])
+        probe=copy(self)
+        probe.program=deepcopy(program)
+        probe.routes={r['id']:deepcopy(r) for r in snapshot['routes']}
+        probe.versions=deepcopy(snapshot['versions'])
+        for route in probe.routes.values():
+            replacements=route.get('superseded_by',[])
+            if (not isinstance(replacements,list) or any(not isinstance(rid,str) for rid in replacements)
+                    or len(set(replacements))!=len(replacements)):
+                raise ProgramError('Resumed summary replacement references malformed')
+            for rid in replacements:
+                replacement=probe.routes.get(rid,{})
+                if route['id'] not in replacement.get('summary_revision',{}).get('supersedes_route_ids',[]):
+                    raise ProgramError('Resumed summary replacement has no matching revision provenance')
+            if 'summary_revision' in route:
+                probe.validate_summary_revision(route,historical=True)
+                if route['summary_revision']['previous_version']>probe.versions[route['variable']]:
+                    raise ProgramError('Resumed summary revision version is from the future')
+                probe.summary_ancestors(route)
+                for rid in route['summary_revision']['supersedes_route_ids']:
+                    if route['id'] not in probe.routes[rid].get('superseded_by',[]):
+                        raise ProgramError('Resumed summary revision did not retire its prior binding')
         self.program=deepcopy(program)
         self.routes={r['id']:deepcopy(r) for r in snapshot['routes']}
         self.versions=deepcopy(snapshot['versions'])

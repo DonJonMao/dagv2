@@ -117,8 +117,9 @@ class Engine:
             if self.personal_response_selection:
                 from .personal_task import PERSONAL_PLAN_GUIDANCE, validate_personal_plan
                 system += '\n' + PERSONAL_PLAN_GUIDANCE
+                schema = residual_plan.planner_contract(self.e.PLAN_SCHEMA, personal_history=True)
                 validate = lambda value: validate_personal_plan(
-                    residual_plan.validate_plan(value, self.repair.validate_plan), self.q['question'])
+                    residual_plan.validate_plan(value, self.repair.validate_plan, personal_history=True), self.q['question'])
         plan=self.reasoner.json('planner',prompts.plan_system(system,self.personal),self.q['question'],validate,schema)
         if len(plan['steps'])>self.s['max_initial_nodes']:raise ProtocolError('Initial node cap exceeded')
         self.steps=deepcopy(plan['steps'])
@@ -696,7 +697,8 @@ class Engine:
         from .residual_control import ResidualControl
         plan=validate_plan({'steps':snapshot['steps'],'final_node_id':snapshot['final_node_id'],
             'output_contract':snapshot['fact_state']['contract'],
-            'program':snapshot['fact_state']['initial_program']},self.repair.validate_plan)
+            'program':snapshot['fact_state']['initial_program']},self.repair.validate_plan,
+            personal_history=self.personal_response_selection)
         if self.personal_response_selection:
             from .personal_task import validate_personal_plan
             validate_personal_plan(plan, self.q['question'])

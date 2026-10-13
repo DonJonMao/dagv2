@@ -161,7 +161,8 @@ def test_personal_phase_contracts_keep_final_choice_and_audit_fields_only_at_the
     calls.respond=lambda index,data:terminal_response(data,engine.output_options[0])
     compose(reader)
     assert calls.requests[0]['data']['phase']=='response_selection'
-    assert calls.requests[0]['data']['personal_task_instruction']==PERSONAL_READING_GUIDANCE
+    assert 'personal_task_instruction' not in calls.requests[0]['data']
+    assert PERSONAL_READING_GUIDANCE in calls.requests[0]['payload']['messages'][0]['content']
     assert reader.semantic_prediction=='a' and reader.semantic_inputs['validation_complete']
     data=reader._payload(engine.steps[1],engine.q['question'],['history','suggestion'],[],audit=True)
     assert data['phase']=='response_audit' and data['personal_task_instruction']==PERSONAL_AUDIT_GUIDANCE
@@ -373,7 +374,8 @@ def test_personal_audit_sees_original_task_options_and_candidate_but_never_chang
         assert data["public_output_question"]==engine.reader_question
         assert data["public_options"]==engine.output_options
         assert data["terminal_candidate"]=={"value":engine.output_options[0],"final_prediction":"a"}
-        assert "ALL public" in data["personal_task_instruction"]
+        assert "personal_task_instruction" not in data
+        assert "ALL public" in calls.requests[-1]["payload"]["messages"][0]["content"]
         return {"slots":[{"variable":v,"observations":[],"unresolved":[]} for v in data["variables"]],
                 "audit_verdict":"conflict","final_prediction":"b"}
 

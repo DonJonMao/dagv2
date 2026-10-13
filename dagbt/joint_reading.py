@@ -148,6 +148,25 @@ Entries with review_allowed=false remain pending; changing query identity alone
 does not authorize retrying a failed batch or clearing its marker.
 '''
 
+SUMMARY_REVISION_INSTRUCTION = '''
+An explicitly declared personal_history_summary is a revisable representation of
+sourced history. Compatible additional facts do not contradict the older facts.
+Only summary_revision_contracts authorizes this request to revise such a summary:
+return a support observation with summary_revision={supersedes_route_ids,
+previous_version,reason}, using exact offered route IDs and the current version.
+Re-read ALL old and new original premises and relevant counterevidence; retain
+them in the new support's source_ids and preserve their factual content, negative
+experiences, conditions and temporal qualifications in the revised whole summary.
+retract_ids stays empty. This explicitly retires the older representation, not its
+facts. Never use revision to hide a genuine contradiction, unavailable evidence,
+or a different scope/parent version. Ordinary facts, terminal choices and audits
+cannot use summary_revision. If a complete compatible account is not supported,
+return sourced partial/unresolved instead. Multiple new supports must agree on
+one whole value. Existing superseded_by links identify retired representations;
+their original evidence remains available. revoked holds actual counterevidence,
+which is never erased by a summary revision or ignored through its ancestry.
+'''
+
 COLUMNAR_INSTRUCTION = '''
 When source_span_columns is present, source_spans contains row arrays. Match each
 row position to source_span_columns to reconstruct every span object before
@@ -429,6 +448,22 @@ class JointReader:
         if failed_reviews:
             data['failed_batch_reviews']=self._failed_payload(
                 failed_reviews,source_aliases,step,self._failed_phase(data))
+        if personal and data.get('phase')=='history_evidence' and not audit:
+            contracts={}
+            for variable in variables:
+                declaration=self.state.program['variables'][variable]
+                if declaration.get('evidence_semantics')!='personal_history_summary':
+                    continue
+                targets=[r['id'] for r in known if r['variable']==variable and self.state.is_active_route(r)
+                    and all(r.get(k)==v for k,v in self.state.scope(variable).items())
+                    and all(p in values and self.state.versions[p]==version
+                            for p,version in r['parent_versions'].items())]
+                if targets:
+                    required=self.state.summary_revision_sources(variable,targets)
+                    contracts[variable]={'previous_version':self.state.versions[variable],
+                        'eligible_route_ids':targets,'required_source_ids':[source_aliases[s] for s in sorted(required)]}
+            if contracts:
+                data['summary_revision_contracts']=contracts
         return data
 
     @staticmethod
@@ -458,6 +493,14 @@ class JointReader:
             schema['properties']={'slots':schema['properties']['slots']}
         requested=list(data.get('requested_slots',data['variables']))
         item=schema['properties']['slots']['items']
+        summary_contracts=data.get('summary_revision_contracts',{})
+        if summary_contracts:
+            item['properties']['observations']['items']['properties']['summary_revision']={
+                'type':'object','properties':{
+                    'supersedes_route_ids':{'type':'array','items':{'type':'string'},'minItems':1,'uniqueItems':True},
+                    'previous_version':{'type':'integer','minimum':0},
+                    'reason':{'type':'string','minLength':1}},
+                'required':['supersedes_route_ids','previous_version','reason'],'additionalProperties':False}
         if data.get('evidence_obligations'):
             item['properties']['resolved_obligation_ids']={'type':'array','items':{'type':'string'},'uniqueItems':True}
         if data.get('failed_batch_reviews'):
@@ -493,6 +536,15 @@ class JointReader:
                     observation['allOf']=[{
                         'if':{'properties':{'stance':{'enum':['support','contradiction']}}},
                         'then':{'properties':{key:{'const':value} for key,value in scope.items()}}}]
+                if summary_contracts:
+                    contract=summary_contracts.get(variable)
+                    revision_rule=({'if':{'required':['summary_revision']},'then':{'properties':{
+                        'stance':{'const':'support'},'retract_ids':{'maxItems':0},
+                        'summary_revision':{'properties':{
+                            'supersedes_route_ids':{'items':{'enum':contract['eligible_route_ids']}},
+                            'previous_version':{'const':contract['previous_version']}}}}}}
+                        if contract else {'not':{'required':['summary_revision']}})
+                    observation.setdefault('allOf',[]).append(revision_rule)
                 properties={'variable':{'const':variable},'observations':{'items':observation}}
                 if data.get('evidence_obligations'):
                     obligation_ids=[item['id'] for item in data['evidence_obligations'] if item['variable']==variable]
@@ -572,7 +624,8 @@ class JointReader:
                           and digest(value) not in shared for value in cells.values())
             if not ambiguous and size(table)+len(OBSERVATION_TABLE_INSTRUCTION.encode('utf-8'))<size(packed):
                 packed=table
-        return packed
+        from .personal_wire import deduplicate_personal_instruction
+        return deduplicate_personal_instruction(packed)
 
     def _estimate(self, operation, data):
         wire=self._wire_data(data)
@@ -692,6 +745,8 @@ class JointReader:
             else:
                 system+='\n'+(PERSONAL_AUDIT_GUIDANCE if 'audit_instruction' in data else PERSONAL_READING_GUIDANCE)
                 system+='\nFor the personalized response-selection terminal ONLY, support means a source-grounded assessment that this candidate response best fits the user. A proposed suggestion need not itself be a past event quoted in memory. Historical variables still require original evidence for every factual assertion; options never supply historical evidence.\n'
+            if any(d.get('evidence_semantics')=='personal_history_summary' for d in data['variables'].values()):
+                system+=SUMMARY_REVISION_INSTRUCTION
         if 'known_observation_columns' in data:
             system+=OBSERVATION_TABLE_INSTRUCTION
         if data.get('terminal_repair'):
@@ -701,11 +756,16 @@ class JointReader:
             return system + TERMINAL_CHOICE_INSTRUCTION
         return system
 
-    def _observation(self, row, variable, visible, step, *, require_grounding=True):
+    def _observation(self, row, variable, visible, step, *, require_grounding=True,
+                     allow_summary_revision=False):
         step=next(s for s in self.e.steps if s['output_slot']==self.state.program['variables'][variable]['demand'])
         fields = {'id','stance','value','source_ids','entity_scope','time_scope','parent_versions','retract_ids','reason'}
-        if not isinstance(row,dict) or set(row)!=fields or not isinstance(row['id'],str) or not row['id']:
+        if (not isinstance(row,dict) or not fields<=set(row) or set(row)-fields-{'summary_revision'}
+                or not isinstance(row['id'],str) or not row['id']):
             raise ProtocolError('Observation fields or identity malformed')
+        if 'summary_revision' in row and (not allow_summary_revision
+                or not getattr(self.e,'personal_response_selection',False)):
+            raise ProtocolError('Summary revision is authorized only during personal history reading, never terminal or audit')
         if row['stance'] not in ('support','contradiction','partial','unknown','irrelevant'):
             raise ProtocolError('Invalid observation stance')
         for field in ('source_ids','retract_ids'):
@@ -770,7 +830,13 @@ class JointReader:
         spans = [self._source(a) for a in row['source_ids']]
         for span in spans:
             self.e.spans[span['id']] = span
-        return {**deepcopy(row),'variable':variable,'source_ids':[s['id'] for s in spans]}
+        normalized={**deepcopy(row),'variable':variable,'source_ids':[s['id'] for s in spans]}
+        if 'summary_revision' in row:
+            self.state.validate_summary_revision(normalized)
+            required=self.state.summary_revision_sources(variable,row['summary_revision']['supersedes_route_ids'])
+            if not required<={self.e.mapper.sources[alias]['source_id'] for alias in visible}:
+                raise ProtocolError('Summary revision requires every inherited premise and counter in the visible original text')
+        return normalized
 
     @staticmethod
     def _counter_identity(row):
@@ -818,7 +884,7 @@ class JointReader:
         conflicts={}
         for variable in variables:
             routes=[row for row in proposed.routes.values()
-                if row['variable']==variable and not row['revoked']
+                if row['variable']==variable and proposed.is_active_route(row)
                 and all(row.get(k)==v for k,v in proposed.scope(variable).items())
                 and ('binding_derivation' not in row
                      or row['binding_derivation']['program_revision']==proposed.revision)
@@ -827,6 +893,20 @@ class JointReader:
             if len({digest(row['value']) for row in routes})>1:
                 conflicts[variable]=routes
         return conflicts
+
+    def _summary_revision_failures(self, rows):
+        countered={rid for row in rows if row['stance']=='contradiction' for rid in row['retract_ids']}
+        failures={}
+        for row in rows:
+            if 'summary_revision' not in row:
+                continue
+            targets=row['summary_revision']['supersedes_route_ids']
+            inherited=set(targets)|{rid for target in targets
+                                   for rid in self.state.summary_ancestors(self.state.routes[target])}
+            if inherited & countered:
+                failures[row['variable'],row['id']]=('summary_revision_conflict: an inherited fact has a real '
+                    'counter in this batch; compatible summary revision cannot discard or conceal it')
+        return failures
 
     def _whole_value_review_failures(self, rows, reviews, data, groups, observed):
         """Keep ambiguous support drafts editable within the existing repair loop."""
@@ -861,6 +941,10 @@ class JointReader:
             group['required_source_ids']=sorted({s for row in [*drafts.values(),*known.values()]
                                                   for s in row['source_ids']})
             failures[variable,'*']='whole_value_disagreement: review all scoped drafts and known routes; compatible fragments need a sourced complete value, genuine conflict stays unresolved'
+            if variable in data.get('summary_revision_contracts',{}):
+                failures[variable,'*']=('whole_value_disagreement: compatible history-summary expansion needs explicit '
+                    'summary_revision with offered prior route IDs and previous_version; preserve old facts and sources, '
+                    'do not invent a contradiction')
         for variable,group in groups.items():
             slot=reviews.get(variable)
             if slot is None or slot['unresolved']:
@@ -901,7 +985,8 @@ class JointReader:
                 raise ProtocolError('Failed-batch review cannot change a protected original counter relation')
             if item.get('duplicate'):
                 try:
-                    old=self._observation(item['draft'],row['variable'],visible,step)
+                    old=self._observation(item['draft'],row['variable'],visible,step,
+                                          allow_summary_revision=record['phase']=='history_evidence')
                 except (ValueError,KeyError,TypeError):
                     old=None
                 if old and any(row[k]!=old[k] for k in set(old)-{'id','reason'}):
@@ -919,7 +1004,13 @@ class JointReader:
             for rid in slot.get('resolved_failed_batch_ids',[]):
                 record=self.failed_batch_reviews.get(rid)
                 if rid not in offered or record is None or record['variable']!=variable:
-                    failures[variable,'*']='Failed-batch resolution requires an offered, paid same-task history review ID'
+                    failures.setdefault((variable,'*'),'Failed-batch resolution requires an offered, paid same-task history review ID')
+                    continue
+                if any(key[0]==variable for key in failures):
+                    # Rows rejected for a specific semantic/structural reason
+                    # are not a model omission. Preserve that first cause and
+                    # keep the failed obligation; never replace it with a
+                    # misleading generic missing-draft message.
                     continue
                 checked={row['id']:row for row in rows if row['variable']==variable}
                 required=self._failed_required_rows(record)
@@ -1035,6 +1126,11 @@ class JointReader:
                             and oid not in slot.get('resolved_obligation_ids',[])):
                         del self.evidence_obligations[oid]
             for oid in slot.get('resolved_obligation_ids',[]):
+                if any(key[0]==variable for key in failures):
+                    # A rejected revision/draft cannot discharge the issue;
+                    # keep its specific cause instead of relabeling it as a
+                    # missing obligation ID or missing original text.
+                    continue
                 obligation=self.evidence_obligations.get(oid)
                 covered={sid for r in settled for sid in r['source_ids']}
                 required=set(obligation['source_ids']) if obligation else set()
@@ -1070,7 +1166,7 @@ class JointReader:
         obligation, and valid counters still enter the state. Existing published
         routes are never rewritten to make room for a new route.
         """
-        existing={self.state.support_identity(route) for route in self.state.routes.values() if not route['revoked']}
+        existing={self.state.support_identity(route) for route in self.state.routes.values() if self.state.is_active_route(route)}
         supports=[r for r in rows if r['stance']=='support' and (r['variable'],r['id']) in rejectable
                   and self.state.support_identity(r) not in existing]
         if not supports:
@@ -1418,7 +1514,8 @@ class JointReader:
                             if attempt and (variable,'*') not in failures and key not in failures and key not in replacement_keys:
                                 next_failures[key]='Repair invented an unrequested observation';continue
                             try:
-                                normalized=self._observation(row,variable,visible,step,require_grounding=not audit)
+                                normalized=self._observation(row,variable,visible,step,require_grounding=not audit,
+                                    allow_summary_revision=not audit and current.get('phase')=='history_evidence')
                                 for offered in data.get('failed_batch_reviews',[]):
                                     if (offered['review_allowed'] and offered['variable']==variable
                                             and offered['id'] in slot.get('resolved_failed_batch_ids',[])):
@@ -1440,7 +1537,8 @@ class JointReader:
                                         continue
                                     draft=duplicate_rows[original][replacements.index(key)]
                                     try:
-                                        unchanged=self._observation(draft,variable,visible,step,require_grounding=not audit)
+                                        unchanged=self._observation(draft,variable,visible,step,require_grounding=not audit,
+                                            allow_summary_revision=not audit and current.get('phase')=='history_evidence')
                                     except (ValueError,KeyError,TypeError):
                                         # Invalid original fields remain editable;
                                         # a valid counter only needed a unique ID.
@@ -1493,6 +1591,12 @@ class JointReader:
                         next_failures.setdefault(key,'A source-validated counter draft remains required; '
                             'envelope repair cannot change its stance, sources, scope, parents or retraction targets')
                         completed.discard(key[0])
+                revision_failures=self._summary_revision_failures(valid)
+                if revision_failures:
+                    valid=[row for row in valid if (row['variable'],row['id']) not in revision_failures]
+                    for key,error in revision_failures.items():
+                        frozen.discard(key);resolved.discard(key);completed.discard(key[0])
+                        next_failures[key]=error
                 ambiguous=self._whole_value_review_failures(
                     valid,reviews,data,whole_value_reviews,observed_rows)
                 if ambiguous:

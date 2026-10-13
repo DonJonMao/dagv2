@@ -47,6 +47,12 @@ of every past event, preference or experience. For open-ended background, ask fo
 a concise sourced text summary of relevant examples and changes. Use a set variable
 only when its task explicitly defines a bounded whole set that can be established
 from the available history; a single witnessed member does not establish that whole.
+For such an open-ended historical summary, explicitly declare
+evidence_semantics="personal_history_summary" on its unrestricted text variable,
+with its historical scope. This declares a revisable representation of sourced
+history, not a unique scalar fact or an exhaustive inventory. Do not attach this
+marker to a name, date, number, rule, bounded domain, deterministic task expression
+or the final response. Ordinary text variables do not acquire revision permission.
 For an utterance such as "I tried X", do not make listing everything the user has
 ever tried a prerequisite. Retrieve the prior attitudes or experiences needed to
 understand X in context. A separate history-summary node is optional, not mandatory.
@@ -84,6 +90,15 @@ the difference between past enjoyment, later frustration and their conditions in
 the value and citations; do not summarize them as an unconditional current interest.
 Re-read any supplied evidence obligations and their original sources explicitly;
 do not drop a source or contradiction merely because a prior value is available.
+Only a variable explicitly declaring evidence_semantics="personal_history_summary"
+permits a source-grounded summary_revision. For compatible added history, preserve
+the old and new facts, negative experiences and time conditions in the new summary;
+explicitly name the current old summary routes and version as offered by the
+protocol. Re-read and cite their original sources together with the new evidence.
+This retires an old summary representation without asserting that its historical
+facts were false. A genuine factual refutation remains a contradiction with its
+own sources and targets. Never use summary revision to hide or discard a counter,
+change scope, choose an arbitrary latest value, or revise the terminal response.
 '''
 
 PERSONAL_READING_GUIDANCE = '''

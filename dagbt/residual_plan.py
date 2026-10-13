@@ -78,7 +78,7 @@ invent sourced facts or create paid tasks. Unsupported compose remains semantic 
 '''
 
 
-def planner_contract(legacy_schema):
+def planner_contract(legacy_schema, *, personal_history=False):
     schema = local_terminal.planner_contract(legacy_schema)
     unit = {'enum': [None, *sorted(UNITS)]}
     interval_schema = {'type':'object', 'properties': {
@@ -96,6 +96,10 @@ def planner_contract(legacy_schema):
             'time_scope': {'type':'string','minLength':1}},
             'required':['entity_scope','time_scope'], 'additionalProperties':False}},
         'required':['type','demand'], 'additionalProperties':False}
+    if personal_history:
+        declaration['properties']['evidence_semantics'] = {
+            'enum':['personal_history_summary'],
+            'description':'Only an unrestricted text summary of personal history before the terminal; never a scalar fact, rule, deterministic binding or final response.'}
     program = {'type':'object', 'properties': {
         'variables': {'type':'object','additionalProperties':declaration},
         'expression': {'type':'object'},
@@ -119,13 +123,15 @@ def planner_contract(legacy_schema):
     return schema
 
 
-def validate_plan(value, legacy_validate):
+def validate_plan(value, legacy_validate, *, personal_history=False):
     if not isinstance(value, dict) or set(value) != {'steps','final_node_id','output_contract','program'}:
         raise ProtocolError('Typed plan requires full DAG, terminal, output_contract and program')
     plan = local_terminal.validate_plan({k:value[k] for k in ('steps','final_node_id')}, legacy_validate)
     try:
         contract = validate_output_contract(value['output_contract'])
         program = validate_program(value['program'])
+        if not personal_history and any('evidence_semantics' in d for d in program['variables'].values()):
+            raise ProgramError('Personal history summary declarations require the explicit PersonaMem task')
         validate_bindings(program, plan['steps'], plan['final_node_id'], contract=contract)
     except ProgramError as exc:
         raise ProtocolError(str(exc)) from exc
@@ -137,12 +143,15 @@ def validate_bindings(program, steps, final_node_id, *, contract=None,
     program = validate_program(program)
     tasks = {s['output_slot']:s for s in steps}
     for declaration in program['variables'].values():
-        if set(declaration) - {'type','demand','domain','open','unit','scope'}:
+        if set(declaration) - {'type','demand','domain','open','unit','scope','evidence_semantics'}:
             raise ProgramError('Unknown variable declaration metadata')
         if 'scope' in declaration:
             validate_scope(declaration['scope'])
         if not isinstance(declaration.get('demand'), str) or declaration['demand'] not in tasks:
             raise ProgramError('Variable demand must belong to the preplanned DAG')
+        if ('evidence_semantics' in declaration and
+                (declaration['demand'] == final_node_id or 'scope' not in declaration)):
+            raise ProgramError('Personal history summary requires an explicit nonterminal evidence scope')
         if (contract is not None and declaration['demand'] == final_node_id
                 and variable_scope(declaration, contract) != {
                     key: contract[key] for key in ('entity_scope','time_scope')}):
