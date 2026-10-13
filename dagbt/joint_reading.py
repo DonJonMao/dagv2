@@ -255,6 +255,7 @@ class JointReader:
         self.failed_obligations = {}
         self.failed_batch_reviews = {}
         self.evidence_obligations = {}
+        self._fresh_initial_selection = None
 
     def material_signature(self):
         """Progress excludes call counters, duplicate proofs and log identities.
@@ -705,9 +706,10 @@ class JointReader:
         from .personal_wire import deduplicate_personal_instruction
         return deduplicate_personal_instruction(packed)
 
-    def _estimate(self, operation, data):
+    def _estimate(self, operation, data, *, output_token_cap=None):
         wire=self._wire_data(data)
-        return self.e.reasoner.estimate(operation,self._system(wire),wire,self._schema(data))
+        options={} if output_token_cap is None else {'output_token_cap':output_token_cap}
+        return self.e.reasoner.estimate(operation,self._system(wire),wire,self._schema(data),**options)
 
     def _fits(self, operation, data):
         count = self._estimate(operation,data)
@@ -737,18 +739,27 @@ class JointReader:
         """
         if not self._fits(operation,data):
             return False
-        if (not fresh_sources or not data.get('personal_response_selection')
+        if not self._fresh_forecast_required(data,fresh_sources=fresh_sources):
+            return True
+        repair_input=self._estimate(operation+'_repair',self._whole_review_forecast(data))
+        output=self.e.s['reasoning_output_tokens']
+        return repair_input+output+output+self.e.s['input_margin']+8<=self.e.s['context_tokens']
+
+    def _fresh_forecast_required(self, data, *, fresh_sources=True):
+        return not (not fresh_sources or not data.get('personal_response_selection')
                 or data.get('phase')!='history_evidence' or data.get('repair_scope')
                 or data.get('task',{}).get('execution')!='retrieval'
                 or data.get('failed_batch_reviews')
                 or self.e.s['max_repairs_per_request']<=0
                 or not self.e.ledger.remaining('json_repairs')
-                or self.e.ledger.remaining('llm')<self.e.s['reserved_audit_calls']+2):
-            return True
+                or self.e.ledger.remaining('llm')<self.e.s['reserved_audit_calls']+2)
+
+    @staticmethod
+    def _whole_review_forecast(data):
         variables=data['variables']
         feedback=('whole_value_disagreement: review all scoped drafts and known routes; '
                   'compatible fragments need a sourced complete value, genuine conflict stays unresolved')
-        repair={**data,'repair_scope':{
+        return {**data,'repair_scope':{
             'failed':[{'variable':v,'id':'*','feedback':feedback,'observation':None,
                        'slot':{'variable':v,'observations':[],'unresolved':[]}}
                       for v in variables],
@@ -759,9 +770,62 @@ class JointReader:
                 'required_source_ids':[source['id'] for source in data['source_spans']]}
                 for v in variables],
             'attempt':1,'previous_response_identity':'0'*64}}
-        repair_input=self._estimate(operation+'_repair',repair)
+
+    def _fresh_structure_floor(self, operation, data, *, output_token_cap=None):
+        """Policy allowance for a minimal complete slots envelope, not an answer.
+
+        Count the entire assistant chat wrapper through the production counter.
+        Its overhead is deliberately retained: this is a structural allowance
+        policy, not an exact raw-completion lower bound or a promise that useful
+        semantic content will fit. Never send or integrate this empty skeleton.
+        A regex estimate cannot authorize the adaptive fallback.
+        """
+        slots=list(data.get('requested_slots',data['variables']))
+        if not slots:
+            return None
+        skeleton={'slots':[{'variable':v,'observations':[],'unresolved':[]} for v in slots]}
+        payload=self.e.reasoner._payload(operation,'',{},output_token_cap=output_token_cap)
+        payload['messages']=[{'role':'assistant','content':json.dumps(
+            skeleton,ensure_ascii=False,separators=(',',':'),allow_nan=False)}]
+        accounting=self.e.reasoner._count_payload(operation+'_structure',payload)
+        count=accounting.get('count')
+        if accounting.get('token_count_is_estimate') is not False or type(count) is not int or count<=0:
+            return None
+        return count
+
+    def _adaptive_fresh_cap(self, operation, data):
+        """Trade only the first draft's actual output cap for repair workspace."""
+        if operation!='joint_read' or not self._fresh_forecast_required(data) or not self._fits(operation,data):
+            return None
         output=self.e.s['reasoning_output_tokens']
-        return repair_input+output+output+self.e.s['input_margin']+8<=self.e.s['context_tokens']
+        context=self.e.s['context_tokens']
+        margin=self.e.s['input_margin']+8
+        repair_input=self._estimate(operation+'_repair',self._whole_review_forecast(data))
+        base_input=self._estimate(operation,data)
+        cap=min(output,context-base_input-margin,context-repair_input-output-margin)
+        # Counting an entire adapted wire can depend on max_tokens' digits.
+        # Recount with the actual cap and only shrink until it is self-consistent.
+        while cap>0:
+            base_input=self._estimate(operation,data,output_token_cap=cap)
+            revised=min(cap,context-base_input-margin,context-repair_input-output-margin)
+            if revised<cap:
+                cap=revised
+                continue
+            floor=self._fresh_structure_floor(operation,data,output_token_cap=cap)
+            if floor is None or cap<floor:
+                return None
+            return {'output_token_cap':cap,'structure_floor_tokens':floor,
+                'base_input_tokens':base_input,'whole_review_forecast_input_tokens':repair_input,
+                'initial_total_tokens':base_input+cap+margin,
+                'forecast_total_tokens':repair_input+output+cap+margin,
+                'repair_output_reserve':output,'input_margin':self.e.s['input_margin'],
+                'safety_margin':8,'context_tokens':context}
+        return None
+
+    @staticmethod
+    def _selection_data_identity(data):
+        # Dict order affects the serialized user message and must be preserved.
+        return digest(json.dumps(data,ensure_ascii=False,separators=(',',':'),allow_nan=False))
 
     def _repair_fits(self, operation, data, step, identity, attempt):
         count=self._estimate(operation,data)
@@ -783,6 +847,7 @@ class JointReader:
         remaining prefixes before declaring capacity unavailable. Unconsumed
         source groups remain pending in their original order.
         """
+        self._fresh_initial_selection=None
         tested={}
         def trial(size):
             if size not in tested:
@@ -804,7 +869,26 @@ class JointReader:
             for size in range(1,length):
                 if trial(size):
                     best=size;break
-        return (tested[best][1],best) if best else ([],0)
+        if best:
+            return tested[best][1],best
+        # Keep the full-output search above unchanged. Only after every prefix
+        # was rejected may a fresh history read reduce its actual first output.
+        # Prefer the largest eligible prefix, never a tiny output forced to 1.
+        if operation=='joint_read' and not semantic and not audit:
+            for size in range(length,0,-1):
+                aliases=tested[size][1]
+                if not aliases:
+                    continue
+                data=self._payload(step,query,variables,aliases,semantic,audit=audit)
+                selection=self._adaptive_fresh_cap(operation,data)
+                if selection is not None:
+                    self._fresh_initial_selection={**selection,
+                        'data_identity':self._selection_data_identity(data)}
+                    self.e.event({'event':'joint_fresh_output_cap_selected','operation':operation,
+                        'node_id':step['output_slot'],'prefix_groups':size,**selection,
+                        'structure_floor_policy':'complete assistant-chat wrapper of minimal slots JSON; not a raw completion lower bound or semantic sufficiency guarantee'})
+                    return aliases,size
+        return [],0
 
     @staticmethod
     def _system(data):
@@ -1474,6 +1558,13 @@ class JointReader:
                 raise InputOverflow('Local sources/parents/counters exceed real wire capacity')
             del pending[:consumed]
             data=self._payload(step,query,variables,batch,semantic,audit=audit)
+            initial_cap=None
+            selection=self._fresh_initial_selection
+            if selection is not None:
+                if (selection['data_identity']!=self._selection_data_identity(data)
+                        or operation!='joint_read' or not self._fresh_forecast_required(data)):
+                    raise InputOverflow('Selected fresh-history output cap does not match the actual request')
+                initial_cap=selection['output_token_cap']
             durable_reviews=[record for record in data.get('failed_batch_reviews',[]) if record['review_allowed']]
             if durable_reviews:
                 # This is a repair of old drafts, not a free fresh read. It uses
@@ -1509,8 +1600,10 @@ class JointReader:
                 visible={s['id']:s for s in current['source_spans']}
                 try:
                     wire=self._wire_data(current)
+                    cap_options=({'output_token_cap':initial_cap}
+                        if attempt==0 and not durable_reviews and initial_cap is not None else {})
                     response=self.e.reasoner.request(operation if attempt==0 and not durable_reviews else operation+'_repair',
-                        self._system(wire),wire,schema=self._schema(current),reserve=0 if audit else None)
+                        self._system(wire),wire,schema=self._schema(current),reserve=0 if audit else None,**cap_options)
                     if isinstance(response,dict) and isinstance(response.get('slots'),list):
                         # Repeating an identical draft is idempotent. Different
                         # drafts sharing an ID remain explicit repair obligations.
@@ -1833,6 +1926,8 @@ class JointReader:
                     {'variable':v,'id':rid,'error':err} for (v,rid),err in failures.items()],
                 'complete':not failures,'input_tokens':(
                     self.e.reasoner.requests[-1]['input_tokens_local'] if self.e.reasoner.requests else None)}
+            if initial_cap is not None:
+                diagnostic['initial_output_token_cap']=initial_cap
             if whole_value_reviews:
                 diagnostic['whole_value_reviews']=deepcopy(list(whole_value_reviews.values()))
             if audit:

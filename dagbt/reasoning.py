@@ -56,7 +56,19 @@ class Reasoner:
     def url(self):
         return self.config["llm_base_url"].rstrip("/") + "/chat/completions"
 
-    def _payload(self, operation, system, data, schema=None):
+    def _output_limit(self, output_token_cap=None):
+        """Resolve one request's cap without changing the configured allowance."""
+        maximum = self.settings["reasoning_output_tokens"]
+        if type(maximum) is not int or maximum < 1:
+            raise ValueError("reasoning_output_tokens must be a positive integer")
+        if output_token_cap is None:
+            return maximum
+        if type(output_token_cap) is not int or not 1 <= output_token_cap <= maximum:
+            raise ValueError("output_token_cap must be a positive integer no greater than reasoning_output_tokens")
+        return output_token_cap
+
+    def _payload(self, operation, system, data, schema=None, *, output_token_cap=None):
+        output = self._output_limit(output_token_cap)
         mode = self.settings.get("response_format", "plain")
         if mode not in {"plain", "json_object", "json_schema"}:
             raise ValueError("response_format must be plain, json_object, or json_schema")
@@ -80,7 +92,7 @@ class Reasoner:
         payload = {
             "messages": [{"role": "system", "content": system},
                          {"role": "user", "content": json.dumps(data, ensure_ascii=False, allow_nan=False, **json_options)}],
-            "max_tokens": self.settings["reasoning_output_tokens"],
+            "max_tokens": output,
             REASONING_MARKER: True,
         }
         if mode == "json_object":
@@ -90,9 +102,9 @@ class Reasoner:
                 "name": "dagbt_evidence", "strict": True, "schema": dict(schema)}}
         return payload
 
-    def estimate(self, operation, system, data, schema=None):
+    def estimate(self, operation, system, data, schema=None, *, output_token_cap=None):
         """Estimated input tokens for exact wire JSON, including schema fields."""
-        payload = self._payload(operation, system, data, schema)
+        payload = self._payload(operation, system, data, schema, output_token_cap=output_token_cap)
         return self._count_payload(operation, payload)['count']
 
     def _count_payload(self, operation, payload):
@@ -104,8 +116,8 @@ class Reasoner:
         return {'count': count_evidence_request_tokens(stage, self.url, payload, self.config),
                 **evidence_token_accounting()}
 
-    def _preflight(self, operation, count, *, reserve=None, extra_reserve=0):
-        output = self.settings["reasoning_output_tokens"]
+    def _preflight(self, operation, count, *, reserve=None, extra_reserve=0, output_token_cap=None):
+        output = self._output_limit(output_token_cap)
         margin = self.settings.get("input_margin", 256)
         if count + output + 8 + margin > self.settings["context_tokens"]:
             raise InputOverflow(f'{operation}: {count}+{output}+8+{margin} exceeds '
@@ -114,17 +126,21 @@ class Reasoner:
         if self.ledger.remaining("llm") <= reserved:
             raise BudgetExceeded("llm", operation, 1, 0)
 
-    def request(self, operation, system, data, validate=None, schema=None, *, reserve=None, extra_reserve=0):
+    def request(self, operation, system, data, validate=None, schema=None, *, reserve=None, extra_reserve=0,
+                output_token_cap=None):
         """One metered request and strict parse; local mapping owns its recovery.
 
         Transport keeps its finite physical HTTP retry policy. This method
         never retries a model response or changes its requested output mode.
         ``last_response``/``requests`` retain raw output and provider metadata.
+        An explicit output cap reduces only this request's allowance; callers
+        own admission policy and subsequent repairs retain their default cap.
         """
-        payload = self._payload(operation, system, data, schema)
+        payload = self._payload(operation, system, data, schema, output_token_cap=output_token_cap)
         accounting = self._count_payload(operation, payload)
         count = accounting['count']
-        self._preflight(operation, count, reserve=reserve, extra_reserve=extra_reserve)
+        self._preflight(operation, count, reserve=reserve, extra_reserve=extra_reserve,
+                        output_token_cap=payload["max_tokens"])
         self.sequence += 1
         stage = (operation, str(self.sequence))
         record = {"operation": operation, "call_index": self.sequence, "messages": deepcopy(payload["messages"]),
