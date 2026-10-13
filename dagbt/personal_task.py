@@ -42,6 +42,14 @@ Every planned task must contribute to the designated terminal. Omit redundant ta
 The current user utterance is given input. Do not require the memory to re-prove
 an event or attribute explicitly stated there. Seek the relevant prior preferences,
 experiences and changes that contextualize it instead.
+History tasks need sufficient query-relevant evidence, not an exhaustive inventory
+of every past event, preference or experience. For open-ended background, ask for
+a concise sourced text summary of relevant examples and changes. Use a set variable
+only when its task explicitly defines a bounded whole set that can be established
+from the available history; a single witnessed member does not establish that whole.
+For an utterance such as "I tried X", do not make listing everything the user has
+ever tried a prerequisite. Retrieve the prior attitudes or experiences needed to
+understand X in context. A separate history-summary node is optional, not mandatory.
 '''
 
 PERSONAL_HISTORY_GUIDANCE = '''
@@ -64,6 +72,11 @@ not establish an adopted user preference. Do not invent external catalogues,
 availability or past execution of a future suggestion. A partial observation must
 cite its actual clue. Use unresolved only for a specific condition still necessary
 to establish this requested historical value, not hypothetical exhaustive coverage.
+Positive and negative experiences can both support a historical summary. A sourced
+dislike is useful history, not automatically a contradiction observation: that
+stance is reserved for challenging an identified existing fact route. Preserve
+the difference between past enjoyment, later frustration and their conditions in
+the value and citations; do not summarize them as an unconditional current interest.
 Re-read any supplied evidence obligations and their original sources explicitly;
 do not drop a source or contradiction merely because a prior value is available.
 '''

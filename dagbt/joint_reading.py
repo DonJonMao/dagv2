@@ -108,6 +108,23 @@ whole-corpus exhaustiveness requirements; scoped sufficient evidence may resolve
 a missing-evidence issue without having read every memory.
 '''
 
+WHOLE_VALUE_REVIEW_INSTRUCTION = '''
+Exception to freezing individual validated drafts: repair_scope.whole_value_reviews
+explicitly returns a same-variable group whose supports disagree about its WHOLE
+value. Those draft_observations have NOT been integrated. Recheck their original
+text, scope and actual parents, retaining EACH draft ID and its original source_ids.
+Decide whether they are compatible fragments that jointly establish one complete
+scoped value, or genuinely incompatible/insufficient evidence. Only in the first
+case may you rewrite the drafts as alternative proofs of the SAME complete value,
+citing every joint premise. You may instead explicitly review a draft as sourced
+partial/unknown/irrelevant with value=null and an explanation; never drop its ID,
+sources, a negative experience, a temporal qualification, or a valid counter.
+Review all required_source_ids. Existing known_observations are already integrated
+routes: only explicit sourced contradictions naming their real route IDs can
+retract them, never an implicit union or overwrite. If the issue cannot be settled,
+preserve it in slot.unresolved with its original evidence. Agreement is not required.
+'''
+
 COLUMNAR_INSTRUCTION = '''
 When source_span_columns is present, source_spans contains row arrays. Match each
 row position to source_span_columns to reconstruct every span object before
@@ -518,6 +535,8 @@ class JointReader:
     @staticmethod
     def _system(data):
         system=SYSTEM+(COLUMNAR_INSTRUCTION if 'source_span_columns' in data else '')
+        if data.get('repair_scope',{}).get('whole_value_reviews'):
+            system+=WHOLE_VALUE_REVIEW_INSTRUCTION
         if data.get('personal_response_selection'):
             from .personal_task import PERSONAL_HISTORY_GUIDANCE, PERSONAL_READING_GUIDANCE, PERSONAL_AUDIT_GUIDANCE
             if data.get('phase')=='history_evidence':
@@ -640,6 +659,74 @@ class JointReader:
             setattr(proposed,name,[] if name=='history' else deepcopy(value))
         proposed.integrate(rows,proposed.pending if pending is None else pending)
         return proposed
+
+    def _whole_value_conflicts(self, rows, variables):
+        """Find live alternative proofs that cannot bind one complete value.
+
+        This detects a protocol ambiguity, not whether the values are compatible
+        fragments. Only a sourced model review can decide that semantic question.
+        """
+        proposed=self._prospective_state(rows)
+        values=proposed.valid()[0]
+        conflicts={}
+        for variable in variables:
+            routes=[row for row in proposed.routes.values()
+                if row['variable']==variable and not row['revoked']
+                and all(row.get(k)==v for k,v in proposed.scope(variable).items())
+                and ('binding_derivation' not in row
+                     or row['binding_derivation']['program_revision']==proposed.revision)
+                and all(p in values and proposed.versions[p]==version
+                        for p,version in row['parent_versions'].items())]
+            if len({digest(row['value']) for row in routes})>1:
+                conflicts[variable]=routes
+        return conflicts
+
+    def _whole_value_review_failures(self, rows, reviews, data, groups, observed):
+        """Keep ambiguous support drafts editable within the existing repair loop."""
+        if data.get('phase')!='history_evidence':
+            return {}
+        conflicts=self._whole_value_conflicts(rows,reviews)
+        failures={}
+        for variable,routes in conflicts.items():
+            if reviews[variable]['unresolved']:
+                # Acknowledged genuine ambiguity is evidence to retain, not an
+                # instruction to manufacture agreement in another model call.
+                continue
+            group=groups.setdefault(variable,{'variable':variable,
+                'scope':deepcopy(self.state.scope(variable)),
+                'draft_observations':[],'known_observations':[],
+                'required_source_ids':[]})
+            drafts={row['id']:row for row in group['draft_observations']}
+            for row in rows:
+                if row['variable']==variable and row['stance']=='support':
+                    draft=deepcopy(observed[variable,row['id']])
+                    # The normalized source set is canonical even if the model
+                    # used the exact older stable-ID compatibility spelling.
+                    draft['source_ids']=[self.e.mapper.source_aliases[s] for s in row['source_ids']]
+                    drafts.setdefault(row['id'],draft)
+            group['draft_observations']=list(drafts.values())
+            known={row['id']:row for row in group['known_observations']}
+            live_ids={row['id'] for row in routes}
+            for row in data['known_observations']:
+                if row['id'] in live_ids:
+                    known.setdefault(row['id'],deepcopy(row))
+            group['known_observations']=list(known.values())
+            group['required_source_ids']=sorted({s for row in [*drafts.values(),*known.values()]
+                                                  for s in row['source_ids']})
+            failures[variable,'*']='whole_value_disagreement: review all scoped drafts and known routes; compatible fragments need a sourced complete value, genuine conflict stays unresolved'
+        for variable,group in groups.items():
+            slot=reviews.get(variable)
+            if slot is None or slot['unresolved']:
+                continue
+            reviewed=[row for row in rows if row['variable']==variable]
+            partial=any(row['stance'] in ('partial','unknown') and row['source_ids'] for row in reviewed)
+            covered={self.e.mapper.source_aliases[s] for row in reviewed for s in row['source_ids']}
+            if not partial and not set(group['required_source_ids'])<=covered:
+                failures[variable,'*']='whole_value_disagreement: explicitly review every required original source before resolving the complete-value disagreement'
+        for row in rows:
+            if (row['variable'],'*') in failures and row['stance']=='support':
+                failures[row['variable'],row['id']]=failures[row['variable'],'*']
+        return failures
 
     def _update_evidence_obligations(self, reviews, rows, data, failures, identity):
         """Carry unresolved evidence until an explicit, sourced scoped review."""
@@ -893,6 +980,7 @@ class JointReader:
             observed_rows, observed_slots, duplicate_rows, repair_inputs = {}, {}, {}, set()
             duplicate_replacements={}
             protected_counters={}
+            whole_value_reviews={}
             current=deepcopy(data)
             prediction=None
             semantic_result=None
@@ -1016,6 +1104,14 @@ class JointReader:
                                 if (key in protected_counters
                                         and self._counter_identity(normalized) not in protected_counters[key]):
                                     raise ProtocolError('Envelope repair cannot reclassify or change a source-validated counter draft')
+                                group=whole_value_reviews.get(variable,{})
+                                original=next((draft for draft in group.get('draft_observations',[])
+                                               if draft['id']==key[1]),None)
+                                if original is not None:
+                                    required={self.e.mapper.sources[a]['source_id'] for a in original['source_ids']}
+                                    if not required<=set(normalized['source_ids']):
+                                        raise ProtocolError('Whole-value review must preserve each original draft source; '
+                                            'review it explicitly instead of dropping the evidence')
                                 for original,replacements in duplicate_replacements.items():
                                     if key not in replacements:
                                         continue
@@ -1074,6 +1170,16 @@ class JointReader:
                         next_failures.setdefault(key,'A source-validated counter draft remains required; '
                             'envelope repair cannot change its stance, sources, scope, parents or retraction targets')
                         completed.discard(key[0])
+                ambiguous=self._whole_value_review_failures(
+                    valid,reviews,data,whole_value_reviews,observed_rows)
+                if ambiguous:
+                    # These were valid individual shapes, but not one agreed
+                    # whole value. Return the complete local group before any
+                    # support is integrated. Valid counters remain frozen.
+                    valid=[row for row in valid if (row['variable'],row['id']) not in ambiguous]
+                    for key,error in ambiguous.items():
+                        frozen.discard(key);resolved.discard(key);completed.discard(key[0])
+                        next_failures[key]=error
                 before_obligations=deepcopy(self.evidence_obligations)
                 self._update_evidence_obligations(reviews,valid,current,next_failures,identity)
                 prospective_pending=(external_pending
@@ -1118,6 +1224,10 @@ class JointReader:
                         'attempt':attempt+1,'previous_response_identity':digest(previous)}}
                 if 'audit_instruction' in data:
                     current['audit_instruction']=data['audit_instruction']
+                offered_reviews=[deepcopy(group) for variable,group in whole_value_reviews.items()
+                                 if variable in failed_variables]
+                if offered_reviews:
+                    current['repair_scope']['whole_value_reviews']=offered_reviews
                 if response is None:
                     # A syntax/truncation failure has no parsed draft to repair.
                     # Preserve the exact failed content when available; its real
@@ -1145,6 +1255,14 @@ class JointReader:
                     for variable in terminal_variables:
                         failures[variable,'terminal_output']=terminal_error
             related={k[0] for k in failures}
+            unresolved_whole=related&set(whole_value_reviews)
+            if unresolved_whole:
+                # A repair that could not run or finish must retain its original
+                # source window under future query identities. Invalid drafts
+                # are not facts, and no automatic union is introduced here.
+                self._update_evidence_obligations({v:{'observations':[],
+                    'unresolved':['Complete-value disagreement remains unresolved; review the original scoped evidence without discarding conflicts.']}
+                    for v in unresolved_whole},[],data,failures,identity)
             # A later independent reading cannot erase a failed counter slot.
             # Only this batch's scoped repair can settle its own failed rows.
             for alias in batch:
@@ -1164,6 +1282,8 @@ class JointReader:
                     {'variable':v,'id':rid,'error':err} for (v,rid),err in failures.items()],
                 'complete':not failures,'input_tokens':(
                     self.e.reasoner.requests[-1]['input_tokens_local'] if self.e.reasoner.requests else None)}
+            if whole_value_reviews:
+                diagnostic['whole_value_reviews']=deepcopy(list(whole_value_reviews.values()))
             if audit:
                 diagnostic['audit_verdict']=audit_verdict
                 diagnostic['audit_complete'] = not failures and audit_verdict=='supported' and not any(
