@@ -9,10 +9,12 @@ import random
 import pytest
 
 from dagbt import history_wire as codec
+from dagbt import review_wire
 from dagbt.fact_state import FactState
 from dagbt.joint_reading import JointReader
 from dagbt.reasoning import ProtocolError
 from test_personamem_joint_protocol import fixture, observation, visible, expand_wire_data
+from test_v4_review_wire_independent import independent_inverse as review_inverse
 
 
 def canonical(value):
@@ -347,7 +349,7 @@ def reader_payload_fixture():
 
 @pytest.mark.parametrize('collision', ['shared_history_texts', 'grounded_subquestion_parts',
                                         'parent_value_ref', 'known_value_ref'])
-def test_prepare_collision_keeps_old_wire_and_never_adds_reference_instruction(collision):
+def test_prepare_history_collision_keeps_literals_and_never_adds_history_instruction(collision):
     reader, engine, state, calls, original = reader_payload_fixture()
     if collision == 'parent_value_ref':
         original['supported_parents']['history']['value_ref'] = 'caller-literal'
@@ -358,12 +360,19 @@ def test_prepare_collision_keeps_old_wire_and_never_adds_reference_instruction(c
     else:
         original[collision] = [{'text_ref': 't0'}]
     before = canonical(original)
+    state_before = canonical((state.public_dict(), reader._schema(original),
+                              engine.mapper.sources, engine.ledger.used))
     old_wire = reader._wire_data(original)
     wire, system = reader._prepare_wire(original)
-    assert canonical(wire) == canonical(old_wire)
+    # History must fall back; independent review sharing may still apply.
+    # Its handwritten inverse must recover every caller-owned history field.
+    assert canonical(review_inverse(wire)) == canonical(old_wire)
     assert canonical(original) == before
-    assert system == reader._system(old_wire)
+    assert 'shared_review_texts' in wire
+    assert system == reader._system(wire) + review_wire.INSTRUCTION
     assert codec.INSTRUCTION not in system
+    assert canonical((state.public_dict(), reader._schema(original),
+                      engine.mapper.sources, engine.ledger.used)) == state_before
     assert not calls.requests and not any(engine.ledger.used.values())
 
 
@@ -407,7 +416,10 @@ def test_prepare_has_no_stale_applied_status_between_requests():
     collision = deepcopy(original)
     collision['shared_history_texts'] = {'t0': 'Caller-owned literal.'}
     fallback_wire, fallback_system = reader._prepare_wire(collision)
-    assert canonical(fallback_wire) == canonical(reader._wire_data(collision))
+    assert canonical(review_inverse(fallback_wire)) == canonical(reader._wire_data(collision))
+    assert fallback_wire['shared_history_texts'] == collision['shared_history_texts']
+    assert 'shared_review_texts' in fallback_wire
+    assert fallback_system == reader._system(fallback_wire) + review_wire.INSTRUCTION
     assert codec.INSTRUCTION not in fallback_system
     wire_again, system_again = reader._prepare_wire(original)
     assert canonical(wire_again) == canonical(shared_wire)

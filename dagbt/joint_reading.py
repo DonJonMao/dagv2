@@ -1133,9 +1133,12 @@ class JointReader:
         is a final reversible candidate, and only an actually applied encoding
         authorizes its instruction; preexisting reserved fields do not.
         """
-        from .history_wire import INSTRUCTION, pack_with_status
-        wire,applied=pack_with_status(self._wire_data(data))
-        return wire,self._system(wire)+(INSTRUCTION if applied else '')
+        from .history_wire import INSTRUCTION as HISTORY_INSTRUCTION, pack_with_status as pack_history
+        from .review_wire import INSTRUCTION as REVIEW_INSTRUCTION, pack_with_status as pack_review
+        wire,history_applied=pack_history(self._wire_data(data))
+        wire,review_applied=pack_review(wire)
+        return (wire,self._system(wire)+(HISTORY_INSTRUCTION if history_applied else '')
+                +(REVIEW_INSTRUCTION if review_applied else ''))
 
     def _estimate(self, operation, data, *, output_token_cap=None):
         wire,system=self._prepare_wire(data)
