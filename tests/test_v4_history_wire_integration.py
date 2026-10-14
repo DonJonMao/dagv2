@@ -54,13 +54,25 @@ def payload(reader, engine, operation):
     return data
 
 
-def capture_estimates(monkeypatch, reasoner):
-    original = reasoner.estimate
+def capture_estimates(monkeypatch, reader):
+    reasoner = reader.e.reasoner
+    original = reasoner._count_payload
+    estimate = reader._estimate
+    in_estimate = False
     seen = []
-    def estimate(operation, system, data, schema=None, **options):
-        seen.append((operation, reasoner._payload(operation, system, data, schema, **options)))
-        return original(operation, system, data, schema, **options)
-    monkeypatch.setattr(reasoner, 'estimate', estimate)
+    def count(operation, request):
+        if in_estimate:
+            seen.append((operation, deepcopy(request)))
+        return original(operation, request)
+    def inspect_estimate(*args, **kwargs):
+        nonlocal in_estimate
+        in_estimate = True
+        try:
+            return estimate(*args, **kwargs)
+        finally:
+            in_estimate = False
+    monkeypatch.setattr(reasoner, '_count_payload', count)
+    monkeypatch.setattr(reader, '_estimate', inspect_estimate)
     return seen
 
 
@@ -71,15 +83,18 @@ def test_estimate_and_request_share_input_system_and_canonical_schema(operation,
     data = payload(reader, engine, operation)
     before, state_before = deepcopy(data), deepcopy(state.public_dict())
     canonical_identity = reader._selection_data_identity(data)
-    estimates = capture_estimates(monkeypatch, engine.reasoner)
+    estimates = capture_estimates(monkeypatch, reader)
     count = reader._estimate(operation, data)
     wire, system = reader._prepare_wire(data)
     assert wire['shared_history_texts'] == {'t0': HISTORY}
     assert system.count(INSTRUCTION) == 1
     assert unpack(wire) == reader._wire_data(data)
+    assert len(estimates) == 1
+    admitted = deepcopy(estimates[0])
     calls.respond = lambda index, current: {'slots': []}
     engine.reasoner.request(operation, system, wire, schema=reader._schema(data))
-    assert estimates == [(operation, calls.requests[0]['payload'])]
+    assert len(estimates) == 1
+    assert admitted == estimates[-1] == (operation, calls.requests[0]['payload'])
     assert engine.reasoner.requests[-1]['input_tokens_local'] == count
     actual_schema = json.loads(calls.requests[0]['payload']['messages'][0]['content'].split(
         'matching this schema:\n', 1)[1])
@@ -91,7 +106,7 @@ def test_estimate_and_request_share_input_system_and_canonical_schema(operation,
 
 def test_actual_read_and_terminal_only_repair_use_the_same_prepared_admission(monkeypatch):
     reader, engine, state, calls = history_terminal()
-    estimates = capture_estimates(monkeypatch, engine.reasoner)
+    estimates = capture_estimates(monkeypatch, reader)
     selected = engine.output_options[0]
     def respond(index, data):
         assert data['shared_history_texts'] == {'t0': HISTORY}
@@ -160,7 +175,7 @@ def test_fresh_forecast_and_actual_repair_share_encoding_without_budget_changes(
     data['task'] = {**data['task'], 'execution': 'retrieval'}
     before = deepcopy(data)
     settings = deepcopy(engine.s)
-    estimates = capture_estimates(monkeypatch, engine.reasoner)
+    estimates = capture_estimates(monkeypatch, reader)
     assert reader._fresh_window_fits('joint_read', data)
     forecast = reader._whole_review_forecast(data)
     assert reader._repair_fits('joint_read_repair', forecast, engine.steps[1], 'capacity', 1)
@@ -180,6 +195,8 @@ def test_output_structure_floor_retains_full_values_and_bypasses_input_encoding(
     def forbidden(*args, **kwargs):
         raise AssertionError('The assistant output floor must not share input references')
     monkeypatch.setattr(reader, '_prepare_wire', forbidden)
+    monkeypatch.setattr(reader, '_wire_candidates', forbidden)
+    monkeypatch.setattr(reader, '_select_wire', forbidden)
     captured = []
     def count(operation, request):
         captured.append(request)

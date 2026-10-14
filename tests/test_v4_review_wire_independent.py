@@ -358,7 +358,7 @@ def test_seeded_unicode_exactness_without_normalization_or_substring_sharing():
         assert encoded["known_observations"][2]["value"] == value + " "
 
 
-def reader_fixture(monkeypatch):
+def reader_fixture(monkeypatch, *, actual_count=False, review_delta=-1):
     _, engine, initial, calls = fixture(max_repairs_per_request=2)
     program = deepcopy(initial.initial_program)
     program["variables"]["history"]["type"] = "text"
@@ -378,11 +378,14 @@ def reader_fixture(monkeypatch):
         "validated_observations": [deepcopy(row)], "whole_value_reviews": [],
         "invalid_response": RAW,
     }]
-    # Counts below are explicit deterministic stubs, not actual tokenization.
+    # Explicit synthetic accounting, not real tokenization. actual_count models
+    # deployment-counter metadata; the declared delta is independent of bytes.
     counts = []
     def count(operation, request):
         counts.append((operation, deepcopy(request)))
-        return {"count": 100, "token_count_is_estimate": True}
+        reviewed = POOL in json.loads(request["messages"][1]["content"])
+        return {"count": 100 + (review_delta if actual_count and reviewed else 0),
+                "token_count_is_estimate": not actual_count}
     monkeypatch.setattr(engine.reasoner, "_count_payload", count)
     return reader, engine, state, calls, data, counts
 
@@ -391,18 +394,27 @@ def reader_fixture(monkeypatch):
     "joint_read", "joint_read_repair", "semantic_compose", "semantic_compose_repair",
     "audit_joint", "audit_joint_repair"])
 @pytest.mark.parametrize("mode", ["plain", "json_object", "json_schema"])
-def test_estimate_and_actual_request_have_identical_complete_wire_and_schema(operation, mode, monkeypatch):
-    reader, engine, state, calls, data, counts = reader_fixture(monkeypatch)
+@pytest.mark.parametrize("actual_count,review_delta", [(False, -1), (True, -1), (True, 0), (True, 9)])
+def test_estimate_and_actual_request_have_identical_complete_wire_and_schema(
+        operation, mode, actual_count, review_delta, monkeypatch):
+    reader, engine, state, calls, data, counts = reader_fixture(
+        monkeypatch, actual_count=actual_count, review_delta=review_delta)
     engine.s["response_format"] = mode
     frozen = exact(data)
     state_before = exact(state.public_dict())
     settings = deepcopy(engine.s)
     identity = reader._selection_data_identity(data)
     schema = deepcopy(reader._schema(data))
-    assert reader._estimate(operation, data) == 100
-    wire, system = reader._prepare_wire(data)
-    assert POOL in wire and system.count(codec.INSTRUCTION) == 1
-    assert exact(independent_inverse(wire)) == exact(reader._wire_data(data))
+    use_review = actual_count and review_delta < 0
+    expected_count = 100 + (review_delta if use_review else 0)
+    assert reader._estimate(operation, data) == expected_count
+    candidates = reader._wire_candidates(data)
+    assert len(candidates) == 2
+    for wire, system in candidates:
+        assert exact(independent_inverse(wire)) == exact(reader._wire_data(data))
+        assert system.count(codec.INSTRUCTION) == int(POOL in wire)
+    estimate_counts = deepcopy(counts)
+    assert len(estimate_counts) == (2 if actual_count else 1)
     received = []
     def offline_get(stage, url, request, **options):
         received.append(deepcopy(request))
@@ -410,8 +422,17 @@ def test_estimate_and_actual_request_have_identical_complete_wire_and_schema(ope
         return {"response_ref": "offline", "response": {"choices": [
             {"finish_reason": "stop", "message": {"content": '{"slots":[]}'}}]}}
     monkeypatch.setattr(calls, "get", offline_get)
-    engine.reasoner.request(operation, system, wire, schema=schema)
-    assert len(received) == 1 and all(payload == received[0] for _, payload in counts)
+    wire, system = candidates[0]
+    reader._request_with_exposure(operation, data, "synthetic-review", wire, system,
+                                  wire_candidates=candidates, schema=schema)
+    assert len(received) == 1
+    expected_wire, expected_system = candidates[int(use_review)]
+    assert received[0] == engine.reasoner._payload(operation, expected_system, expected_wire, schema)
+    assert estimate_counts[int(use_review)] == counts[-1] == (operation, received[0])
+    allowed_probes = [engine.reasoner._payload(operation, instruction, candidate, schema)
+                      for candidate, instruction in candidates]
+    assert all(op == operation and payload in allowed_probes for op, payload in counts)
+    assert engine.reasoner.requests[-1]["input_tokens_local"] == expected_count
     assert exact(data) == frozen and exact(state.public_dict()) == state_before
     assert engine.s == settings and reader._selection_data_identity(data) == identity
     assert reader._schema(data) == schema
@@ -419,17 +440,24 @@ def test_estimate_and_actual_request_have_identical_complete_wire_and_schema(ope
     assert engine.ledger.used["llm"] == 1 and engine.ledger.used["json_repairs"] == 0
 
 
-def test_actual_repair_capacity_failure_retains_guard_and_does_not_charge(monkeypatch):
+@pytest.mark.parametrize("actual_count", [False, True])
+def test_actual_repair_capacity_failure_retains_guard_and_does_not_charge(monkeypatch, actual_count):
     reader, engine, state, calls, data, _ = reader_fixture(monkeypatch)
     before = exact(data), exact(state.public_dict()), deepcopy(engine.ledger.used)
     seen = []
     def oversized(operation, request):
         seen.append(request)
-        return {"count": engine.s["context_tokens"] - request["max_tokens"] - engine.s["input_margin"] - 7}
+        reviewed = POOL in json.loads(request["messages"][1]["content"])
+        return {"count": engine.s["context_tokens"] - request["max_tokens"] - engine.s["input_margin"] - 7
+                + int(actual_count and not reviewed), "token_count_is_estimate": not actual_count}
     monkeypatch.setattr(engine.reasoner, "_count_payload", oversized)
     assert not reader._repair_fits("joint_read_repair", data, engine.steps[0], "synthetic-review", 1)
-    assert POOL in json.loads(seen[0]["messages"][1]["content"])
-    wire, system = reader._prepare_wire(data)
+    assert POOL not in json.loads(seen[0]["messages"][1]["content"])
+    assert len(seen) == (2 if actual_count else 1)
+    if actual_count:
+        assert POOL in json.loads(seen[1]["messages"][1]["content"])
+    wire, system, _ = reader._select_wire("joint_read_repair", reader._wire_candidates(data), reader._schema(data))
+    assert (POOL in wire) is actual_count
     with pytest.raises(InputOverflow):
         engine.reasoner.request("joint_read_repair", system, wire, schema=reader._schema(data))
     assert not calls.requests
@@ -599,8 +627,9 @@ def test_decoder_does_not_allow_reason_reference_on_parent_role():
         codec.unpack(encoded)
 
 
-def test_real_durable_recovery_charges_existing_budget_and_keeps_unresolved_obligation(monkeypatch):
-    reader, engine, state, calls, _, counts = reader_fixture(monkeypatch)
+@pytest.mark.parametrize("actual_count", [False, True])
+def test_real_durable_recovery_charges_existing_budget_and_keeps_unresolved_obligation(monkeypatch, actual_count):
+    reader, engine, state, calls, _, counts = reader_fixture(monkeypatch, actual_count=actual_count)
     source_id = engine.mapper.sources["s1"]["source_id"]
     row = observation("saved-observation", [source_id], value=TEXT, reason=REASON)
     original_record = {
@@ -623,7 +652,7 @@ def test_real_durable_recovery_charges_existing_budget_and_keeps_unresolved_obli
         data = independent_inverse(json.loads(request["messages"][1]["content"]))
         assert data["failed_batch_reviews"][0]["review_allowed"] is True
         assert data["failed_batch_reviews"][0]["invalid_response"] == RAW
-        assert POOL in json.loads(request["messages"][1]["content"])
+        assert (POOL in json.loads(request["messages"][1]["content"])) is actual_count
         engine.ledger.reserve("llm", "/".join(stage))
         partial = observation("partial-current", ["s1"], stance="partial")
         partial["value"] = None

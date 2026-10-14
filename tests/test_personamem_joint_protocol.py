@@ -260,18 +260,35 @@ def test_read_and_repair_estimate_the_same_document_table_sent_to_the_model(monk
     canonical_sources = deepcopy(engine.mapper.sources)
     estimates = []
     estimate = engine.reasoner.estimate
+    counter = engine.reasoner._count_payload
+    reader_estimate = reader._estimate
+    in_estimate = False
 
-    def inspect_estimate(operation, system, data, schema=None):
+    def inspect_count(operation, request):
+        system = request['messages'][0]['content']
+        data = json.loads(request['messages'][1]['content'])
         if operation in ('joint_read', 'joint_read_repair'):
             assert data["source_documents"]
             assert all(source["doc_id"] in data["source_documents"] and "time_metadata" not in source
                        for source in wire_source_rows(data))
-        assert system == reader._system(data)
-        count = estimate(operation, system, data, schema)
-        estimates.append((digest(data), count))
-        return count
+        base_system, schema_text = system.split('\n\nReturn one complete JSON object matching this schema:\n', 1)
+        assert base_system == reader._system(data)
+        assert json.loads(schema_text) == reader._schema(data)
+        accounting = counter(operation, request)
+        if in_estimate:
+            estimates.append((digest(data), accounting['count']))
+        return accounting
 
-    monkeypatch.setattr(engine.reasoner, "estimate", inspect_estimate)
+    def inspect_estimate(*args, **kwargs):
+        nonlocal in_estimate
+        in_estimate = True
+        try:
+            return reader_estimate(*args, **kwargs)
+        finally:
+            in_estimate = False
+
+    monkeypatch.setattr(engine.reasoner, "_count_payload", inspect_count)
+    monkeypatch.setattr(reader, "_estimate", inspect_estimate)
     assert reader.read(engine.steps[0], "Read past creative activities", ["history"], [document_id], "history-query")
     assert len(calls.requests) == 2
     for sent, recorded in zip(calls.requests, engine.reasoner.requests):

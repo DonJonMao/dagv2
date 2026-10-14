@@ -1,5 +1,6 @@
 """Independent lossless whole-review route references, with no remote calls."""
 from copy import deepcopy
+import json
 
 import pytest
 
@@ -172,14 +173,19 @@ def test_forecast_and_actual_repair_use_same_reference_wire_and_keep_both_output
     captured = []
     threshold = 16384 - 4096 - 4096 - engine.s['input_margin'] - 8
     extra = 0
-    def estimate(operation, system, payload, schema):
+    def count(operation, request):
+        system = request['messages'][0]['content']
+        payload = json.loads(request['messages'][1]['content'])
+        assert request['max_tokens'] == 4096
+        schema = json.loads(system.split('matching this schema:\n', 1)[1])
+        assert schema == reader._schema(data)
         captured.append((operation, system, deepcopy(payload)))
         if payload.get('repair_scope', {}).get('whole_value_reviews'):
             assert 'known_observation_ids' in payload['repair_scope']['whole_value_reviews'][0]
             assert 'known_observation_ids' in system
-            return threshold + extra
-        return 2000
-    monkeypatch.setattr(engine.reasoner, 'estimate', estimate)
+            return {'count': threshold + extra, 'token_count_is_estimate': True}
+        return {'count': 2000, 'token_count_is_estimate': True}
+    monkeypatch.setattr(engine.reasoner, '_count_payload', count)
     assert reader._fresh_window_fits('joint_read', data)
     forecast = deepcopy(captured[-1][2])
     extra = 1

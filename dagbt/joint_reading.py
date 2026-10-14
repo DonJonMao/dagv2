@@ -580,10 +580,17 @@ class JointReader:
         self.source_exposures.append(record)
         return record
 
-    def _request_with_exposure(self, operation, data, identity, wire, system, **options):
+    def _request_with_exposure(self, operation, data, identity, wire, system, *,
+                               wire_candidates=None, **options):
         record=self._record_source_exposure(data,identity,operation)
         sequence=self.e.reasoner.sequence
         try:
+            # Selection may contact the configured tokenizer. Keep it after
+            # attempted exposure, where the existing request preflight runs,
+            # so a count failure retains the same conservative unread scope.
+            candidates=wire_candidates if wire_candidates is not None else ((wire,system),)
+            wire,system,_=self._select_wire(operation,candidates,options.get('schema'),
+                output_token_cap=options.get('output_token_cap'))
             response=self.e.reasoner.request(operation,system,wire,**options)
         except BaseException as exc:
             record['request_status']='failed'
@@ -1126,24 +1133,60 @@ class JointReader:
         from .personal_wire import deduplicate_personal_instruction
         return deduplicate_personal_instruction(packed)
 
-    def _prepare_wire(self, data):
-        """Prepare the same input and decoding system for count and generation.
+    def _wire_candidates(self, data):
+        """Construct independent reversible candidates without token counting.
 
-        The old packing boundary remains available independently. Shared text
-        is a final reversible candidate, and only an actually applied encoding
-        authorizes its instruction; preexisting reserved fields do not.
+        The baseline is the complete pre-review representation. Byte savings
+        only propose a second representation, whose own applied flag alone
+        authorizes the additional decoding instruction.
         """
         from .history_wire import INSTRUCTION as HISTORY_INSTRUCTION, pack_with_status as pack_history
         from .review_wire import INSTRUCTION as REVIEW_INSTRUCTION, pack_with_status as pack_review
-        wire,history_applied=pack_history(self._wire_data(data))
-        wire,review_applied=pack_review(wire)
-        return (wire,self._system(wire)+(HISTORY_INSTRUCTION if history_applied else '')
-                +(REVIEW_INSTRUCTION if review_applied else ''))
+        baseline,history_applied=pack_history(self._wire_data(data))
+        history_instruction=HISTORY_INSTRUCTION if history_applied else ''
+        candidates=[(baseline,self._system(baseline)+history_instruction)]
+        reviewed,review_applied=pack_review(baseline)
+        if review_applied:
+            candidates.append((reviewed,self._system(reviewed)+history_instruction+REVIEW_INSTRUCTION))
+        return tuple(candidates)
+
+    def _prepare_wire(self, data):
+        """Return the pure byte-proposed representation, not a token decision.
+
+        This compatibility boundary performs no counting. Production estimates
+        and both request paths use all candidates with _select_wire instead.
+        """
+        return self._wire_candidates(data)[-1]
+
+    def _select_wire(self, operation, candidates, schema=None, *, output_token_cap=None):
+        """Use review sharing only for strictly smaller actual complete input.
+
+        Reuse the Reasoner's payload serializer and shared production counter;
+        its errors propagate unchanged. No new cache, preflight, model request
+        or semantic/budget update occurs here. A compatibility single candidate
+        is counted normally but establishes no multi-candidate comparison.
+        """
+        def count(candidate):
+            wire,system=candidate
+            payload=self.e.reasoner._payload(operation,system,wire,schema,
+                output_token_cap=output_token_cap)
+            return self.e.reasoner._count_payload(operation,payload)
+        baseline=candidates[0]
+        baseline_count=count(baseline)
+        if (len(candidates)==1 or baseline_count.get('token_count_is_estimate') is not False):
+            return (*baseline,baseline_count)
+        candidate=candidates[1]
+        candidate_count=count(candidate)
+        if (candidate_count.get('token_count_is_estimate') is False
+                and candidate_count['count']<baseline_count['count']):
+            return (*candidate,candidate_count)
+        return (*baseline,baseline_count)
 
     def _estimate(self, operation, data, *, output_token_cap=None):
-        wire,system=self._prepare_wire(data)
-        options={} if output_token_cap is None else {'output_token_cap':output_token_cap}
-        return self.e.reasoner.estimate(operation,system,wire,self._schema(data),**options)
+        candidates=self._wire_candidates(data)
+        _,_,accounting=self._select_wire(operation,candidates,self._schema(data),
+            output_token_cap=output_token_cap)
+        return accounting['count']
 
     def _fits(self, operation, data):
         count = self._estimate(operation,data)
@@ -2189,9 +2232,11 @@ class JointReader:
             self.e.ledger.reserve('json_repairs',operation+'_repair')
             attempts_used+=1
             try:
-                wire,system=self._prepare_wire(repair)
+                candidates=self._wire_candidates(repair)
+                wire,system=candidates[0]
                 schema=self._schema(repair)
-                response=self._request_with_exposure(operation+'_repair',repair,identity,wire,system,schema=schema)
+                response=self._request_with_exposure(operation+'_repair',repair,identity,wire,system,
+                    wire_candidates=candidates,schema=schema)
                 if (not isinstance(response,dict) or set(response)!={'slots','semantic_answer','final_prediction'}
                         or response['slots']!=[]):
                     raise ProtocolError('Terminal-only repair must preserve validated facts and return slots=[]')
@@ -2430,14 +2475,16 @@ class JointReader:
                 visible={s['id']:s for s in current['source_spans']}
                 offered_route_ids={route['id'] for route in current['known_observations']}
                 try:
-                    wire,system=self._prepare_wire(current)
+                    candidates=self._wire_candidates(current)
+                    wire,system=candidates[0]
                     cap_options=({'output_token_cap':initial_cap}
                         if attempt==0 and not durable_reviews and initial_cap is not None else {})
                     request_operation=operation if attempt==0 and not durable_reviews else operation+'_repair'
                     for source in current['source_spans']:
                         exposed.setdefault(source['id'],set()).update(current['variables'])
                     response=self._request_with_exposure(request_operation,current,identity,wire,system,
-                        schema=self._schema(current),reserve=0 if audit else None,**cap_options)
+                        wire_candidates=candidates,schema=self._schema(current),
+                        reserve=0 if audit else None,**cap_options)
                     if isinstance(response,dict) and isinstance(response.get('slots'),list):
                         # Repeating an identical draft is idempotent. Different
                         # drafts sharing an ID remain explicit repair obligations.

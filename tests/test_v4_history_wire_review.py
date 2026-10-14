@@ -438,15 +438,19 @@ def test_estimation_receives_encoded_wire_with_canonical_schema_and_unchanged_to
     before = canonical(data)
     estimates = []
 
-    def inspect(operation, system, wire, schema, **kwargs):
-        estimates.append((operation, system, deepcopy(wire), deepcopy(schema), kwargs))
-        return 123
+    def inspect(operation, request):
+        estimates.append((operation, deepcopy(request)))
+        return {'count': 123, 'token_count_is_estimate': True}
 
-    monkeypatch.setattr(engine.reasoner, 'estimate', inspect)
+    monkeypatch.setattr(engine.reasoner, '_count_payload', inspect)
     assert reader._estimate('semantic_compose', data, output_token_cap=127) == 123
-    operation, system, wire, schema, options = estimates[0]
+    assert len(estimates) == 1
+    operation, request = estimates[0]
+    system = request['messages'][0]['content']
+    wire = json.loads(request['messages'][1]['content'])
+    schema = json.loads(system.split('matching this schema:\n', 1)[1])
     assert operation == 'semantic_compose'
-    assert options == {'output_token_cap': 127}
+    assert request['max_tokens'] == 127
     assert 'shared_history_texts' in wire and 'known_observation_columns' not in wire
     assert codec.INSTRUCTION in system
     assert canonical(schema) == canonical(expected_schema)
@@ -459,12 +463,22 @@ def test_actual_read_sends_the_same_encoded_input_and_schema_that_were_estimated
     reader, engine, state, calls, _ = reader_payload_fixture()
     canonical_sources = canonical(engine.mapper.sources)
     estimates = []
-    estimate = engine.reasoner.estimate
+    count = engine.reasoner._count_payload
+    estimate = reader._estimate
+    in_estimate = False
 
-    def inspect(operation, system, wire, schema=None, **kwargs):
-        request = engine.reasoner._payload(operation, system, wire, schema, **kwargs)
-        estimates.append((operation, canonical(request)))
-        return estimate(operation, system, wire, schema, **kwargs)
+    def inspect(operation, request):
+        if in_estimate:
+            estimates.append((operation, canonical(request)))
+        return count(operation, request)
+
+    def inspect_estimate(*args, **kwargs):
+        nonlocal in_estimate
+        in_estimate = True
+        try:
+            return estimate(*args, **kwargs)
+        finally:
+            in_estimate = False
 
     def reply(index, expanded):
         decoded = oracle_decode(expanded)
@@ -473,7 +487,8 @@ def test_actual_read_sends_the_same_encoded_input_and_schema_that_were_estimated
         return {'slots': [{'variable': variable, 'observations': [], 'unresolved': []}
                           for variable in decoded['requested_slots']]}
 
-    monkeypatch.setattr(engine.reasoner, 'estimate', inspect)
+    monkeypatch.setattr(engine.reasoner, '_count_payload', inspect)
+    monkeypatch.setattr(reader, '_estimate', inspect_estimate)
     calls.respond = reply
     reader.read(engine.steps[1], 'Use this history:\n' + long_text(), ['suggestion'],
                 ['piano'], 'independent-history-wire-read')
@@ -506,13 +521,19 @@ def test_terminal_only_repair_estimate_requires_the_same_full_terminal_schema(mo
                 terminal_repair={'expected_value': 'piano', 'feedback': 'Inconsistent prediction.'})
     captured = []
 
-    def inspect(operation, system, wire, schema=None, **kwargs):
-        captured.append((system, deepcopy(wire), deepcopy(schema)))
-        return 123
+    def inspect(operation, request):
+        captured.append((operation, deepcopy(request)))
+        return {'count': 123, 'token_count_is_estimate': True}
 
-    monkeypatch.setattr(engine.reasoner, 'estimate', inspect)
+    monkeypatch.setattr(engine.reasoner, '_count_payload', inspect)
     reader._estimate('semantic_compose_repair', data)
-    system, wire, schema = captured[0]
+    assert len(captured) == 1
+    operation, request = captured[0]
+    assert operation == 'semantic_compose_repair'
+    assert request['max_tokens'] == engine.s['reasoning_output_tokens']
+    system = request['messages'][0]['content']
+    wire = json.loads(request['messages'][1]['content'])
+    schema = json.loads(system.split('matching this schema:\n', 1)[1])
     assert schema['required'] == ['slots', 'semantic_answer', 'final_prediction']
     assert schema['properties']['slots']['minItems'] == schema['properties']['slots']['maxItems'] == 0
     assert schema['properties']['final_prediction']['enum'] == ['a', 'b', 'c', 'd', None]

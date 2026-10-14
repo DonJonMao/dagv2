@@ -302,16 +302,23 @@ def test_estimate_receives_same_prepared_wire_without_state_schema_or_budget_cha
     before = exact((data, state.public_dict(), engine.mapper.sources, engine.ledger.used))
     schema = reader._schema(data)
     captured = []
-    def estimate(operation, system, wire, actual_schema, **options):
-        captured.append((system, deepcopy(wire), actual_schema, options))
-        return 123
-    monkeypatch.setattr(engine.reasoner, 'estimate', estimate)
+    def count(operation, request):
+        captured.append((operation, deepcopy(request)))
+        wire = json.loads(request['messages'][1]['content'])
+        return {'count': 123 if 'shared_review_texts' in wire else 124,
+                'token_count_is_estimate': False}
+    monkeypatch.setattr(engine.reasoner, '_count_payload', count)
     assert reader._estimate('joint_read_repair', data, output_token_cap=127) == 123
-    system, wire, actual_schema, options = captured[0]
+    assert len(captured) == 2
+    wire, system = reader._prepare_wire(data)
     assert codec.INSTRUCTION in system and 'shared_review_texts' in wire
-    assert exact(wire) == exact(reader._prepare_wire(data)[0])
-    assert system == reader._prepare_wire(data)[1]
-    assert exact(actual_schema) == exact(schema) and options == {'output_token_cap': 127}
+    for (operation, request), (candidate, instruction) in zip(captured, reader._wire_candidates(data)):
+        assert operation == 'joint_read_repair'
+        assert request == engine.reasoner._payload(operation, instruction, candidate, schema,
+                                                   output_token_cap=127)
+        assert request['max_tokens'] == 127
+        assert exact(independent_inverse(candidate)) == exact(reader._wire_data(data))
+    assert exact(reader._schema(data)) == exact(schema)
     assert exact((data, state.public_dict(), engine.mapper.sources, engine.ledger.used)) == before
     assert not calls.requests
 

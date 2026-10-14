@@ -136,7 +136,7 @@ def test_semantic_terminal_has_real_response_and_option_isolation():
 
 @pytest.mark.parametrize('method',[JOINT,RESIDUAL])
 @pytest.mark.parametrize('repair',[False,True])
-def test_personamem_semantic_terminal_uses_structured_options_without_reader_instruction(method,repair):
+def test_personamem_semantic_terminal_uses_structured_options_without_reader_instruction(method,repair,monkeypatch):
  from types import SimpleNamespace
  from dagbt.engine import Engine
  from dagbt.personamem import ANSWER_INSTRUCTION,TERMINAL_CHOICE_INSTRUCTION,format_question,parse_choice
@@ -166,12 +166,24 @@ def test_personamem_semantic_terminal_uses_structured_options_without_reader_ins
   (docs,['x'],np.array([[1,0,0]],np.float32),None,demo.Tokenizer()),services,config,method,
   reader_question=question,output_options=options)
  estimates=[]
- estimate=engine.reasoner.estimate
- def capture_estimate(operation,system,data,schema=None):
-  count=estimate(operation,system,data,schema)
-  estimates.append((operation,engine.reasoner._payload(operation,system,data,schema)['messages'],count))
-  return count
- engine.reasoner.estimate=capture_estimate
+ from dagbt.joint_reading import JointReader
+ estimate=JointReader._estimate
+ counter=engine.reasoner._count_payload
+ in_estimate=False
+ def capture_count(operation,payload):
+  accounting=counter(operation,payload)
+  if in_estimate:
+   estimates.append((operation,payload['messages'],accounting['count']))
+  return accounting
+ def capture_estimate(reader,*args,**kwargs):
+  nonlocal in_estimate
+  in_estimate=True
+  try:
+   return estimate(reader,*args,**kwargs)
+  finally:
+   in_estimate=False
+ monkeypatch.setattr(engine.reasoner,'_count_payload',capture_count)
+ monkeypatch.setattr(JointReader,'_estimate',capture_estimate)
  row=engine.run()
  assert row['answer']['status']=='ok' and parse_choice(row['answer']['prediction'],options)=='a'
  assert engine.output_options==options and row['answer']['completion_kind']=='semantic_assessment'
