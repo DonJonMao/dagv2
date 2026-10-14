@@ -161,6 +161,15 @@ review all required sources, and retain every counter, partial or unresolved
 issue. Referenced observations remain unchanged and do not become new facts.
 '''
 
+FROZEN_IDS_INSTRUCTION = '''
+repair_scope.frozen_observation_ids lists the controller's immutable observation
+IDs by variable for this batch. Omit those IDs from ordinary observations; do not
+restate or change them. This list grants no reference or obligation-discharge
+permission. Only IDs explicitly offered in frozen_observation_reviews may appear
+in reviewed_observation_ids, under the unchanged source, scope and review rules.
+Listing a partial/unknown row here does not make it a settled review.
+'''
+
 WHOLE_VALUE_REFERENCE_INSTRUCTION = '''
 In repair_scope.whole_value_reviews, known_observation_ids replaces the list of
 known_observations with references in the same order. Resolve each ID to its
@@ -980,6 +989,7 @@ class JointReader:
                     *[row['id'] for row in offer['observations']]]
         if frozen_reviews:
             item['properties']['reviewed_observation_ids']={'type':'array','items':{'type':'string'},'uniqueItems':True}
+        frozen_ids=data.get('repair_scope',{}).get('frozen_observation_ids',{})
         if requested:
             item['properties']['variable']['enum']=requested
             targets_by_variable={v:[r['id'] for r in data.get('known_observations',[]) if r['variable']==v]
@@ -1033,10 +1043,12 @@ class JointReader:
                 if frozen_reviews:
                     ids=frozen_reviews.get(variable,[])
                     properties['reviewed_observation_ids']=({'items':{'enum':ids}} if ids else {'maxItems':0})
-                    if ids:
-                        # IDs offered here identify immutable rows from this
-                        # batch, not ordinary known routes or other variables.
-                        observation.setdefault('properties',{})['id']={'not':{'enum':ids}}
+                # All immutable rows are forbidden ordinary restatements, even
+                # unknown/partial rows that cannot be offered as settled reviews.
+                # Retain the existing restriction for legacy offers-only inputs.
+                forbidden=sorted(set(frozen_ids.get(variable,[]))|set(frozen_reviews.get(variable,[])))
+                if forbidden:
+                    observation.setdefault('properties',{})['id']={'not':{'enum':forbidden}}
                 branches.append({'properties':properties})
             item['oneOf']=branches
         schema['properties']['slots'].update(minItems=len(requested),maxItems=len(requested))
@@ -1494,6 +1506,8 @@ class JointReader:
     @staticmethod
     def _system(data):
         system=SYSTEM+(COLUMNAR_INSTRUCTION if 'source_span_columns' in data else '')
+        if data.get('repair_scope',{}).get('frozen_observation_ids'):
+            system+=FROZEN_IDS_INSTRUCTION
         if any('obligation_review_sources' in entry or 'frozen_observation_reviews' in entry
                 for entry in data.get('repair_scope',{}).get('failed',[])):
             system+=OBLIGATION_REVIEW_INSTRUCTION
@@ -2764,6 +2778,14 @@ class JointReader:
                         **({'slot':deepcopy(observed_slots.get(v))} if rid=='*' else {})}
                         for (v,rid),error in sorted(failures.items())],
                         'attempt':attempt+1,'previous_response_identity':digest(previous)}}
+                # This is only the final current-batch frozen set, after source,
+                # whole-value and handoff failures have thawed editable drafts.
+                # Known routes and durable failed records grant no authority.
+                frozen_ids={v:sorted(rid for variable,rid in frozen if variable==v)
+                            for v in sorted(failed_variables)}
+                frozen_ids={v:ids for v,ids in frozen_ids.items() if ids}
+                if frozen_ids:
+                    current['repair_scope']['frozen_observation_ids']=frozen_ids
                 if 'audit_instruction' in data:
                     current['audit_instruction']=data['audit_instruction']
                 if data.get('failed_batch_reviews'):
