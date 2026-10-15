@@ -58,6 +58,18 @@ them. Failed-batch format recovery and source-issue settlement remain separate.
 '''
 
 
+WEB_WINDOW_INSTRUCTION = '''
+web_reading_context is controller bookkeeping, never evidence or review authority.
+new_window_source_ids identifies newly offered window text; retained_mandatory_source_ids
+identifies originals retained for existing facts/issues. Re-read required originals,
+but do not copy an unchanged old issue into a new observation or settlement claim.
+pending_source_issues stay unresolved without repetition. frozen_observations lists
+immutable current-batch rows, not permission to cite them as reviewed observations.
+Only explicit common review offers grant that permission. If new text adds no
+admissible observation, report no_relevant_evidence even while old issues persist.
+'''
+
+
 WEB_EMPTY_REPAIR_INSTRUCTION = '''
 This repair has only wildcard slot failures; no mandatory draft/counter/whole-value
 or durable review. With NO NEW observation, correct using
@@ -77,16 +89,95 @@ class WebJointReader(JointReader):
         self.web_paid_recoveries = []
         self._selected_web_paid_recovery = None
         self._active_web_paid_recovery = None
+        self.web_navigation_reads = []
 
     def _read(self, *args, **kwargs):
         # This mode authorizes one selected batch, never a later read/audit.
         self._selected_web_paid_recovery = None
         self._active_web_paid_recovery = None
+        first_gap, first_batch = len(self.web_search_gaps), len(self.batches)
+        first_exposure = len(self.source_exposures)
         try:
             return super()._read(*args, **kwargs)
         finally:
+            self._accept_navigation_reads(first_gap, first_batch, first_exposure)
             self._selected_web_paid_recovery = None
             self._active_web_paid_recovery = None
+
+    def _accept_navigation_reads(self, first_gap, first_batch, first_exposure):
+        """Archive completed empty slots as navigation hints, never facts."""
+        for batch in self.batches[first_batch:]:
+            # Valid rows accumulate across all attempts in the common reader.
+            # A final empty repair cannot turn an earlier frozen partial/fact
+            # into an empty batch. Conservatively suppress mixed-slot feedback.
+            if not batch.get('complete') or batch.get('valid_rows') != 0:
+                continue
+            source_ids = {self.e.mapper.sources[alias]['source_id']
+                          for alias in batch.get('visible_source_aliases', [])}
+            matching = [exposure for exposure in self.source_exposures[first_exposure:]
+                        if exposure['query_identity'] == batch['identity']
+                        and {source['source']['source_id'] if 'source' in source else source['source_id']
+                             for source in exposure['sources']} == source_ids]
+            if not matching or matching[-1].get('request_status') != 'returned':
+                continue
+            final_call = matching[-1]['logical_call_index']
+            for gap in self.web_search_gaps[first_gap:]:
+                if (gap['query_identity'] != batch['identity']
+                        or set(gap['source_ids']) != source_ids
+                        or gap['logical_call_index'] != final_call):
+                    continue
+                record = {**deepcopy(gap), 'doc_ids': list(dict.fromkeys(
+                    source['doc_id'] for source in self.e.mapper.sources.values()
+                    if source['source_id'] in source_ids))}
+                if record not in self.web_navigation_reads:
+                    self.web_navigation_reads.append(record)
+
+    def navigation_feedback(self, node_id, identity=None):
+        """Read-only, same-query feedback for choosing observed hyperlinks."""
+        query_identity = (identity if isinstance(identity, str) else digest(identity)
+                          if identity is not None else None)
+        reads = [deepcopy(row) for row in self.web_navigation_reads
+                 if row['task_id'] == node_id
+                 and (query_identity is None or row['query_identity'] == query_identity)]
+        return {'protocol': 'web_reading_feedback_v1',
+                'evidence_semantics': 'navigation_hints_not_facts',
+                'query_identity': query_identity,
+                'accepted_empty_reads': reads,
+                'assessed_doc_ids': list(dict.fromkeys(doc for row in reads for doc in row['doc_ids']))}
+
+    def _payload(self, step, query, variables, aliases, semantic=False, *, audit=False,
+                 proof_projection=False):
+        data = super()._payload(step, query, variables, aliases, semantic,
+                                audit=audit, proof_projection=proof_projection)
+        if self._search_gap_scope(data) and data.get('evidence_obligations'):
+            mandatory = super()._payload(step, query, variables, [], semantic,
+                                         audit=audit, proof_projection=proof_projection)
+            window = list(dict.fromkeys(aliases))
+            data['web_reading_context'] = {
+                'evidence_semantics': 'bookkeeping_not_facts', 'grants_review_authority': False,
+                'window_source_ids': window,
+                'new_window_source_ids': [alias for alias in window
+                                          if (self.current_identity, alias) not in self.read_states],
+                'retained_mandatory_source_ids': [source['id'] for source in mandatory['source_spans']],
+                'pending_source_issues': [
+                    {'obligation_id': issue['id'], 'source_ids': list(issue['source_ids']),
+                     'state': 'unresolved_controller_owned', 'ordinary_restatement_needed': False}
+                    for issue in data.get('evidence_obligations', [])]}
+        return data
+
+    def _wire_candidates(self, data):
+        # Frozen rows are established after the canonical payload is built.
+        # Add a lossless wire-only description; this grants no review offers.
+        wire_data = deepcopy(data)
+        if (self._search_gap_scope(wire_data)
+                and wire_data.get('repair_scope', {}).get('frozen_observation_ids')):
+            scope = wire_data['repair_scope']
+            wire_data.setdefault('web_reading_context', {})['frozen_observations'] = [
+                {'variable': variable, 'id': identifier,
+                 'immutable': True, 'grants_review_authority': False}
+                for variable, identifiers in scope.get('frozen_observation_ids', {}).items()
+                for identifier in identifiers]
+        return super()._wire_candidates(wire_data)
 
     @staticmethod
     def _search_gap_scope(data):
@@ -99,10 +190,17 @@ class WebJointReader(JointReader):
         system = JointReader._system(data) + WEB_ENTAILMENT_INSTRUCTION
         if WebJointReader._search_gap_scope(data):
             system += WEB_READING_INSTRUCTION
-            if data.get('repair_scope'):
+            if data.get('web_reading_context'):
+                system += WEB_WINDOW_INSTRUCTION
+            if data.get('repair_scope') or data.get('evidence_obligations'):
                 system += WEB_REPAIR_INSTRUCTION
+            if data.get('repair_scope'):
                 if WebJointReader._empty_repair_allowed(data):
                     system += WEB_EMPTY_REPAIR_INSTRUCTION
+        if 'audit_instruction' in data:
+            system += ('\nAudit must cover EVERY attribute requested by original_question and each '
+                       'output_contract.fields entry. Correct individual facts do not establish a '
+                       'complete terminal answer; withhold supported if an attribute is missing.\n')
         return system
 
     @staticmethod
@@ -301,6 +399,8 @@ class WebJointReader(JointReader):
         self._selected_web_headroom = None
         self._selected_web_paid_recovery = None
         self._active_web_paid_recovery = None
+        if operation == 'joint_read' and step.get('execution') == 'retrieval' and not semantic and not audit:
+            self._prioritize_discovery_regions(pending)
         try:
             aliases, consumed = super()._fitting_prefix(
                 operation, step, query, variables, pending, semantic, audit)
@@ -315,6 +415,22 @@ class WebJointReader(JointReader):
             return aliases, consumed
         finally:
             self._web_headroom_candidates = {}
+
+    def _prioritize_discovery_regions(self, pending):
+        """Schedule unoffered body text first without removing other work."""
+        ranks = {'main': 0, 'content': 0, 'navigation': 2, 'utility_ui': 3, 'hidden_ui': 4}
+        def priority(group):
+            source = self.e.mapper.sources[group[0]]
+            document = self.e.docs[source['doc_id']]
+            regions = document.metadata.get('web_regions', [])
+            overlap = [(max(0, min(source['end'], region['end']) - max(source['start'], region['start'])),
+                        ranks.get(region.get('role'), 1)) for region in regions]
+            return max(overlap, key=lambda item: item[0])[1] if overlap and max(x[0] for x in overlap) else 1
+        positions = [index for index, group in enumerate(pending)
+                     if group and (self.current_identity, group[0]) in self.discovery_frontier]
+        ordered = sorted((pending[index] for index in positions), key=priority)
+        for index, group in zip(positions, ordered):
+            pending[index] = group
 
     def _paid_recovery_prefix(self, operation, step, query, variables, pending, semantic, audit):
         """Try one paid old-draft review only after every full forecast fails.
@@ -471,4 +587,5 @@ class WebJointReader(JointReader):
                 'web_reading_protocol': 'required_typed_web_reading_v3',
                 'web_search_gaps': deepcopy(self.web_search_gaps),
                 'web_capacity_admissions': deepcopy(self.web_capacity_admissions),
-                'web_paid_recoveries': deepcopy(self.web_paid_recoveries)}
+                'web_paid_recoveries': deepcopy(self.web_paid_recoveries),
+                'web_navigation_reads': deepcopy(self.web_navigation_reads)}

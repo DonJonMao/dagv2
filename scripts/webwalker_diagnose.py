@@ -43,13 +43,16 @@ def diagnose(directory):
               'web_search_gaps': joint.get('web_search_gaps', []),
               'web_capacity_admissions': joint.get('web_capacity_admissions', []),
               'web_paid_recoveries': joint.get('web_paid_recoveries', []),
+              'web_navigation_reads': joint.get('web_navigation_reads', []),
               'unread_obligation_count': len(joint.get('unread_obligations', [])),
               'failed_obligation_count': len(joint.get('failed_obligations', [])),
               'planner_responses': [], 'reading_requests': [], 'key_events': []}
     path = directory / 'fusion_events.jsonl'
     keep = {'protocol_error', 'joint_repair_input_unavailable', 'reasoning_repair_exhausted',
             'reasoning_repair_preflight_failed', 'residual_action_incomplete',
-            'web_paid_recovery_blocked', 'web_paid_recovery_local_repair_blocked'}
+            'web_paid_recovery_blocked', 'web_paid_recovery_local_repair_blocked',
+            'web_task_turn_completed', 'web_document_window_yielded',
+            'web_document_window_resumed', 'web_navigation_window'}
     for line in path.read_text().splitlines() if path.exists() else []:
         event = json.loads(line)
         if event.get('event') in keep:
@@ -70,7 +73,7 @@ def diagnose(directory):
             try:
                 data = json.loads(event['messages'][1]['content'])
                 for key in ('source_spans', 'known_observations', 'evidence_obligations',
-                            'failed_batch_reviews', 'repair_scope'):
+                            'failed_batch_reviews', 'repair_scope', 'web_reading_context'):
                     value = data.get(key)
                     request[key + '_json_chars'] = len(json.dumps(value, ensure_ascii=False)) if value is not None else 0
                     if isinstance(value, list):
@@ -83,7 +86,7 @@ def diagnose(directory):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--output', default='outputs/webwalkerqa_v4_access_v4_smoke')
+    parser.add_argument('--output', default='outputs/webwalkerqa_v4_access_v5_smoke')
     parser.add_argument('--question', required=True)
     args = parser.parse_args()
     root = Path(args.output) / 'tasks' / args.question
