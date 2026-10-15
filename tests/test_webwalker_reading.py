@@ -376,6 +376,100 @@ def test_empty_gap_repair_does_not_unfreeze_or_erase_source_validated_unknown():
     assert any(row['id'] == 'frozen-unknown' and row['stance'] == 'unknown' for row in retained)
 
 
+def test_partial_resolution_claim_can_be_withdrawn_without_erasing_frozen_evidence():
+    issue = observation('original-partial', ['s1'], stance='partial',
+                        reason='The source establishes piano activity but leaves the date incomplete.')
+    issue['value'] = None
+    repeated = {**deepcopy(issue), 'id': 'new-window-partial'}
+    invalid_responses = []
+
+    def respond(index, data):
+        if index == 1:
+            return response(issue)
+        if index == 2:
+            result = response(repeated)
+            result['slots'][0]['resolved_obligation_ids'] = [data['evidence_obligations'][0]['id']]
+            invalid_responses.append(deepcopy(result))
+            return result
+        assert index == 3
+        assert data['repair_scope']['frozen_observation_ids'] == {'history': ['new-window-partial']}
+        assert [entry['id'] for entry in data['repair_scope']['failed']] == ['*']
+        assert not data.get('failed_batch_reviews')
+        return response()
+
+    reader, engine, state, calls = web_fixture(respond, max_repairs_per_request=1)
+    sources, limits, settings = deepcopy(engine.mapper.sources), deepcopy(engine.ledger.limits), deepcopy(engine.s)
+    read(reader, 'piano', 'original-partial-page')
+    original = deepcopy(reader.evidence_obligations)
+    assert len(original) == 1 and state.pending == {'history'}
+    obligation_id, obligation = next(iter(original.items()))
+
+    read(reader, 'painting', 'new-partial-page')
+
+    assert len(calls.requests) == engine.ledger.used['llm'] == 3
+    assert engine.ledger.used['json_repairs'] == 1
+    assert engine.ledger.limits == limits and engine.s == settings and engine.mapper.sources == sources
+    assert set(reader.evidence_obligations) == {obligation_id}
+    retained = reader.evidence_obligations[obligation_id]
+    assert retained['source_ids'] == obligation['source_ids'] == [sources['s1']['source_id']]
+    assert retained['descriptions'] == obligation['descriptions']
+    assert set(retained['origins']) == {'original-partial-page', 'new-partial-page'}
+    assert not state.routes and state.valid()[0] == {} and state.pending == {'history'}
+    assert not reader.failed_batch_reviews and not reader.failed_obligations
+    assert reader.batches[-1]['complete'] and not reader.batches[-1]['failed_slots']
+    # The legal empty envelope does not delete the partial row validated before
+    # the slot-level resolution error, nor turn that row into a supported fact.
+    rows = state.history[-1]['rows']
+    assert [(row['id'], row['stance'], row['value'], row['source_ids'], row['reason']) for row in rows] == [
+        ('new-window-partial', 'partial', None, [sources['s1']['source_id']], repeated['reason'])]
+    repair = calls.requests[2]
+    assert {source['id'] for source in repair['data']['source_spans']} == {'s1', 's2'}
+    system = repair['payload']['messages'][0]['content']
+    assert 'WEB REPAIR FIELD CHECK' in system
+    assert 'This repair has only wildcard slot failures' in system
+    assert 'the frozen rows and the controller\'s evidence obligations remain unchanged' in system
+    assert json.loads(engine.reasoner.requests[1]['raw_output']) == invalid_responses[0]
+    assert json.loads(engine.reasoner.requests[2]['raw_output']) == response()
+    assert len(reader.web_search_gaps) == 1
+
+
+@pytest.mark.parametrize('mandatory', ['named_draft', 'literal_star_draft', 'duplicate_drafts',
+                                     'replacement', 'counter', 'whole_value', 'raw_invalid_response',
+                                     'durable_recovery'])
+def test_empty_repair_hint_is_absent_when_original_drafts_or_reviews_are_mandatory(mandatory):
+    failed = {'variable': 'history', 'id': '*', 'feedback': 'Slot-level error.',
+              'observation': None, 'slot': response()['slots'][0]}
+    data = {'task': {'execution': 'retrieval'}, 'repair_scope': {'failed': [failed]}}
+    draft = observation('required-draft', ['s1'])
+    if mandatory == 'named_draft':
+        data['repair_scope']['failed'].append(
+            {'variable': 'history', 'id': draft['id'], 'feedback': 'Correct the original draft.',
+             'observation': draft})
+    elif mandatory == 'literal_star_draft':
+        failed['observation'] = {**draft, 'id': '*'}
+    elif mandatory == 'duplicate_drafts':
+        failed['observations'] = [draft]
+    elif mandatory == 'replacement':
+        failed['replacement_observations'] = [draft]
+    elif mandatory == 'counter':
+        failed['required_counter_observations'] = [
+            {**draft, 'stance': 'contradiction', 'value': None, 'retract_ids': ['original-route']}]
+    elif mandatory == 'whole_value':
+        data['repair_scope']['whole_value_reviews'] = [
+            {'variable': 'history', 'draft_observations': [draft]}]
+    elif mandatory == 'raw_invalid_response':
+        data['repair_scope']['invalid_response'] = '{"slots":[{"variable":"history","observations":['
+    else:
+        data['failed_batch_reviews'] = [{'id': 'earlier-failed-batch', 'review_allowed': True}]
+    before = deepcopy(data)
+
+    system = WebJointReader._system(data)
+
+    assert 'WEB REPAIR FIELD CHECK' in system
+    assert 'This repair has only wildcard slot failures' not in system
+    assert data == before
+
+
 @pytest.mark.parametrize('form', ['mixed_slot', 'top_level', 'duplicate_slots', 'malformed_list',
                                  'legacy_top_level', 'legacy_duplicate'])
 def test_invalid_gap_then_empty_gap_repair_cannot_erase_ordinary_unresolved_source(form):

@@ -1,4 +1,4 @@
-# WebWalkerQA v4 网站容错与协议修复实验包（access v3）
+# WebWalkerQA v4 网站容错与协议修复实验包（access v4）
 
 本包以你指定的 PersonaMem v4 实验包为安装基线，公共求解核心保持逐字节一致：
 
@@ -18,13 +18,13 @@
 
 ```bash
 cd ~/bt
-sha256sum -c dagbt_webwalker_v4_experiment.tar.gz.sha256
-mkdir -p ~/dagbt_patches/webwalker_v4_access_v3
-tar -xzf dagbt_webwalker_v4_experiment.tar.gz -C ~/dagbt_patches/webwalker_v4_access_v3
-bash ~/dagbt_patches/webwalker_v4_access_v3/dagbt_webwalker_v4_experiment/install_and_smoke.sh
+sha256sum -c dagbt_webwalker_v4_access_v4_experiment.tar.gz.sha256
+mkdir -p ~/dagbt_patches/webwalker_v4_access_v4
+tar -xzf dagbt_webwalker_v4_access_v4_experiment.tar.gz -C ~/dagbt_patches/webwalker_v4_access_v4
+bash ~/dagbt_patches/webwalker_v4_access_v4/dagbt_webwalker_v4_experiment/install_and_smoke.sh
 ```
 
-默认 Web 目标：`~/dagbt_runs/20261015_webwalker_v4_access_v3_experiment/dagv2`，与 PersonaMem 分开。
+默认 Web 目标：`~/dagbt_runs/20261015_webwalker_v4_access_v4_experiment/dagv2`，与 PersonaMem 分开。
 默认凭据来源：`~/dagbt_runs/20261014_personamem_v4_experiment/dagv2`。
 其他 Web 目录可作为第一个参数传入；来源目录用 `DAGBT_PERSONAMEM_BASE` 指定。
 不允许目标覆盖来源部署或嵌套在其目录中。Python 优先使用目标的 `.venv`，否则沿用
@@ -40,15 +40,22 @@ bash ~/dagbt_patches/webwalker_v4_access_v3/dagbt_webwalker_v4_experiment/instal
 ```bash
 export DAGBT_PYTHON="$HOME/dagbt_runs/20260930_v3/dagv2/.venv/bin/python"
 TASK_OLD="$HOME/dagbt_runs/20261015_webwalker_v4_access_v2_experiment/dagv2"
-TASK_NEW="$HOME/dagbt_runs/20261015_webwalker_v4_access_v3_experiment/dagv2"
+TASK_NEW="$HOME/dagbt_runs/20261015_webwalker_v4_access_v4_experiment/dagv2"
 mkdir -p "$TASK_NEW/_webwalker_browser_vendor" "$TASK_NEW/_webwalker_browsers"
 cp -a "$TASK_OLD/_webwalker_browser_vendor/." "$TASK_NEW/_webwalker_browser_vendor/"
 cp -a "$TASK_OLD/_webwalker_browsers/." "$TASK_NEW/_webwalker_browsers/"
-bash ~/dagbt_patches/webwalker_v4_access_v3/dagbt_webwalker_v4_experiment/install_and_smoke.sh "$TASK_NEW"
+bash ~/dagbt_patches/webwalker_v4_access_v4/dagbt_webwalker_v4_experiment/install_and_smoke.sh "$TASK_NEW"
 ```
 
 复制缓存后安装器仍检查缓存并实际启动浏览器；本次旧部署已安装 Playwright 1.56.0，系统动态库已安装时无需再执行 sudo。
 缓存不完整时按正常流程补下载。使用独立副本，避免浏览器安装时修改旧部署。
+
+若仍出现服务器最初报告的四个系统库缺失，先安装错误中指定的库，再重跑上述安装命令：
+
+```bash
+sudo apt-get update
+sudo apt-get install -y libatk1.0-0t64 libatspi2.0-0t64 libxdamage1 libasound2t64
+```
 
 默认下载隔离的 Playwright/Chromium，需要 PyPI 和浏览器 CDN 可访问。
 不修改原虚拟环境、不执行 sudo、不自动安装系统库；浏览器无法启动时明确失败。
@@ -61,7 +68,7 @@ bash ~/dagbt_patches/webwalker_v4_access_v3/dagbt_webwalker_v4_experiment/instal
 进入安装目标：
 
 ```bash
-cd ~/dagbt_runs/20261015_webwalker_v4_access_v3_experiment/dagv2
+cd ~/dagbt_runs/20261015_webwalker_v4_access_v4_experiment/dagv2
 bash scripts/run_webwalker.sh smoke
 ```
 
@@ -72,7 +79,7 @@ bash scripts/run_webwalker.sh smoke
 `stopped` 只表示手动停止，不代表 PersonaMem 全量完成；已发布结果保留。
 默认检查来源部署的 `outputs/personamem_v4_experiment_full`；其他输出可作为 smoke/full 的第二个参数传入。
 有失败题但已终止的 PersonaMem 允许开始，不要求 14 题全成功，也不停止旧实验。
-smoke 默认官方前两题、两组共四个任务，输出 `outputs/webwalkerqa_v4_access_v3_smoke`。
+smoke 默认官方前两题、两组共四个任务，输出 `outputs/webwalkerqa_v4_access_v4_smoke`。
 完成后评分；执行完成不等于答对。算法实验不以全题成功作为发行或全量启动条件。
 
 全量 680 题、两组共 1360 个任务：
@@ -80,7 +87,7 @@ smoke 默认官方前两题、两组共四个任务，输出 `outputs/webwalkerq
 ```bash
 bash scripts/run_webwalker.sh full
 bash scripts/run_webwalker.sh status
-tail -f outputs/webwalkerqa_v4_access_v3_full/launcher.log
+tail -f outputs/webwalkerqa_v4_access_v4_full/launcher.log
 ```
 
 全量预检要求模型与部署 tokenize 可用；首个网站仅作诊断，其访问失败不会否决全部题目。
@@ -92,14 +99,14 @@ tail -f outputs/webwalkerqa_v4_access_v3_full/launcher.log
 代码（含公共核心）、配置、数据、题目或方法变化会拒绝续写；重新实验使用新目录：
 
 ```bash
-export WEBWALKER_OUTPUT=outputs/webwalkerqa_v4_access_v3_second
+export WEBWALKER_OUTPUT=outputs/webwalkerqa_v4_access_v4_second
 bash scripts/run_webwalker.sh full
 ```
 
 停止指定 WebWalker 运行（只对身份匹配且持有 OS 锁的进程发信号）：
 
 ```bash
-bash scripts/run_webwalker.sh stop outputs/webwalkerqa_v4_access_v3_full
+bash scripts/run_webwalker.sh stop outputs/webwalkerqa_v4_access_v4_full
 ```
 
 停止不会停止 PersonaMem。Ctrl-C / SIGTERM 清理自己的 worker。
@@ -178,8 +185,8 @@ HTTP 403/429、网络错误或 200 验证页面会在有界 HTTP 尝试后回退
   HTTP 状态；`evaluation.json` 报告两组相同的计划题数、排除数、覆盖率与有效题准确率。
   `all_planned_accuracy_*` 另将被排除题按失败保留在原计划分母，供核对。全部跳过时
   有效题准确率为 null，不显示为 0 或 100%。所有已发生的请求成本仍统计。
-- 新协议和源码身份拒绝续写旧结果。默认安装到新的 `20261015_webwalker_v4_access_v3_experiment`
-  目录，输出也改为 `webwalkerqa_v4_access_v3_*`。已安装旧包时使用这个新目录，不覆盖旧的 access_v2 或 access_stopped 安装。
+- 新协议和源码身份拒绝续写旧结果。默认安装到新的 `20261015_webwalker_v4_access_v4_experiment`
+  目录，输出也改为 `webwalkerqa_v4_access_v4_*`。已安装旧包时使用这个新目录，不覆盖旧的 access_v2 或 access_stopped 安装。
 
 本地的容错测试通过不代表远端 Linux 上能绕过网站限制，也不代表已跑完整官方评测。
 
@@ -211,7 +218,7 @@ HTTP 403/429、网络错误或 200 验证页面会在有界 HTTP 尝试后回退
 
 ```bash
 "$DAGBT_PYTHON" scripts/webwalker_diagnose.py \
-  --output outputs/webwalkerqa_v4_access_v3_smoke --question wwqa-0001
+  --output outputs/webwalkerqa_v4_access_v4_smoke --question wwqa-0001
 ```
 
 它只读结果和调用记录，不读取凭据或参考答案。新版预检、回归、真实 smoke 结果以
@@ -242,4 +249,41 @@ HTTP 403/429、网络错误或 200 验证页面会在有界 HTTP 尝试后回退
 并声称解决义务，留下 1 段证据义务和 24 段失败批次原文，随后容量入场检查拒绝继续。
 没有再次发送超限修复请求，但任务级容量堵塞仍在，不能将新预检视为完整修复或效果通过。
 旧失败在相同文本上不能通过换身份获得额外尝试，恢复继续沿用核心的新证据/父版本和
-付费修复约束。当前建议暂缓全量；包内 `validation.json` 保留全部状态与局限。
+付费修复约束。当时据此暂缓全量；这是 access_v3 的历史状态。后续版本的执行验收与准确率应分别判断，详见下节。
+
+
+## access v4：修复提示与原文关系核对
+
+Linux 先前只完成失败的 smoke，尚未启动全量；没有后台全量结果可等待。
+access_v3 的本地两题也不能当成服务器全量结果。
+
+本版保留 access_v3 的容量预留修复；不修改公共核心、输出额度或请求次数。
+对修复请求明确区分可选的 `resolved_obligation_ids` 声明、必须保留的失败草稿 ID，以及
+冻结的 partial/unknown。`unresolved=[]` 只是 Web 响应格式，不表示旧疑点已经解决。
+仅在纯 wildcard 且没有必需草稿、counter、whole-value 或已授权持久恢复时，提示允许
+空的本次增量阅读；旧观察与义务继续保留，程序不自动改写模型输出。
+
+阅读与审计增加通用原文核对要求：不能把另一文档/政策/过程的陈述转移到请求对象，
+不能混淆文档日期与事件日期，不能用审批机构回答地理地点。它只是模型指令，
+并不是确定性语义验证器；不加入题目答案、目标链接或全局搜索。
+
+执行验收与答案成绩分别记录。离线/安装及真实请求核算通过后，可以启动固定协议的
+全量实验；不以 smoke 必须答对、必须消除所有预算/容量约束下的失败作为门槛。
+全量中模型连续违规、合法容量拒绝、预算用尽或答错都保留为失败及实际成本，不免费
+重跑或从分母排除。模型/规划/协议失败与网站不可达继续分别归因。
+当前版本的真实 smoke 与安装验证结果见 `validation.json`；它不保证准确率或方法优势。
+
+
+标准修复空间预测拒绝所有新窗口时，只对真正有新原文的旧失败恢复尝试一次受限入场：
+完整旧证据、草稿与新窗口必须先通过真实 wire 计数，首次请求仍消耗现有的 LLM 和 JSON
+修复额度。此作用域禁止再追加本地修复；成功才能显式解除相应失败记录，失败则完整保留
+待审材料与成本。没有新证据、额度不足或真实完整请求超限时仍拒绝，不换身份重试。
+
+`generation_summary.json` 从实际 `fusion_events.jsonl` 的物理成功响应统计 LLM token/耗时，
+并报告缺失 usage 数；缓存重放不会再次计入实际生成 token。旧版读错请求起始日志导致的
+零 token 汇总已修正，旧实验本身及其原始日志不被覆盖。
+
+全量要读取的结果：`progress.json` 核实 1360 任务是否全部终止；`evaluation.json` 比较两组
+共同可访问题集的准确率、有效题数和覆盖率；`generation_summary.json` 比较 LLM 请求、
+输入/输出 token、网页访问和耗时。保留网站排除数、失败类型及缺失成本，执行成功数不能
+替代准确率。完整统计只在生成全部终止、独立 judge 完成后解释。

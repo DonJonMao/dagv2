@@ -23,21 +23,21 @@ case "$TASK_MODE" in
     ;;
   preflight)
     "$TASK_PYTHON" -m dagbt.webwalker_runner preflight --config "$TASK_CONFIG" \
-      --after-personamem "$TASK_PERSONA" --output outputs/webwalkerqa_v4_access_v3_preflight
+      --after-personamem "$TASK_PERSONA" --output outputs/webwalkerqa_v4_access_v4_preflight
     ;;
   smoke)
-    TASK_OUTPUT="${WEBWALKER_OUTPUT:-outputs/webwalkerqa_v4_access_v3_smoke}"
+    TASK_OUTPUT="${WEBWALKER_OUTPUT:-outputs/webwalkerqa_v4_access_v4_smoke}"
     "$TASK_PYTHON" scripts/webwalker_offline_smoke.py
     "$TASK_PYTHON" -m dagbt.webwalker_runner preflight --config "$TASK_CONFIG" \
-      --after-personamem "$TASK_PERSONA" --output outputs/webwalkerqa_v4_access_v3_preflight
+      --after-personamem "$TASK_PERSONA" --output outputs/webwalkerqa_v4_access_v4_preflight
     "$TASK_PYTHON" -m dagbt.webwalker_runner run --config "$TASK_CONFIG" \
       --after-personamem "$TASK_PERSONA" --limit 2 --output "$TASK_OUTPUT"
     "$TASK_PYTHON" -m dagbt.webwalker_runner score --config "$TASK_JUDGE_CONFIG" --output "$TASK_OUTPUT"
     ;;
   full)
-    TASK_OUTPUT="${WEBWALKER_OUTPUT:-outputs/webwalkerqa_v4_access_v3_full}"
+    TASK_OUTPUT="${WEBWALKER_OUTPUT:-outputs/webwalkerqa_v4_access_v4_full}"
     "$TASK_PYTHON" -m dagbt.webwalker_runner preflight --config "$TASK_CONFIG" \
-      --after-personamem "$TASK_PERSONA" --output outputs/webwalkerqa_v4_access_v3_preflight
+      --after-personamem "$TASK_PERSONA" --output outputs/webwalkerqa_v4_access_v4_preflight
     "$TASK_PYTHON" -m dagbt.webwalker_runner status --output "$TASK_OUTPUT"
     mkdir -p "$TASK_OUTPUT"
     DAGBT_PYTHON="$TASK_PYTHON" WEBWALKER_OUTPUT="$TASK_OUTPUT" nohup bash "$0" _foreground "$TASK_PERSONA" \
@@ -47,13 +47,13 @@ case "$TASK_MODE" in
     echo "Use: bash scripts/run_webwalker.sh status"
     ;;
   _foreground)
-    TASK_OUTPUT="${WEBWALKER_OUTPUT:-outputs/webwalkerqa_v4_access_v3_full}"
+    TASK_OUTPUT="${WEBWALKER_OUTPUT:-outputs/webwalkerqa_v4_access_v4_full}"
     "$TASK_PYTHON" -m dagbt.webwalker_runner run --config "$TASK_CONFIG" \
       --after-personamem "$TASK_PERSONA" --output "$TASK_OUTPUT"
     "$TASK_PYTHON" -m dagbt.webwalker_runner score --config "$TASK_JUDGE_CONFIG" --output "$TASK_OUTPUT"
     ;;
   status)
-    "$TASK_PYTHON" -m dagbt.webwalker_runner status --output "${WEBWALKER_OUTPUT:-outputs/webwalkerqa_v4_access_v3_full}"
+    "$TASK_PYTHON" -m dagbt.webwalker_runner status --output "${WEBWALKER_OUTPUT:-outputs/webwalkerqa_v4_access_v4_full}"
     ;;
   stop)
     if [[ -z "${2:-}" ]]; then echo "Usage: $0 stop /path/to/webwalker/output" >&2; exit 2; fi
@@ -61,7 +61,7 @@ case "$TASK_MODE" in
     ;;
   score)
     "$TASK_PYTHON" -m dagbt.webwalker_runner score --config "$TASK_JUDGE_CONFIG" \
-      --output "${WEBWALKER_OUTPUT:-outputs/webwalkerqa_v4_access_v3_full}"
+      --output "${WEBWALKER_OUTPUT:-outputs/webwalkerqa_v4_access_v4_full}"
     ;;
   *) echo "Usage: $0 {offline|preflight|smoke|full|status|stop|score} [personamem_output]" >&2; exit 2 ;;
 esac

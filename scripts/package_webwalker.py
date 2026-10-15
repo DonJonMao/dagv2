@@ -37,6 +37,7 @@ def build(destination, wheel, validation=None):
                'tests/test_webwalker.py', 'tests/test_webwalker_runner.py', 'tests/test_webwalker_v4.py',
                'tests/test_webwalker_access.py', 'tests/test_webwalker_reasoning.py',
                'tests/test_webwalker_reading.py', 'tests/test_webwalker_diagnose.py',
+               'tests/test_webwalker_recovery.py',
                'tests/test_webwalker_typed_recovery.py',
                'scripts/webwalker_diagnose.py',
                *['data/webwalkerqa/' + p.name for p in (ROOT / 'data/webwalkerqa').iterdir() if p.is_file()]]
@@ -57,7 +58,7 @@ def build(destination, wheel, validation=None):
                 'baseline_source_sha256': baseline,
                 'payload_sha256': hashes, 'pdf_wheel': 'deps/' + wheel.name,
                 'pdf_wheel_sha256': sha(wheel), 'dataset': 'WebWalkerQA main 680 questions',
-                'protocol': 'provided_root_observed_link_traversal_v4_access_v3',
+                'protocol': 'provided_root_observed_link_traversal_v4_access_v4',
                 'access_policy': 'paired_root_unavailable_exclusion_v1',
                 'upstream_experiment_archive_sha256': '88b72a8e64b64ba4e33e806fb8023c3d24da333a1a467eb831b2e1dd47f9e4fc'}
     (bundle / 'bundle_manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + '\n')
@@ -66,7 +67,7 @@ def build(destination, wheel, validation=None):
     installer = '''#!/usr/bin/env bash
 set -euo pipefail
 TASK_BUNDLE="$(cd "$(dirname "$0")" && pwd)"
-TASK_TARGET="${1:-${DAGBT_TARGET:-$HOME/dagbt_runs/20261015_webwalker_v4_access_v3_experiment/dagv2}}"
+TASK_TARGET="${1:-${DAGBT_TARGET:-$HOME/dagbt_runs/20261015_webwalker_v4_access_v4_experiment/dagv2}}"
 TASK_PYTHON="${DAGBT_PYTHON:-}"
 if [[ -z "$TASK_PYTHON" ]]; then
   if [[ -x "$TASK_TARGET/.venv/bin/python" ]]; then
@@ -87,7 +88,7 @@ echo "Installed and offline-verified. With PersonaMem complete or cleanly stoppe
 '''
     (bundle / 'install_and_smoke.sh').write_text(installer)
     (bundle / 'install_and_smoke.sh').chmod(0o755)
-    archive = destination / (name + '.tar.gz')
+    archive = destination / 'dagbt_webwalker_v4_access_v4_experiment.tar.gz'
     with tarfile.open(archive, 'w:gz') as tar:
         tar.add(bundle, arcname=name)
     archive.with_suffix(archive.suffix + '.sha256').write_text(sha(archive) + '  ' + archive.name + '\n')

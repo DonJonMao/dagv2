@@ -42,12 +42,14 @@ def diagnose(directory):
               'failed_batch_reviews': [issue(item) for item in joint.get('failed_batch_reviews', [])],
               'web_search_gaps': joint.get('web_search_gaps', []),
               'web_capacity_admissions': joint.get('web_capacity_admissions', []),
+              'web_paid_recoveries': joint.get('web_paid_recoveries', []),
               'unread_obligation_count': len(joint.get('unread_obligations', [])),
               'failed_obligation_count': len(joint.get('failed_obligations', [])),
               'planner_responses': [], 'reading_requests': [], 'key_events': []}
     path = directory / 'fusion_events.jsonl'
     keep = {'protocol_error', 'joint_repair_input_unavailable', 'reasoning_repair_exhausted',
-            'reasoning_repair_preflight_failed', 'residual_action_incomplete'}
+            'reasoning_repair_preflight_failed', 'residual_action_incomplete',
+            'web_paid_recovery_blocked', 'web_paid_recovery_local_repair_blocked'}
     for line in path.read_text().splitlines() if path.exists() else []:
         event = json.loads(line)
         if event.get('event') in keep:
@@ -81,7 +83,7 @@ def diagnose(directory):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--output', default='outputs/webwalkerqa_v4_access_v3_smoke')
+    parser.add_argument('--output', default='outputs/webwalkerqa_v4_access_v4_smoke')
     parser.add_argument('--question', required=True)
     args = parser.parse_args()
     root = Path(args.output) / 'tasks' / args.question

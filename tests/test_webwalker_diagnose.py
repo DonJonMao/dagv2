@@ -15,6 +15,8 @@ def test_collector_reports_plans_obligations_and_costs_without_touching_files(tm
            'diagnostics': {'ledger': {'used': {'llm': 3}, 'events': [{'secret_unwanted_noise': True}]},
              'joint_reading': {'batches': [{'operation': 'joint_read', 'source_aliases': ['s1'],
                'visible_source_aliases': ['s1', 's2'], 'input_tokens': 120}],
+               'web_paid_recoveries': [{'policy': 'single_paid_durable_recovery_v1',
+                                         'additional_local_repairs_allowed': 0}],
                'evidence_obligations': [{'id': 'o1', 'variable': 'x', 'source_ids': ['s1', 's2'],
                                           'descriptions': ['Documented conflict remains.']}],
                'failed_batch_reviews': [{'id': 'f1', 'variable': 'x', 'source_ids': ['s1'],
@@ -25,7 +27,8 @@ def test_collector_reports_plans_obligations_and_costs_without_touching_files(tm
               {'event': 'reasoning_response', 'operation': 'joint_read', 'raw_output': '{"slots":[]}',
                'input_tokens_local': 120, 'messages': [{'role': 'system', 'content': 'Read.'},
                                                         {'role': 'user', 'content': json.dumps(wire)}]},
-              {'event': 'joint_repair_input_unavailable', 'input_tokens': 13000, 'context_tokens': 16384}]
+              {'event': 'joint_repair_input_unavailable', 'input_tokens': 13000, 'context_tokens': 16384},
+              {'event': 'web_paid_recovery_local_repair_blocked', 'reason': 'single_paid_response_already_attempted'}]
     (task / 'fusion_events.jsonl').write_text('\n'.join(json.dumps(e) for e in events))
     # These are intentionally not valid JSON and must never be opened.
     (tmp_path / 'credentials.local.json').write_text('PRIVATE_SENTINEL')
@@ -42,5 +45,7 @@ def test_collector_reports_plans_obligations_and_costs_without_touching_files(tm
     assert item['failed_batch_reviews'][0]['feedback'][0]['feedback'] == 'wrong alias'
     assert item['reading_requests'][0]['source_spans_count'] == 1
     assert item['key_events'][0]['input_tokens'] == 13000
+    assert item['key_events'][1]['reason'] == 'single_paid_response_already_attempted'
+    assert item['web_paid_recoveries'][0]['additional_local_repairs_allowed'] == 0
     assert 'PRIVATE_SENTINEL' not in result.stdout and 'ANSWER_SENTINEL' not in result.stdout
     assert before == {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in tmp_path.rglob('*') if p.is_file()}

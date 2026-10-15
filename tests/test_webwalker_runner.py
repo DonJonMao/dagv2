@@ -51,6 +51,30 @@ def test_existing_terminal_result_is_not_retried(monkeypatch, tmp_path):
     assert w.run_one(tmp_path, q, RESIDUAL, {}, 1) == row
 
 
+def test_summary_counts_physical_llm_usage_from_durable_journal_after_timeout(tmp_path):
+    row = {'unit_id': 'wwqa-0000', 'method': RESIDUAL,
+           'answer': {'status': 'failed', 'prediction': None}}
+    directory = w.task_path(tmp_path, row['unit_id'], RESIDUAL)
+    directory.mkdir(parents=True)
+    journal = [
+        {'event': 'http_response', 'kind': 'llm', 'usage': {'prompt_tokens': 100, 'completion_tokens': 12}, 'seconds': 2},
+        {'event': 'request_cache_hit', 'kind': 'llm'},
+        {'event': 'http_response', 'kind': 'embedding_http', 'usage': {'prompt_tokens': 99}, 'seconds': 1},
+        {'event': 'http_response', 'kind': 'llm', 'usage': None, 'seconds': 3},
+        {'event': 'web_http'}, {'event': 'web_browser_network'},
+    ]
+    (directory / 'fusion_events.jsonl').write_text(''.join(json.dumps(event) + '\n' for event in journal))
+    (directory / 'call_events.jsonl').write_text(json.dumps({'event': 'call_started', 'cache_hit': True}) + '\n')
+    (directory / 'tokenization_events.jsonl').write_text(json.dumps({'http_attempts': 2, 'seconds': 0.5}) + '\n')
+    report = w.summarize([row], [RESIDUAL], tmp_path)[RESIDUAL]
+    assert report['missing_cost_ledgers'] == 1 and report['execution_ok'] == 0
+    assert report['all_task_journal_costs'] == {
+        'tokenize_http_attempts': 2, 'tokenize_seconds': 0.5,
+        'llm_prompt_tokens': 100, 'llm_completion_tokens': 12, 'llm_response_seconds': 5,
+        'llm_successful_responses': 2, 'llm_responses_missing_usage': 1,
+        'web_http_attempts': 1, 'browser_network_requests': 1}
+
+
 def test_scoring_requires_complete_generation_before_answer_loader(monkeypatch, tmp_path):
     a = args(tmp_path)
     save(Path(a.output) / 'progress.json', {'state': 'running'})

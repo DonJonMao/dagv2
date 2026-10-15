@@ -31,7 +31,7 @@ from .webwalker_data import load_questions, load_references
 
 ROOT = Path(__file__).resolve().parents[1]
 ARMS = (JOINT, RESIDUAL)
-VERSION = 'webwalkerqa_root_traversal_v4_access_v3'
+VERSION = 'webwalkerqa_root_traversal_v4_access_v4'
 CORE_RELEASE = 'e6677081cdfb33c01db3aaa274a497168f314f78'
 ACCESS_POLICY = 'paired_root_unavailable_exclusion_v1'
 
@@ -426,7 +426,8 @@ def summarize(rows, arms, output=None):
                       'note': 'Execution success is not answer accuracy. Missing ledgers (e.g. hard timeout) retain partial traces and must not be treated as zero cost.'}
         if output is not None:
             counters = {'tokenize_http_attempts': 0, 'tokenize_seconds': 0, 'llm_prompt_tokens': 0,
-                        'llm_completion_tokens': 0, 'llm_response_seconds': 0, 'web_http_attempts': 0,
+                        'llm_completion_tokens': 0, 'llm_response_seconds': 0,
+                        'llm_successful_responses': 0, 'llm_responses_missing_usage': 0, 'web_http_attempts': 0,
                         'browser_network_requests': 0}
             for row in group:
                 directory = task_path(output, row['unit_id'], arm)
@@ -437,10 +438,20 @@ def summarize(rows, arms, output=None):
                         if filename == 'tokenization_events.jsonl':
                             counters['tokenize_http_attempts'] += event.get('http_attempts', 0)
                             counters['tokenize_seconds'] += event.get('seconds', 0)
-                        elif filename == 'call_events.jsonl' and event.get('event') == 'http_response':
+                        # Transport's Ledger sink writes completed physical
+                        # responses to fusion_events, including before a hard
+                        # worker timeout. call_events contains request starts;
+                        # cache replays must not add paid token usage again.
+                        elif (filename == 'fusion_events.jsonl' and event.get('event') == 'http_response'
+                              and event.get('kind') == 'llm'):
                             usage = event.get('usage') or {}
-                            counters['llm_prompt_tokens'] += usage.get('prompt_tokens', 0)
-                            counters['llm_completion_tokens'] += usage.get('completion_tokens', 0)
+                            counters['llm_successful_responses'] += 1
+                            if (isinstance(usage, dict) and all(type(usage.get(k)) is int and usage[k] >= 0
+                                    for k in ('prompt_tokens', 'completion_tokens'))):
+                                counters['llm_prompt_tokens'] += usage['prompt_tokens']
+                                counters['llm_completion_tokens'] += usage['completion_tokens']
+                            else:
+                                counters['llm_responses_missing_usage'] += 1
                             counters['llm_response_seconds'] += event.get('seconds', 0)
                         elif filename == 'fusion_events.jsonl' and event.get('event') == 'web_http':
                             counters['web_http_attempts'] += 1
@@ -589,7 +600,7 @@ def main(argv=None):
         p = sub.add_parser(name)
         p.add_argument('--config', default='configs/webwalker-v4.json')
         p.add_argument('--data', default='data/webwalkerqa')
-        p.add_argument('--output', default='outputs/webwalkerqa_v4_access_v3')
+        p.add_argument('--output', default='outputs/webwalkerqa_v4_access_v4')
         if name != 'score':
             p.add_argument('--after-personamem')
         if name in ('run', 'launch'):
@@ -598,7 +609,7 @@ def main(argv=None):
         if name == 'preflight':
             p.add_argument('--offline', action='store_true')
     p = sub.add_parser('status')
-    p.add_argument('--output', default='outputs/webwalkerqa_v4_access_v3')
+    p.add_argument('--output', default='outputs/webwalkerqa_v4_access_v4')
     p = sub.add_parser('stop')
     p.add_argument('--output', required=True)
     p = sub.add_parser('_worker', help=argparse.SUPPRESS)
