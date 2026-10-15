@@ -26,7 +26,8 @@ def observation(identifier='history-1', sources=('s1',), value=None, **changes):
 
 
 def response(*rows):
-    return {'slots': [{'variable': 'history', 'observations': list(rows), 'unresolved': []}]}
+    return {'slots': [{'variable': 'history', 'observations': list(rows), 'unresolved': [],
+                       'reading_status': 'evidence_assessment' if rows else 'no_relevant_evidence'}]}
 
 
 def expand_wire_data(data):
@@ -91,7 +92,7 @@ def web_fixture(respond=None, **settings):
 
 def gap_response(text='Continue to an unvisited archive.'):
     return {'slots': [{'variable': 'history', 'observations': [], 'unresolved': [],
-                       'search_gaps': [text]}]}
+                       'reading_status': 'no_relevant_evidence', 'search_gaps': [text]}]}
 
 
 def read(reader, doc='piano', identity='local-web'):
@@ -117,6 +118,132 @@ def test_explicit_gap_keeps_raw_archive_without_binding_or_retaining_old_page():
     assert 'personal_response_selection' not in calls.requests[0]['data']
 
 
+def test_required_no_evidence_disposition_without_optional_gap_is_recorded_and_creates_no_fact():
+    value = response()
+    reader, _, state, calls = web_fixture(lambda i, data: value)
+    read(reader)
+    assert len(calls.requests) == 1 and not state.valid()[0] and not state.pending
+    assert not reader.evidence_obligations and not reader.failed_batch_reviews
+    assert reader.web_search_gaps[0]['reading_status'] == 'no_relevant_evidence'
+    assert reader.web_search_gaps[0]['search_gaps'] == []
+
+
+@pytest.mark.parametrize('status', [None, 'unknown_status', True])
+def test_missing_or_invalid_status_cannot_silently_pass_legacy_empty_shape(status):
+    initial = response()
+    if status is None:
+        del initial['slots'][0]['reading_status']
+    else:
+        initial['slots'][0]['reading_status'] = status
+    reader, engine, state, calls = web_fixture(
+        lambda i, data: initial if i == 1 else response(), max_repairs_per_request=1)
+    read(reader)
+    assert len(calls.requests) == 2 and engine.ledger.used['json_repairs'] == 1
+    assert json.loads(engine.reasoner.requests[0]['raw_output']) == initial
+    assert not state.valid()[0] and not state.pending
+    assert not reader.failed_batch_reviews and len(reader.web_search_gaps) == 1
+    assert calls.requests[1]['data']['repair_scope']['failed']
+
+
+def test_named_sourced_unknown_retains_only_its_actual_source_in_multi_document_window():
+    row = observation('source-ambiguity', ['s1'], stance='unknown', reason='The stated activity has an ambiguous date.')
+    row['value'] = None
+    reader, engine, state, calls = web_fixture(lambda i, data: response(row))
+    reader.read(engine.steps[0], 'Find activity evidence', ['history'], list(engine.docs), 'multi-page',
+                discovery_doc_ids=list(engine.docs))
+    assert len(calls.requests[0]['data']['source_spans']) == 3
+    obligation = next(iter(reader.evidence_obligations.values()))
+    assert obligation['source_ids'] == [engine.mapper.sources['s1']['source_id']]
+    assert state.pending == {'history'} and not state.valid()[0]
+    retained = reader._payload(engine.steps[0], 'query', ['history'], [])
+    assert [source['id'] for source in retained['source_spans']] == ['s1']
+
+
+def test_typed_evidence_requires_sources_and_cannot_discard_named_draft_via_empty_repair():
+    row = observation('source-free', [], stance='unknown', reason='Unknown without an original source.')
+    row['value'] = None
+    reader, engine, state, calls = web_fixture(
+        lambda i, data: response(row) if i == 1 else response(), max_repairs_per_request=1)
+    read(reader)
+    assert len(calls.requests) == 2 and not state.valid()[0] and state.pending == {'history'}
+    assert reader.failed_batch_reviews
+    assert any(failure['id'] == 'source-free' for record in reader.failed_batch_reviews.values()
+               for failure in record['failed'])
+
+
+def test_typed_frozen_reference_only_repair_preserves_offered_source_review_without_new_rows():
+    reader, engine, state, calls = web_fixture(max_repairs_per_request=2)
+    good = observation('already-valid', ['s1'])
+    invalid = observation('repair-this', ['invented-source'])
+    corrected = observation('repair-this', ['s1'])
+    def respond(index, data):
+        if index == 1:
+            return response(good, invalid)
+        if index == 2:
+            return response(good, corrected)  # The frozen restatement needs a bounded slot repair.
+        offers = data['repair_scope']['failed'][0]['frozen_observation_reviews']
+        ids = offers['slot_observation_ids'] + [row['id'] for row in offers['observations']]
+        return {'slots': [{'variable': 'history', 'reading_status': 'evidence_assessment',
+                           'observations': [], 'unresolved': [], 'reviewed_observation_ids': ids}]}
+    calls.respond = respond
+    read(reader)
+    assert len(calls.requests) == 3 and engine.ledger.used['json_repairs'] == 2
+    assert state.valid()[0]['history'] == ['piano'] and not state.pending
+    assert not reader.failed_batch_reviews
+    assert calls.requests[-1]['data']['repair_scope']['failed'][0]['frozen_observation_reviews']
+
+
+def test_reference_only_repair_resolves_obligation_using_exact_current_frozen_sources():
+    reader, engine, state, calls = web_fixture(max_repairs_per_request=2)
+    issue = observation('original-issue', ['s1', 's2'], stance='unknown', reason='The two original dates need review.')
+    issue['value'] = None
+    good = observation('first-review', ['s1'])
+    invalid = observation('second-review', ['not-visible'])
+    corrected = observation('second-review', ['s2'])
+    def respond(index, data):
+        if index == 1:
+            return response(issue)
+        oid = data['evidence_obligations'][0]['id']
+        if index in (2, 3):
+            result = response(good, invalid if index == 2 else corrected)
+            result['slots'][0]['resolved_obligation_ids'] = [oid]
+            return result
+        offers = next(entry['frozen_observation_reviews'] for entry in data['repair_scope']['failed']
+                      if 'frozen_observation_reviews' in entry)
+        references = offers['slot_observation_ids'] + [row['id'] for row in offers['observations']]
+        return {'slots': [{'variable': 'history', 'reading_status': 'evidence_assessment',
+                           'observations': [], 'unresolved': [], 'reviewed_observation_ids': references,
+                           'resolved_obligation_ids': [oid]}]}
+    calls.respond = respond
+    reader.read(engine.steps[0], 'Review activity dates', ['history'], ['piano', 'painting'],
+                'initial-issue', discovery_doc_ids=['piano', 'painting'])
+    assert reader.evidence_obligations and state.pending == {'history'}
+    reader.read(engine.steps[0], 'Review activity dates', ['history'], ['piano', 'painting'],
+                'explicit-source-review', discovery_doc_ids=['piano', 'painting'])
+    assert len(calls.requests) == 4 and engine.ledger.used['json_repairs'] == 2
+    assert not reader.evidence_obligations and not reader.failed_batch_reviews and not state.pending
+    assert state.valid()[0]['history'] == ['piano']
+    assert json.loads(engine.reasoner.requests[-1]['raw_output'])['slots'][0]['observations'] == []
+
+
+def test_missing_status_does_not_bypass_source_validated_counter_capture():
+    reader, engine, state, calls = web_fixture(max_repairs_per_request=1)
+    state.integrate([reader._observation(observation(), 'history', visible(reader), engine.steps[0])])
+    route = next(iter(state.routes))
+    counter = observation('counter-without-status', ['s2'], stance='contradiction', retract_ids=[route])
+    counter['value'] = None
+    initial = response(counter)
+    del initial['slots'][0]['reading_status']
+    calls.respond = lambda i, data: initial if i == 1 else response()
+    read(reader, 'painting')
+    assert len(calls.requests) == 2 and state.pending == {'history'}
+    protected = [draft for record in reader.failed_batch_reviews.values()
+                 for failure in record['failed'] for draft in failure.get('required_counter_observations', [])]
+    assert any(draft['id'] == counter['id'] and draft['retract_ids'] == [route] for draft in protected)
+    assert json.loads(engine.reasoner.requests[0]['raw_output']) == initial
+    assert not state.routes[route]['revoked']
+
+
 @pytest.mark.parametrize('message', ['Not found in this page.', '本页没有答案。', 'Conflicting dates remain.'])
 def test_legacy_unresolved_is_never_reclassified_by_its_text(message):
     value = {'slots': [{'variable': 'history', 'observations': [], 'unresolved': [message]}]}
@@ -132,7 +259,6 @@ def test_new_gap_never_discharges_real_sourced_issue_or_restored_obligation():
     issue = response(observation('ambiguous', ['s1'], stance='unknown', value=None,
                                  reason='The original source leaves its date ambiguous.'))
     issue['slots'][0]['observations'][0]['value'] = None
-    issue['slots'][0]['unresolved'] = ['Resolve the ambiguity in this source.']
     reader, engine, state, calls = web_fixture(lambda i, data: issue if i == 1 else gap_response())
     read(reader)
     obligations = deepcopy(reader.obligation_snapshot())
@@ -265,6 +391,7 @@ def test_invalid_gap_then_empty_gap_repair_cannot_erase_ordinary_unresolved_sour
         initial['slots'][0]['unresolved'].append(7)
     elif form.startswith('legacy_'):
         initial['slots'][0].pop('search_gaps')
+        initial['slots'][0].pop('reading_status')
         if form == 'legacy_top_level':
             initial['invalid_envelope'] = True
         else:
@@ -405,6 +532,7 @@ def test_multiple_empty_pages_continue_to_observed_target_or_finish_without_fals
                             **data['requested_scopes']['p'], 'parent_versions': {}, 'retract_ids': [],
                             'reason': 'Explicit project statement.'}]
                 slot = {'variable': 'p', 'observations': row, 'unresolved': []}
+                slot['reading_status'] = 'evidence_assessment' if row else 'no_relevant_evidence'
                 if not row: slot['search_gaps'] = ['Follow another observed project link.']
                 value = {'slots': [slot]}
             return {'response_ref': 'offline-' + str(len(self.requests)),

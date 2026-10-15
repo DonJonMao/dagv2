@@ -226,7 +226,10 @@ def test_web_semantic_terminal_and_audit_are_actual_model_calls(website, monkeyp
                                                        if b['demand'] in parents},
                                    'retract_ids': [], 'reason': 'The source names the project package.'}
                     rows = [] if stage[0] == 'audit_joint' else [observation]
-                    slots.append({'variable': variable, 'observations': rows, 'unresolved': []})
+                    slot = {'variable': variable, 'observations': rows, 'unresolved': []}
+                    if stage[0].startswith('joint_read') and data['task']['execution'] == 'retrieval':
+                        slot['reading_status'] = ('evidence_assessment' if rows else 'no_relevant_evidence')
+                    slots.append(slot)
                 value = {'slots': slots}
                 if stage[0] == 'semantic_compose':
                     value.update(semantic_answer=answer, final_prediction=answer)

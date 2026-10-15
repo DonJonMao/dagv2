@@ -37,6 +37,7 @@ def build(destination, wheel, validation=None):
                'tests/test_webwalker.py', 'tests/test_webwalker_runner.py', 'tests/test_webwalker_v4.py',
                'tests/test_webwalker_access.py', 'tests/test_webwalker_reasoning.py',
                'tests/test_webwalker_reading.py', 'tests/test_webwalker_diagnose.py',
+               'tests/test_webwalker_typed_recovery.py',
                'scripts/webwalker_diagnose.py',
                *['data/webwalkerqa/' + p.name for p in (ROOT / 'data/webwalkerqa').iterdir() if p.is_file()]]
     hashes = {}

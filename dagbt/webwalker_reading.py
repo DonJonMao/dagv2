@@ -11,22 +11,32 @@ from .transport import digest
 
 
 WEB_READING_INSTRUCTION = '''
-Web navigation distinguishes finding no evidence from finding unresolved evidence.
-For a page/window with NO relevant factual observation, return observations=[] and
-unresolved=[]; optionally put untried navigation directions or missing search
-targets in search_gaps. search_gaps is allowed ONLY on an otherwise empty-evidence
-retrieval slot. It creates no fact, proof, source obligation or resolution claim.
-Do not emit a source-cited unknown observation, or slot.unresolved, merely to say
-that this page did not contain the answer. The next local bridge can continue.
-If the original text establishes a partial fact, counter, conflict, ambiguity,
-missing required part of an otherwise proposed answer, or another concrete
-unresolved evidence issue, keep the ordinary sourced observations/unresolved
-protocol. Never move such an issue to search_gaps. Existing evidence obligations,
-failed drafts, frozen observations and source/counter review requirements remain
-mandatory; search_gaps cannot discharge or reclassify them. Do not restate frozen
-unknown/partial observations. An empty-evidence slot claims no review resolution.
-search_gaps is forbidden during terminal composition and audit. A search gap is
-neither evidence of a negative fact nor evidence that all directions are exhausted.
+REQUIRED WEB RETRIEVAL PROTOCOL: each requested slot must declare reading_status.
+Use no_relevant_evidence when this window has no relevant factual observation:
+observations=[], unresolved=[], no resolution/review IDs. search_gaps optionally
+lists untried directions. Example for requested variable v, when the page only
+contains unrelated navigation:
+{"slots":[{"variable":"v","reading_status":"no_relevant_evidence","observations":[],"unresolved":[],"search_gaps":["Follow another observed category link."]}]}
+No-relevant-evidence is a search result, never a negative fact or proof of absence.
+Use evidence_assessment for one or more original-source-cited ordinary observations.
+A concrete incomplete statement, ambiguity or conflict must be a named partial/
+unknown observation with its exact source_ids and reason, not bare slot.unresolved.
+For BOTH statuses unresolved MUST be []. Do not cite a whole window as unknown
+merely because it does not contain the answer. The next local bridge can continue.
+Only a genuine textual issue needs a sourced partial/unknown observation.
+Existing evidence obligations, failed drafts and counters remain mandatory. To
+resolve a previously offered issue, use evidence_assessment and explicitly review
+its original text with sourced supported/corrective/irrelevant observations and
+the offered resolution ID. A genuinely irrelevant original-source review may
+cover an earlier absence-only issue; never label a real partial fact, supporting
+text or counter irrelevant just to close it. Cover every required original source.
+An empty slot never resolves a prior issue. Preserve every required failed draft ID.
+Do not restate frozen observations. In a repair, evidence_assessment may instead
+use the currently offered reviewed_observation_ids for immutable sourced rows;
+those existing references still require the common source and resolution checks.
+No-relevant-evidence forbids these review/resolution claims. search_gaps is only
+allowed for no_relevant_evidence. Terminal composition and audit use the ordinary
+protocol without reading_status or search_gaps.
 '''
 
 
@@ -46,7 +56,8 @@ class WebJointReader(JointReader):
 
     @staticmethod
     def _system(data):
-        return JointReader._system(data) + WEB_READING_INSTRUCTION
+        system = JointReader._system(data)
+        return system + WEB_READING_INSTRUCTION if WebJointReader._search_gap_scope(data) else system
 
     @staticmethod
     def _schema(data):
@@ -54,6 +65,11 @@ class WebJointReader(JointReader):
         if not WebJointReader._search_gap_scope(data):
             return schema
         slot = schema['properties']['slots']['items']
+        slot['properties']['reading_status'] = {
+            'type': 'string', 'enum': ['no_relevant_evidence', 'evidence_assessment']}
+        slot['required'].append('reading_status')
+        slot['properties']['unresolved']['maxItems'] = 0
+        slot['properties']['observations']['items']['properties']['source_ids']['minItems'] = 1
         slot['properties']['search_gaps'] = {
             'type': 'array', 'minItems': 1,
             'items': {'type': 'string', 'minLength': 1},
@@ -62,63 +78,91 @@ class WebJointReader(JointReader):
                  ('observations', 'unresolved', 'resolved_obligation_ids',
                   'resolved_failed_batch_ids', 'reviewed_observation_ids')
                  if key in slot['properties']}
+        evidence = [{'properties': {'observations': {'minItems': 1}}}]
+        if 'reviewed_observation_ids' in slot['properties']:
+            evidence.append({'required': ['reviewed_observation_ids'],
+                             'properties': {'reviewed_observation_ids': {'minItems': 1}}})
         slot.setdefault('allOf', []).append({
-            'if': {'required': ['search_gaps']},
-            'then': {'properties': empty}})
+            'if': {'properties': {'reading_status': {'const': 'no_relevant_evidence'}}},
+            'then': {'properties': empty},
+            'else': {'anyOf': evidence, 'not': {'required': ['search_gaps']}}})
         return schema
 
     @staticmethod
     def _gap_response(response, data):
-        """Decode only a structurally valid empty-evidence extension.
+        """Decode the required typed retrieval disposition without new facts.
 
         Invalid extensions remain on the original response. The core therefore
         captures its observation/counter drafts before rejecting the envelope,
         instead of an adapter exception bypassing that mandatory capture.
         """
-        if (not WebJointReader._search_gap_scope(data) or not isinstance(response, dict)
+        if not WebJointReader._search_gap_scope(data):
+            return response, []
+        rejected = deepcopy(response)
+        if isinstance(rejected, dict) and isinstance(rejected.get('slots'), list):
+            for slot in rejected['slots']:
+                if isinstance(slot, dict) and 'reading_status' not in slot:
+                    # The unmodified legacy shape would otherwise pass core
+                    # validation. An undeclared adapter marker rejects it only
+                    # AFTER the core has captured every named/counter draft.
+                    slot['web_reading_protocol_error'] = 'Required reading_status is missing'
+        if (not isinstance(response, dict)
                 or set(response) - {'slots', 'final_prediction', 'semantic_answer', 'audit_verdict'}
                 or not isinstance(response.get('slots'), list)):
-            return response, []
+            return rejected, []
         if ('final_prediction' in response
                 and response['final_prediction'] is not None
                 and not isinstance(response['final_prediction'], str)):
-            return response, []
+            return rejected, []
         if ('audit_verdict' in response
                 and response['audit_verdict'] not in ('supported', 'unknown', 'conflict')):
-            return response, []
+            return rejected, []
         requested = set(data['variables'])
         seen, records = set(), []
         required = {'variable', 'observations', 'unresolved'}
         reviews = {'resolved_obligation_ids', 'resolved_failed_batch_ids', 'reviewed_observation_ids'}
-        allowed = required | reviews | {'search_gaps'}
+        allowed = required | reviews | {'search_gaps', 'reading_status'}
         for slot in response['slots']:
             if (not isinstance(slot, dict) or not required <= set(slot) or set(slot) - allowed
                     or not isinstance(slot.get('variable'), str)
                     or slot['variable'] not in requested or slot['variable'] in seen
                     or not isinstance(slot['observations'], list)
                     or not isinstance(slot['unresolved'], list)
-                    or any(not isinstance(gap, str) for gap in slot['unresolved'])):
-                return response, []
+                    or slot['unresolved']):
+                return rejected, []
             seen.add(slot['variable'])
             for key in reviews & set(slot):
                 values = slot[key]
                 if (not isinstance(values, list) or any(not isinstance(value, str) for value in values)
                         or len(set(values)) != len(values)):
-                    return response, []
-            if 'search_gaps' not in slot:
-                continue
-            gaps = slot['search_gaps']
-            if (not isinstance(gaps, list) or not gaps
-                    or any(not isinstance(gap, str) or not gap.strip() for gap in gaps)
-                    or slot['observations'] or slot['unresolved']
-                    or any(slot.get(key) for key in reviews)):
-                return response, []
-            records.append({'variable': slot['variable'], 'search_gaps': deepcopy(gaps)})
-        if seen != requested or not records:
-            return response, []
+                    return rejected, []
+            status = slot.get('reading_status')
+            if status == 'no_relevant_evidence':
+                gaps = slot.get('search_gaps', [])
+                if (not isinstance(gaps, list)
+                        or ('search_gaps' in slot and not gaps)
+                        or any(not isinstance(gap, str) or not gap.strip() for gap in gaps)
+                        or slot['observations'] or any(slot.get(key) for key in reviews)):
+                    return rejected, []
+                records.append({'variable': slot['variable'], 'reading_status': status,
+                                'search_gaps': deepcopy(gaps)})
+            elif status == 'evidence_assessment':
+                rows = slot['observations']
+                references = slot.get('reviewed_observation_ids', [])
+                if ('search_gaps' in slot or (not rows and not references)
+                        or any(not isinstance(row, dict)
+                               or not isinstance(row.get('source_ids'), list) or not row['source_ids']
+                               or any(not isinstance(source, str) or not source for source in row['source_ids'])
+                               for row in rows)):
+                    return rejected, []
+            else:
+                return rejected, []
+        if seen != requested:
+            return rejected, []
         decoded = deepcopy(response)
         for slot in decoded['slots']:
             slot.pop('search_gaps', None)
+            slot.pop('reading_status')
         return decoded, records
 
     def _web_headroom(self, operation, data, *, fresh_sources=True):
@@ -231,6 +275,6 @@ class WebJointReader(JointReader):
         # them in obligation_snapshot(): the core hashes that behavioral state
         # when deciding whether a read made progress.
         return {**super().public_dict(),
-                'web_reading_protocol': 'explicit_empty_evidence_search_gap_v1',
+                'web_reading_protocol': 'required_typed_web_reading_v1',
                 'web_search_gaps': deepcopy(self.web_search_gaps),
                 'web_capacity_admissions': deepcopy(self.web_capacity_admissions)}

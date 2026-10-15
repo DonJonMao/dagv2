@@ -102,8 +102,10 @@ class Model:
                                  if v['demand'] in next(s['inputs'] for s in plan()['steps']
                                                        if s['output_slot'] == data['variables'][variable]['demand'])},
                              'retract_ids': [], 'reason': 'Explicit page statement'}]
-                slots.append({'variable': variable, 'observations': rows,
-                              'unresolved': []})
+                slot = {'variable': variable, 'observations': rows, 'unresolved': []}
+                if operation.startswith('joint_read') and data['task']['execution'] == 'retrieval':
+                    slot['reading_status'] = ('evidence_assessment' if rows else 'no_relevant_evidence')
+                slots.append(slot)
             value = {'slots': slots}
             if operation.startswith('audit_joint'):
                 value['audit_verdict'] = 'supported'
