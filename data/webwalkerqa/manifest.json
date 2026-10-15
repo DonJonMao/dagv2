@@ -1,0 +1,18 @@
+{
+  "schema": "webwalkerqa_main_root_traversal_v1",
+  "source": "https://huggingface.co/datasets/callanwu/WebWalkerQA/resolve/c7ab3329a2a4a35ca569fdca369b61a3d1787e5b/data/main-00000-of-00001.jsonl",
+  "revision": "c7ab3329a2a4a35ca569fdca369b61a3d1787e5b",
+  "raw_sha256": "cbe95d9de714ef52fe4a9ddf160dfab462407cb1ba526f1c31b4305ca32c34cb",
+  "questions": 680,
+  "questions_sha256": "27df0fd12be23f74a98a5f70303d9aff51843a069c91d37ae782cdb3dce7fadd",
+  "evaluation_sha256": "9dbb33c9fa5d24698ed1df3ab760fe7fa0f1c37920dff99bdf776335c3080c1e",
+  "generation_fields": [
+    "id",
+    "question",
+    "root_url"
+  ],
+  "oracle_fields_for_evaluation_only": [
+    "answer",
+    "info"
+  ]
+}
