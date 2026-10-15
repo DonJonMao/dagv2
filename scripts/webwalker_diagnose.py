@@ -81,7 +81,7 @@ def diagnose(directory):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--output', default='outputs/webwalkerqa_v4_access_v2_smoke')
+    parser.add_argument('--output', default='outputs/webwalkerqa_v4_access_v3_smoke')
     parser.add_argument('--question', required=True)
     args = parser.parse_args()
     root = Path(args.output) / 'tasks' / args.question

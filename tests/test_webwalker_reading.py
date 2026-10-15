@@ -455,6 +455,153 @@ def test_headroom_selects_smaller_untrimmed_prefix_without_spending_calls_or_rep
     assert not reader._web_headroom_candidates and not reader.web_capacity_admissions
 
 
+def test_new_window_after_real_failed_batch_keeps_repair_headroom_and_all_mandatory_state():
+    unknown = observation('old-source-issue', ['s1'], stance='unknown',
+                          reason='The original text leaves the relevant time ambiguous.')
+    unknown['value'] = None
+    invalid = observation('old-failed-draft', ['nonexistent-source'])
+    first = response(unknown, invalid)
+    reader, engine, state, calls = web_fixture(
+        lambda index, data: deepcopy(first) if index <= 3 else gap_response(),
+        reasoning_output_tokens=4096, max_repairs_per_request=2)
+    read(reader, 'piano', 'original-failed-read')
+    assert len(calls.requests) == 3 and reader.failed_batch_reviews and reader.evidence_obligations
+    retained = deepcopy(reader.failed_batch_reviews)
+    required = deepcopy(reader.evidence_obligations)
+    old_source = engine.mapper.sources['s1']['source_id']
+    assert any(old_source in record['source_ids'] for record in retained.values())
+    assert any(old_source in issue['source_ids'] for issue in required.values())
+    before_sources = deepcopy(engine.mapper.sources)
+    before_limits, before_settings = deepcopy(engine.ledger.limits), deepcopy(engine.s)
+    before_calls = len(calls.requests)
+    # This counter measures complete production payloads at an exact controlled
+    # boundary. Three visible original spans exceed the existing unknown-draft
+    # workspace; two fit. Old failure records are obtained through a real read,
+    # rather than installed by mutating the reader's private state.
+    calls.count_reasoning_tokens = ExactCounts()
+    reader.read(engine.steps[0], 'Find activity evidence', ['history'], ['painting', 'advice'],
+                'new-evidence-with-old-failure', discovery_doc_ids=['painting', 'advice'])
+    fresh = calls.requests[before_calls:]
+    assert len(fresh) == 1
+    assert [{source['id'] for source in call['data']['source_spans']} for call in fresh] == [
+        {'s1', 's2'}]
+    assert ('new-evidence-with-old-failure', 's3') in reader.discovery_frontier
+    assert ('new-evidence-with-old-failure', 's3') not in reader.read_states
+    assert all(call['data'].get('failed_batch_reviews') and call['data'].get('evidence_obligations')
+               for call in fresh)
+    for call in fresh:
+        assert call['payload']['max_tokens'] == 4096
+        assert old_source in {engine.mapper.sources[source['id']]['source_id']
+                              for source in call['data']['source_spans']}
+    for identifier, record in retained.items():
+        assert reader.failed_batch_reviews[identifier]['failed'] == record['failed']
+        assert reader.failed_batch_reviews[identifier]['source_ids'] == record['source_ids']
+        assert reader.failed_batch_reviews[identifier]['validated_observations'] == record['validated_observations']
+    assert reader.evidence_obligations == required and state.pending == {'history'}
+    assert engine.mapper.sources == before_sources
+    assert engine.ledger.limits == before_limits and engine.s == before_settings
+    assert engine.ledger.used['llm'] == 4 and engine.ledger.used['json_repairs'] == 3
+    assert reader.web_capacity_admissions[-1]['within_budget']
+    assert reader.web_capacity_admissions[-1]['source_count'] == 2
+
+
+def retained_failure_fixture(*, max_repairs=2, prepaid_repairs=0):
+    unknown = observation('old-source-issue', ['s1'], stance='unknown',
+                          reason='The original text leaves the relevant time ambiguous.')
+    unknown['value'] = None
+    invalid = observation('old-failed-draft', ['nonexistent-source'])
+    first = response(unknown, invalid)
+    reader, engine, state, calls = web_fixture(
+        lambda index, data: deepcopy(first) if index <= max_repairs + 1 else gap_response(),
+        reasoning_output_tokens=4096, max_repairs_per_request=max_repairs)
+    if prepaid_repairs:
+        engine.ledger.reserve('json_repairs', 'earlier-unrelated-repair-work', prepaid_repairs)
+    read(reader, 'piano', 'original-failed-read')
+    assert len(calls.requests) == max_repairs + 1
+    assert reader.failed_batch_reviews and reader.evidence_obligations and state.pending == {'history'}
+    return reader, engine, state, calls
+
+
+def test_retained_failure_forecast_counts_known_coverage_and_frozen_review_metadata_before_exposure():
+    reader, engine, state, calls = retained_failure_fixture()
+    before_calls, before_exposures = len(calls.requests), deepcopy(reader.source_exposures)
+    before_admissions = deepcopy(reader.web_capacity_admissions)
+    before_budget, before_settings = deepcopy(engine.ledger.public_dict()), deepcopy(engine.s)
+    before_sources = deepcopy(engine.mapper.sources)
+    before_failed, before_issues = deepcopy(reader.failed_batch_reviews), deepcopy(reader.evidence_obligations)
+    forecasts = []
+    def count(stage, url, payload):
+        assert len(calls.requests) == before_calls and reader.source_exposures == before_exposures
+        assert payload['max_tokens'] == 4096
+        data = expand_wire_data(json.loads(payload['messages'][1]['content']))
+        scope = data.get('repair_scope', {})
+        is_forecast = scope.get('invalid_response') == '' and 'invalid_response' in scope
+        if is_forecast:
+            assert data['failed_batch_reviews']
+            assert 'old-failed-draft' in json.dumps(data['failed_batch_reviews'])
+            assert 'nonexistent-source' in json.dumps(data['failed_batch_reviews'])
+            for entry in scope['failed']:
+                offered = [item for item in data['evidence_obligations']
+                           if item['variable'] == entry['variable']]
+                assert entry['obligation_review_sources'] == [
+                    {'obligation_id': item['id'], 'required_source_ids': item['source_ids'],
+                     'covered_source_ids': [source['id'] for source in data['source_spans']
+                                            if source['id'] not in item['source_ids']],
+                     'missing_source_ids': item['source_ids']}
+                    for item in offered]
+                assert entry['frozen_observation_reviews'] == {
+                    'slot_observation_ids': [], 'observations': []}
+            forecasts.append(deepcopy(data))
+            # The known review metadata is part of the complete exact request.
+            # The larger candidate crosses the real fixed-context boundary;
+            # its untouched smaller prefix lands exactly on that boundary.
+            measured = 7929 if len(data['source_spans']) == 3 else 7928
+        else:
+            measured = 1000
+        return {'count': measured, 'token_count_is_estimate': False,
+                'tokenization_wire_sha256': digest(payload), 'token_estimator_id': 'exact-review-fixture'}
+    calls.count_reasoning_tokens = count
+    pending = [['s2'], ['s3']]
+    reader.current_identity = 'forecast-retained-review'
+    selected, consumed = reader._fitting_prefix('joint_read', engine.steps[0], 'query', ['history'],
+                                                 pending, False, False)
+    assert selected == ['s2'] and consumed == 1 and pending == [['s2'], ['s3']]
+    assert {len(data['source_spans']) for data in forecasts} == {2, 3}
+    assert all('s1' in {source['id'] for source in data['source_spans']} for data in forecasts)
+    assert engine.ledger.public_dict() == before_budget and engine.s == before_settings
+    assert engine.mapper.sources == before_sources
+    assert reader.failed_batch_reviews == before_failed and reader.evidence_obligations == before_issues
+    assert len(calls.requests) == before_calls and reader.source_exposures == before_exposures
+    assert state.pending == {'history'} and reader.web_capacity_admissions == before_admissions
+
+
+@pytest.mark.parametrize('edge', ['local_recovery_allowance', 'shared_repair_budget'])
+def test_durable_recovery_does_not_forecast_an_unpayable_additional_repair(edge):
+    reader, engine, state, calls = retained_failure_fixture(
+        max_repairs=1 if edge == 'local_recovery_allowance' else 2,
+        prepaid_repairs=3 if edge == 'shared_repair_budget' else 0)
+    if edge == 'shared_repair_budget':
+        assert engine.ledger.remaining('json_repairs') == 1
+    before_budget, before_settings = deepcopy(engine.ledger.public_dict()), deepcopy(engine.s)
+    before_calls, before_exposures = len(calls.requests), deepcopy(reader.source_exposures)
+    before_admissions = deepcopy(reader.web_capacity_admissions)
+    counter = ExactCounts(9000)
+    calls.count_reasoning_tokens = counter
+    pending = [['s2'], ['s3']]
+    reader.current_identity = 'single-paid-recovery'
+    selected, consumed = reader._fitting_prefix('joint_read', engine.steps[0], 'query', ['history'],
+                                                 pending, False, False)
+    data = reader._payload(engine.steps[0], 'query', ['history'], selected)
+    assert any(record['review_allowed'] for record in data['failed_batch_reviews'])
+    assert selected == ['s2', 's3'] and consumed == 2
+    assert {source['id'] for source in data['source_spans']} == {'s1', 's2', 's3'}
+    assert not any(is_forecast for _, is_forecast in counter.records)
+    assert all(payload['max_tokens'] == 4096 for payload, _ in counter.records)
+    assert engine.ledger.public_dict() == before_budget and engine.s == before_settings
+    assert len(calls.requests) == before_calls and reader.source_exposures == before_exposures
+    assert state.pending == {'history'} and reader.web_capacity_admissions == before_admissions
+
+
 def test_headroom_uses_admission_measurement_without_extra_tokenizer_call_after_response():
     reader, engine, _, calls = web_fixture(lambda i, data: gap_response(), reasoning_output_tokens=4096)
     counter = ExactCounts(2000)

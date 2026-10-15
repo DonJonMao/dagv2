@@ -36,7 +36,7 @@ class WebEngine(Engine):
                    'diagnostics': {'ledger': self.ledger.public_dict(),
                                    'initial_dag': self.steps, 'final_node_id': self.final_node_id}}
         row['dataset'] = 'webwalkerqa'
-        row['protocol'] = 'provided_root_observed_link_traversal_v4_access_v2'
+        row['protocol'] = 'provided_root_observed_link_traversal_v4_access_v3'
         row['root_url'] = self.web_root
         row['diagnostics']['web'] = self.bridge.public_dict()
         row['diagnostics']['web']['http_events'] = store.events

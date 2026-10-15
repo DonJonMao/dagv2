@@ -31,7 +31,7 @@ from .webwalker_data import load_questions, load_references
 
 ROOT = Path(__file__).resolve().parents[1]
 ARMS = (JOINT, RESIDUAL)
-VERSION = 'webwalkerqa_root_traversal_v4_access_v2'
+VERSION = 'webwalkerqa_root_traversal_v4_access_v3'
 CORE_RELEASE = 'e6677081cdfb33c01db3aaa274a497168f314f78'
 ACCESS_POLICY = 'paired_root_unavailable_exclusion_v1'
 
@@ -589,7 +589,7 @@ def main(argv=None):
         p = sub.add_parser(name)
         p.add_argument('--config', default='configs/webwalker-v4.json')
         p.add_argument('--data', default='data/webwalkerqa')
-        p.add_argument('--output', default='outputs/webwalkerqa_v4_access_v2')
+        p.add_argument('--output', default='outputs/webwalkerqa_v4_access_v3')
         if name != 'score':
             p.add_argument('--after-personamem')
         if name in ('run', 'launch'):
@@ -598,7 +598,7 @@ def main(argv=None):
         if name == 'preflight':
             p.add_argument('--offline', action='store_true')
     p = sub.add_parser('status')
-    p.add_argument('--output', default='outputs/webwalkerqa_v4_access_v2')
+    p.add_argument('--output', default='outputs/webwalkerqa_v4_access_v3')
     p = sub.add_parser('stop')
     p.add_argument('--output', required=True)
     p = sub.add_parser('_worker', help=argparse.SUPPRESS)

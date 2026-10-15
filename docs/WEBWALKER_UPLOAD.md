@@ -1,4 +1,4 @@
-# WebWalkerQA v4 网站容错与协议修复实验包（access v2）
+# WebWalkerQA v4 网站容错与协议修复实验包（access v3）
 
 本包以你指定的 PersonaMem v4 实验包为安装基线，公共求解核心保持逐字节一致：
 
@@ -19,12 +19,12 @@
 ```bash
 cd ~/bt
 sha256sum -c dagbt_webwalker_v4_experiment.tar.gz.sha256
-mkdir -p ~/dagbt_patches/webwalker_v4_access_v2
-tar -xzf dagbt_webwalker_v4_experiment.tar.gz -C ~/dagbt_patches/webwalker_v4_access_v2
-bash ~/dagbt_patches/webwalker_v4_access_v2/dagbt_webwalker_v4_experiment/install_and_smoke.sh
+mkdir -p ~/dagbt_patches/webwalker_v4_access_v3
+tar -xzf dagbt_webwalker_v4_experiment.tar.gz -C ~/dagbt_patches/webwalker_v4_access_v3
+bash ~/dagbt_patches/webwalker_v4_access_v3/dagbt_webwalker_v4_experiment/install_and_smoke.sh
 ```
 
-默认 Web 目标：`~/dagbt_runs/20261015_webwalker_v4_access_v2_experiment/dagv2`，与 PersonaMem 分开。
+默认 Web 目标：`~/dagbt_runs/20261015_webwalker_v4_access_v3_experiment/dagv2`，与 PersonaMem 分开。
 默认凭据来源：`~/dagbt_runs/20261014_personamem_v4_experiment/dagv2`。
 其他 Web 目录可作为第一个参数传入；来源目录用 `DAGBT_PERSONAMEM_BASE` 指定。
 不允许目标覆盖来源部署或嵌套在其目录中。Python 优先使用目标的 `.venv`，否则沿用
@@ -39,11 +39,12 @@ bash ~/dagbt_patches/webwalker_v4_access_v2/dagbt_webwalker_v4_experiment/instal
 
 ```bash
 export DAGBT_PYTHON="$HOME/dagbt_runs/20260930_v3/dagv2/.venv/bin/python"
-TASK_OLD="$HOME/dagbt_runs/20261015_webwalker_v4_access_stopped_experiment/dagv2"
-TASK_NEW="$HOME/dagbt_runs/20261015_webwalker_v4_access_v2_experiment/dagv2"
-mkdir -p "$TASK_NEW"
-cp -a "$TASK_OLD/_webwalker_browser_vendor" "$TASK_OLD/_webwalker_browsers" "$TASK_NEW/"
-bash ~/dagbt_patches/webwalker_v4_access_v2/dagbt_webwalker_v4_experiment/install_and_smoke.sh "$TASK_NEW"
+TASK_OLD="$HOME/dagbt_runs/20261015_webwalker_v4_access_v2_experiment/dagv2"
+TASK_NEW="$HOME/dagbt_runs/20261015_webwalker_v4_access_v3_experiment/dagv2"
+mkdir -p "$TASK_NEW/_webwalker_browser_vendor" "$TASK_NEW/_webwalker_browsers"
+cp -a "$TASK_OLD/_webwalker_browser_vendor/." "$TASK_NEW/_webwalker_browser_vendor/"
+cp -a "$TASK_OLD/_webwalker_browsers/." "$TASK_NEW/_webwalker_browsers/"
+bash ~/dagbt_patches/webwalker_v4_access_v3/dagbt_webwalker_v4_experiment/install_and_smoke.sh "$TASK_NEW"
 ```
 
 复制缓存后安装器仍检查缓存并实际启动浏览器；本次旧部署已安装 Playwright 1.56.0，系统动态库已安装时无需再执行 sudo。
@@ -60,7 +61,7 @@ bash ~/dagbt_patches/webwalker_v4_access_v2/dagbt_webwalker_v4_experiment/instal
 进入安装目标：
 
 ```bash
-cd ~/dagbt_runs/20261015_webwalker_v4_access_v2_experiment/dagv2
+cd ~/dagbt_runs/20261015_webwalker_v4_access_v3_experiment/dagv2
 bash scripts/run_webwalker.sh smoke
 ```
 
@@ -71,7 +72,7 @@ bash scripts/run_webwalker.sh smoke
 `stopped` 只表示手动停止，不代表 PersonaMem 全量完成；已发布结果保留。
 默认检查来源部署的 `outputs/personamem_v4_experiment_full`；其他输出可作为 smoke/full 的第二个参数传入。
 有失败题但已终止的 PersonaMem 允许开始，不要求 14 题全成功，也不停止旧实验。
-smoke 默认官方前两题、两组共四个任务，输出 `outputs/webwalkerqa_v4_access_v2_smoke`。
+smoke 默认官方前两题、两组共四个任务，输出 `outputs/webwalkerqa_v4_access_v3_smoke`。
 完成后评分；执行完成不等于答对。算法实验不以全题成功作为发行或全量启动条件。
 
 全量 680 题、两组共 1360 个任务：
@@ -79,7 +80,7 @@ smoke 默认官方前两题、两组共四个任务，输出 `outputs/webwalkerq
 ```bash
 bash scripts/run_webwalker.sh full
 bash scripts/run_webwalker.sh status
-tail -f outputs/webwalkerqa_v4_access_v2_full/launcher.log
+tail -f outputs/webwalkerqa_v4_access_v3_full/launcher.log
 ```
 
 全量预检要求模型与部署 tokenize 可用；首个网站仅作诊断，其访问失败不会否决全部题目。
@@ -91,14 +92,14 @@ tail -f outputs/webwalkerqa_v4_access_v2_full/launcher.log
 代码（含公共核心）、配置、数据、题目或方法变化会拒绝续写；重新实验使用新目录：
 
 ```bash
-export WEBWALKER_OUTPUT=outputs/webwalkerqa_v4_access_v2_second
+export WEBWALKER_OUTPUT=outputs/webwalkerqa_v4_access_v3_second
 bash scripts/run_webwalker.sh full
 ```
 
 停止指定 WebWalker 运行（只对身份匹配且持有 OS 锁的进程发信号）：
 
 ```bash
-bash scripts/run_webwalker.sh stop outputs/webwalkerqa_v4_access_v2_full
+bash scripts/run_webwalker.sh stop outputs/webwalkerqa_v4_access_v3_full
 ```
 
 停止不会停止 PersonaMem。Ctrl-C / SIGTERM 清理自己的 worker。
@@ -177,8 +178,8 @@ HTTP 403/429、网络错误或 200 验证页面会在有界 HTTP 尝试后回退
   HTTP 状态；`evaluation.json` 报告两组相同的计划题数、排除数、覆盖率与有效题准确率。
   `all_planned_accuracy_*` 另将被排除题按失败保留在原计划分母，供核对。全部跳过时
   有效题准确率为 null，不显示为 0 或 100%。所有已发生的请求成本仍统计。
-- 新协议和源码身份拒绝续写旧结果。默认安装到新的 `20261015_webwalker_v4_access_v2_experiment`
-  目录，输出也改为 `webwalkerqa_v4_access_v2_*`。已安装旧包时使用这个新目录，不覆盖旧的 access_stopped 安装。
+- 新协议和源码身份拒绝续写旧结果。默认安装到新的 `20261015_webwalker_v4_access_v3_experiment`
+  目录，输出也改为 `webwalkerqa_v4_access_v3_*`。已安装旧包时使用这个新目录，不覆盖旧的 access_v2 或 access_stopped 安装。
 
 本地的容错测试通过不代表远端 Linux 上能绕过网站限制，也不代表已跑完整官方评测。
 
@@ -210,8 +211,28 @@ HTTP 403/429、网络错误或 200 验证页面会在有界 HTTP 尝试后回退
 
 ```bash
 "$DAGBT_PYTHON" scripts/webwalker_diagnose.py \
-  --output outputs/webwalkerqa_v4_access_v2_smoke --question wwqa-0001
+  --output outputs/webwalkerqa_v4_access_v3_smoke --question wwqa-0001
 ```
 
 它只读结果和调用记录，不读取凭据或参考答案。新版预检、回归、真实 smoke 结果以
 `validation.json` 为准；通过执行检查不能替代准确率评测。
+
+## access v3：旧失败与新页面混合请求的容量预留
+
+服务器 access v2 smoke 仍出现 RESIDUAL `InputOverflow`：实际修复输入 12399 tokens，
+加 4096 输出和 264 余量超过 16384。旧失败草稿存在时，之前跳过了 Web 额外修复预测，
+即使同一请求继续加入新原文。JOINT 也曾因重述冻结观察而留下失败阅读批次。
+
+新版为这种混合请求也精确计入已有原文、失败草稿、义务覆盖反馈和冻结复核元数据，
+再预留一份既有输出额度作为未知草稿空间。只缩小尚未尝试的新窗口，旧证据不删除。
+持久恢复首个请求消耗的 JSON 修复次数仍计入原预算；没有后续修复额度时不会假装
+还存在一次可付费修复。所有真实修复仍按完整 wire 再计数；未知草稿可能重复出现，
+预测不是任意响应都能装下的保证，强制闭包自身超限仍明确失败。
+
+`no_relevant_evidence` 明确表示本次没有新增可用观察：即使载荷含旧事实或旧疑点，
+也可返回空观察，既有状态保持未变，不必重述冻结的 unknown/partial。真正疑点仍使用
+带源观察；unknown/partial 不允许同时声称解决证据义务。修正失败草稿与解决事实疑点
+分别校验，不自动重写模型回答或将真实疑点标成无关。
+
+默认安装和输出改为 access_v3。access_v2 的服务器失败、本地试跑与实际评分均保留，
+不会作为新版通过证据，旧结果目录不能在新版源码下续写。

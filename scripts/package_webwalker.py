@@ -57,7 +57,7 @@ def build(destination, wheel, validation=None):
                 'baseline_source_sha256': baseline,
                 'payload_sha256': hashes, 'pdf_wheel': 'deps/' + wheel.name,
                 'pdf_wheel_sha256': sha(wheel), 'dataset': 'WebWalkerQA main 680 questions',
-                'protocol': 'provided_root_observed_link_traversal_v4_access_v2',
+                'protocol': 'provided_root_observed_link_traversal_v4_access_v3',
                 'access_policy': 'paired_root_unavailable_exclusion_v1',
                 'upstream_experiment_archive_sha256': '88b72a8e64b64ba4e33e806fb8023c3d24da333a1a467eb831b2e1dd47f9e4fc'}
     (bundle / 'bundle_manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + '\n')
@@ -66,7 +66,7 @@ def build(destination, wheel, validation=None):
     installer = '''#!/usr/bin/env bash
 set -euo pipefail
 TASK_BUNDLE="$(cd "$(dirname "$0")" && pwd)"
-TASK_TARGET="${1:-${DAGBT_TARGET:-$HOME/dagbt_runs/20261015_webwalker_v4_access_v2_experiment/dagv2}}"
+TASK_TARGET="${1:-${DAGBT_TARGET:-$HOME/dagbt_runs/20261015_webwalker_v4_access_v3_experiment/dagv2}}"
 TASK_PYTHON="${DAGBT_PYTHON:-}"
 if [[ -z "$TASK_PYTHON" ]]; then
   if [[ -x "$TASK_TARGET/.venv/bin/python" ]]; then

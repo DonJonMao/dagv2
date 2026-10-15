@@ -12,18 +12,21 @@ from .transport import digest
 
 WEB_READING_INSTRUCTION = '''
 REQUIRED WEB RETRIEVAL PROTOCOL: each requested slot must declare reading_status.
-Use no_relevant_evidence when this window has no relevant factual observation:
-observations=[], unresolved=[], no resolution/review IDs. search_gaps optionally
-lists untried directions. Example for requested variable v, when the page only
-contains unrelated navigation:
+Use no_relevant_evidence when this call adds NO NEW admissible observation:
+observations=[], unresolved=[], no resolution/review IDs. This remains legal
+when the payload includes old facts or source obligations: they stay unchanged
+in controller state. Do not repeat old issues just to keep them pending.
+search_gaps optionally lists untried directions. Example for requested v:
 {"slots":[{"variable":"v","reading_status":"no_relevant_evidence","observations":[],"unresolved":[],"search_gaps":["Follow another observed category link."]}]}
 No-relevant-evidence is a search result, never a negative fact or proof of absence.
-Use evidence_assessment for one or more original-source-cited ordinary observations.
+Use evidence_assessment for NEW original-source-cited ordinary observations.
 A concrete incomplete statement, ambiguity or conflict must be a named partial/
 unknown observation with its exact source_ids and reason, not bare slot.unresolved.
 For BOTH statuses unresolved MUST be []. Do not cite a whole window as unknown
 merely because it does not contain the answer. The next local bridge can continue.
 Only a genuine textual issue needs a sourced partial/unknown observation.
+For a real ambiguous statement, submit a named unknown row with value=null,
+precise source_ids and requested scope, unresolved=[], and no resolution claim.
 Existing evidence obligations, failed drafts and counters remain mandatory. To
 resolve a previously offered issue, use evidence_assessment and explicitly review
 its original text with sourced supported/corrective/irrelevant observations and
@@ -31,7 +34,11 @@ the offered resolution ID. A genuinely irrelevant original-source review may
 cover an earlier absence-only issue; never label a real partial fact, supporting
 text or counter irrelevant just to close it. Cover every required original source.
 An empty slot never resolves a prior issue. Preserve every required failed draft ID.
-Do not restate frozen observations. In a repair, evidence_assessment may instead
+An unknown/partial observation cannot resolve an evidence obligation. Keep the
+issue pending without listing its ID in resolved_obligation_ids. Correcting a
+failed draft may still leave a genuine evidence obligation unresolved.
+Do not restate frozen observations, including frozen unknown/partial rows.
+In a repair, evidence_assessment may instead
 use the currently offered reviewed_observation_ids for immutable sourced rows;
 those existing references still require the common source and resolution checks.
 No-relevant-evidence forbids these review/resolution claims. search_gaps is only
@@ -86,6 +93,17 @@ class WebJointReader(JointReader):
             'if': {'properties': {'reading_status': {'const': 'no_relevant_evidence'}}},
             'then': {'properties': empty},
             'else': {'anyOf': evidence, 'not': {'required': ['search_gaps']}}})
+        if 'resolved_obligation_ids' in slot['properties']:
+            # Mirror the existing core guard. Unknown/partial observations can
+            # remain genuine issues, but cannot justify an obligation release.
+            # A corrected failed draft is a separate kind of resolution.
+            slot['allOf'].append({
+                'if': {'required': ['resolved_obligation_ids'],
+                       'properties': {'resolved_obligation_ids': {'minItems': 1}}},
+                'then': {'properties': {
+                    'reading_status': {'const': 'evidence_assessment'},
+                    'observations': {'items': {'properties': {
+                        'stance': {'enum': ['support', 'contradiction', 'irrelevant']}}}}}}})
         return schema
 
     @staticmethod
@@ -166,17 +184,45 @@ class WebJointReader(JointReader):
         return decoded, records
 
     def _web_headroom(self, operation, data, *, fresh_sources=True):
+        # An initial request can also be a paid recovery of a durable draft.
+        # Its existing originals/drafts are already in data, but any newly
+        # exposed text can still produce another failed response. Recovery is
+        # therefore not an exemption from fresh-window repair forecasting.
+        recovery = any(item.get('review_allowed')
+                       for item in data.get('failed_batch_reviews', []))
         if (operation != 'joint_read' or not fresh_sources or not self._search_gap_scope(data)
-                or data.get('repair_scope') or data.get('failed_batch_reviews')
-                or self.e.s['max_repairs_per_request'] <= 0
-                or not self.e.ledger.remaining('json_repairs')
+                or data.get('repair_scope')
+                or self.e.s['max_repairs_per_request'] <= bool(recovery)
+                or self.e.ledger.remaining('json_repairs') <= bool(recovery)
                 or self.e.ledger.remaining('llm') < self.e.s['reserved_audit_calls'] + 2):
             return None
+        failed = []
+        for variable in data['variables']:
+            entry = {'variable': variable, 'id': '*', 'feedback': 'x' * 240,
+                     'observation': None,
+                     'slot': {'variable': variable, 'observations': [], 'unresolved': []}}
+            obligations = [item for item in data.get('evidence_obligations', [])
+                           if item['variable'] == variable]
+            if obligations:
+                # Coverage feedback repeats required/missing source aliases;
+                # unlike the future draft, this growth is known before reading.
+                entry['obligation_review_sources'] = [
+                    {'obligation_id': item['id'],
+                     'required_source_ids': list(item['source_ids']),
+                     # A failed review may cite every other visible source
+                     # while missing all required originals. Count that known
+                     # coverage footprint as well as the missing originals.
+                     'covered_source_ids': [source['id'] for source in data['source_spans']
+                                            if source['id'] not in item['source_ids']],
+                     'missing_source_ids': list(item['source_ids'])}
+                    for item in obligations]
+            # These are measurement-only empty shells. They grant no frozen
+            # review authority; the common reader offers actual IDs later.
+            entry['frozen_observation_reviews'] = {
+                'slot_observation_ids': [], 'observations': []}
+            failed.append(entry)
         forecast = {**data, 'repair_scope': {
-            'failed': [{'variable': variable, 'id': '*', 'feedback': 'x' * 240,
-                        'observation': None,
-                        'slot': {'variable': variable, 'observations': [], 'unresolved': []}}
-                       for variable in data['variables']],
+            'failed': failed,
             'attempt': 1, 'previous_response_identity': '0' * 64,
             'invalid_response': ''}}
         count = self._estimate(operation + '_repair', forecast)
@@ -186,7 +232,8 @@ class WebJointReader(JointReader):
                 'repair_output_reserve': output, 'forecast_total_tokens': total,
                 'context_tokens': self.e.s['context_tokens'],
                 'within_budget': total <= self.e.s['context_tokens'],
-                'policy': 'generic_repair_envelope_plus_one_unknown_draft_allowance_v1'}
+                'durable_recovery': bool(recovery),
+                'policy': 'scoped_repair_envelope_plus_one_unknown_draft_allowance_v2'}
 
     def _fresh_window_fits(self, operation, data, *, fresh_sources=True):
         if not super()._fresh_window_fits(operation, data, fresh_sources=fresh_sources):
@@ -275,6 +322,6 @@ class WebJointReader(JointReader):
         # them in obligation_snapshot(): the core hashes that behavioral state
         # when deciding whether a read made progress.
         return {**super().public_dict(),
-                'web_reading_protocol': 'required_typed_web_reading_v1',
+                'web_reading_protocol': 'required_typed_web_reading_v2',
                 'web_search_gaps': deepcopy(self.web_search_gaps),
                 'web_capacity_admissions': deepcopy(self.web_capacity_admissions)}
