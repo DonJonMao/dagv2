@@ -46,7 +46,7 @@ cp -a "$TASK_OLD/_webwalker_browser_vendor" "$TASK_OLD/_webwalker_browsers" "$TA
 bash ~/dagbt_patches/webwalker_v4_access_v2/dagbt_webwalker_v4_experiment/install_and_smoke.sh "$TASK_NEW"
 ```
 
-复制缓存后安装器仍检查预期版本并实际启动浏览器；系统动态库已安装时无需再执行 sudo。
+复制缓存后安装器仍检查缓存并实际启动浏览器；本次旧部署已安装 Playwright 1.56.0，系统动态库已安装时无需再执行 sudo。
 缓存不完整时按正常流程补下载。使用独立副本，避免浏览器安装时修改旧部署。
 
 默认下载隔离的 Playwright/Chromium，需要 PyPI 和浏览器 CDN 可访问。
